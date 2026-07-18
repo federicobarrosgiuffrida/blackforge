@@ -96,6 +96,21 @@ TEST(CpuExecutorTest, SemiDiversiProduconoPesiDiversi) {
     EXPECT_FALSE(allEqual);
 }
 
+TEST(CpuExecutorTest, EseguePipelineConRmsnorm) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> rmsnorm |> linear(4)\n"
+        "}\n");
+
+    const ir::ModelIR& model = module.models.front();
+    backend::cpu::Executor executor;
+    runtime::Tensor input = executor.makeSyntheticInput(model.valueById(model.inputValue), 3);
+
+    runtime::Tensor output = executor.run(model, input);
+    EXPECT_EQ(output.shape(), (std::vector<std::size_t>{3, 4}));
+}
+
 TEST(CpuExecutorTest, LanciaSeIlModelloNonHaPipeline) {
     ir::Module module = buildModule(
         "model M {\n"

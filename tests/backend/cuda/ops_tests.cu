@@ -125,6 +125,42 @@ TEST(CudaOpsTest, GeluCorrispondeAllaVersioneCpu) {
     }
 }
 
+TEST(CudaOpsTest, RmsnormCorrispondeAllaVersioneCpu) {
+    Tensor input({2, 4}, {1.0F, 2.0F, 3.0F, 4.0F, -0.5F, 2.5F, -1.5F, 0.5F});
+
+    Tensor cpuResult = cpu::rmsnorm(input);
+    Tensor gpuResult = cuda::rmsnorm(cuda::DeviceTensor::fromHost(input)).toHost();
+
+    ASSERT_EQ(gpuResult.shape(), cpuResult.shape());
+    for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
+        EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-4F) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, RmsnormConFeatureMaggioriDelBlockSizeCorrispondeAllaVersioneCpu) {
+    // features (300) supera il numero di thread per blocco (256): serve
+    // a esercitare davvero il ciclo grid-stride dentro il kernel, non
+    // solo il caso in cui un thread copre un solo elemento a testa.
+    std::vector<float> values(300);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        values[i] = static_cast<float>(i % 7) - 3.0F;
+    }
+    Tensor input({1, 300}, values);
+
+    Tensor cpuResult = cpu::rmsnorm(input);
+    Tensor gpuResult = cuda::rmsnorm(cuda::DeviceTensor::fromHost(input)).toHost();
+
+    ASSERT_EQ(gpuResult.shape(), cpuResult.shape());
+    for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
+        EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-4F) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, RmsnormLanciaSeNonERango2) {
+    Tensor input({4}, {1.0F, 2.0F, 3.0F, 4.0F});
+    EXPECT_THROW((void)cuda::rmsnorm(cuda::DeviceTensor::fromHost(input)), std::invalid_argument);
+}
+
 TEST(CudaOpsTest, AddLanciaSuFormeIncompatibili) {
     Tensor a({2}, {1.0F, 2.0F});
     Tensor b({3}, {1.0F, 2.0F, 3.0F});

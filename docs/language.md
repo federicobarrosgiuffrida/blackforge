@@ -163,15 +163,15 @@ Dopo il parsing, `blackforge check` valida:
   ancora binding con nome per risultati intermedi, quindi qualunque
   altro identificatore come sorgente è un errore di "non definito".
 - **Operazioni**: le fasi di pipeline devono essere tra le operazioni
-  note — `linear(n)` (un intero positivo), `silu`, `relu`, `gelu`
-  (zero argomenti). Questo elenco crescerà quando il backend implementerà
-  davvero le operazioni.
+  note — `linear(n)` (un intero positivo), `silu`, `relu`, `gelu`,
+  `rmsnorm` (zero argomenti). Questo elenco crescerà quando il backend
+  implementerà davvero le operazioni.
 - **Dataset**: nome univoco nel programma; esattamente un campo `path`,
   un `input` e un `labels`, entrambi tensori validi (stesse regole di
   forma/dtype di un `model`).
 - **Train**: esattamente un `model` (che deve riferirsi a un modello
-  dichiarato nel programma), un `dataset` (idem), una `loss` (solo
-  `mse` per ora), un `optimizer` (`sgd` o `adamw`), `epochs` e
+  dichiarato nel programma), un `dataset` (idem), una `loss` (`mse` o
+  `cross_entropy`), un `optimizer` (`sgd` o `adamw`), `epochs` e
   `batch_size` (interi positivi); `learning_rate` è opzionale (default
   `0.001` se omesso) e deve essere positivo se presente. I riferimenti
   a `model`/`dataset` sono risolti per nome in tutto il programma,
@@ -196,10 +196,11 @@ piccolo grafo di `Value` (formato numerico + forma) collegati da
 A differenza dell'analisi semantica di base, qui la forma **viene
 davvero propagata**: `linear(n)` sostituisce l'ultima dimensione del
 tensore in ingresso con `n` (le altre, incluse quelle simboliche come
-`batch`, sono preservate), mentre `silu`/`relu`/`gelu` non modificano
-forma né formato numerico essendo operazioni elementwise. Questo
-permette di rilevare errori come "linear applicato a un tensore senza
-dimensioni" che l'analisi semantica locale non può vedere.
+`batch`, sono preservate), mentre `silu`/`relu`/`gelu`/`rmsnorm` non
+modificano forma né formato numerico (elementwise, o comunque riga per
+riga nel caso di `rmsnorm`). Questo permette di rilevare errori come
+"linear applicato a un tensore senza dimensioni" che l'analisi
+semantica locale non può vedere.
 
 Non esiste ancora un pass manager con ottimizzazioni (fusione,
 eliminazione di operazioni morte): con l'attuale insieme minimo di
@@ -217,7 +218,15 @@ una a una sul backend CPU (`blackforge::backend::cpu`):
   `[n]`, con pesi generati in modo deterministico (seme fisso, non una
   strategia di inizializzazione statisticamente valida come
   Xavier/Kaiming);
-- `silu`, `relu`, `gelu`: applicate elemento per elemento.
+- `silu`, `relu`, `gelu`: applicate elemento per elemento;
+- `rmsnorm`: normalizzazione RMS (Zhang & Sennrich, 2019) riga per riga
+  su un tensore `[batch, features]`, `y = x / sqrt(mean(x^2) + eps)`
+  con `eps = 1e-6` fisso. **Senza** il fattore di scala `gamma`
+  allenabile della formulazione più comune (es. LLaMA): è
+  normalizzazione pura, senza parametri propri — una scelta di scope
+  deliberata per non dover estendere ancora il formato dei checkpoint e
+  l'interazione con LoRA per un singolo layer. Backward verificato con
+  gradient checking numerico (vedi `tests/backend/cpu/autodiff_tests.cpp`).
 
 Se il programma dichiara un blocco `precision { storage ... compute ...
 accumulate ... }` (vedi `include/blackforge/backend/cpu/quantize.hpp`),
@@ -303,6 +312,10 @@ RTX 5060, Blackwell/sm_120):
   prodotto matriciale, usare una libreria NVIDIA ufficiale è più
   affidabile e performante di reinventarla, come indicato negli
   obiettivi del progetto. `linear = addBias(matmul(...))`, come su CPU.
+  `rmsnorm` è un kernel scritto a mano con un blocco per riga del batch
+  e una riduzione in shared memory per la somma dei quadrati (verificato
+  anche con `features` maggiore del numero di thread per blocco, per
+  esercitare davvero il ciclo grid-stride dentro il kernel).
 - **`Executor`** (in `blackforge::backend::cuda`, da non confondere con
   `blackforge::backend::cpu::Executor`): stessa interfaccia della
   controparte CPU, stessa inizializzazione dei pesi a parità di seme —

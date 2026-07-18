@@ -116,6 +116,7 @@ runtime::Tensor Model::forward(const runtime::Tensor& input) {
             case ir::OpKind::Silu: current = silu(current); break;
             case ir::OpKind::Relu: current = relu(current); break;
             case ir::OpKind::Gelu: current = gelu(current); break;
+            case ir::OpKind::RmsNorm: current = rmsnorm(current); break;
         }
 
         if (precision_.has_value()) {
@@ -170,6 +171,7 @@ void Model::backward(const runtime::Tensor& outputGrad) {
             case ir::OpKind::Silu: gradCurrent = siluBackward(layer.cachedInput, gradCurrent); break;
             case ir::OpKind::Relu: gradCurrent = reluBackward(layer.cachedInput, gradCurrent); break;
             case ir::OpKind::Gelu: gradCurrent = geluBackward(layer.cachedInput, gradCurrent); break;
+            case ir::OpKind::RmsNorm: gradCurrent = rmsnormBackward(layer.cachedInput, gradCurrent); break;
         }
     }
 }

@@ -18,6 +18,13 @@ DeviceTensor silu(const DeviceTensor& input);
 DeviceTensor relu(const DeviceTensor& input);
 DeviceTensor gelu(const DeviceTensor& input);
 
+// RMSNorm senza gamma allenabile (vedi backend::cpu::rmsnorm per i
+// dettagli): un blocco CUDA per riga del batch, con una riduzione in
+// shared memory per calcolare la somma dei quadrati. eps fisso a 1e-6,
+// identico al backend CPU (kRmsNormEps in ops_elementwise.cu), per
+// permettere il confronto diretto CPU/GPU nei test.
+DeviceTensor rmsnorm(const DeviceTensor& input);
+
 // Layer lineare: input [batch, inFeatures], weight [inFeatures, outFeatures],
 // bias [outFeatures] -> output [batch, outFeatures].
 DeviceTensor linear(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias);

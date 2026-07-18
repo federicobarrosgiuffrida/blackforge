@@ -12,6 +12,7 @@ const std::unordered_map<std::string, OpKind>& opKindTable() {
         {"silu", OpKind::Silu},
         {"relu", OpKind::Relu},
         {"gelu", OpKind::Gelu},
+        {"rmsnorm", OpKind::RmsNorm},
     };
     return table;
 }
@@ -32,6 +33,7 @@ std::string opKindName(OpKind kind) {
         case OpKind::Silu: return "silu";
         case OpKind::Relu: return "relu";
         case OpKind::Gelu: return "gelu";
+        case OpKind::RmsNorm: return "rmsnorm";
     }
     return "?";
 }

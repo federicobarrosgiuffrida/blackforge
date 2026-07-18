@@ -106,3 +106,17 @@ TEST(AutodiffTest, GeluBackwardCorrispondeAllaDerivataNumerica) {
         EXPECT_NEAR(analytic.at(i), numericalDerivative(f, input, i), 1e-2F) << "indice " << i;
     }
 }
+
+TEST(AutodiffTest, RmsnormBackwardCorrispondeAllaDerivataNumerica) {
+    // Batch di 2 righe, cosi' la formula di backward deve normalizzare
+    // correttamente riga per riga (non mescolare le righe tra loro).
+    Tensor input({2, 3}, {0.5F, -1.2F, 0.3F, 2.0F, 0.1F, -0.5F});
+    Tensor gradOutput({2, 3}, {1.0F, -0.5F, 2.0F, 0.3F, -1.0F, 0.7F});
+
+    Tensor analytic = cpu::rmsnormBackward(input, gradOutput);
+    auto f = [&](const Tensor& x) { return dot(cpu::rmsnorm(x), gradOutput); };
+
+    for (std::size_t i = 0; i < input.elementCount(); ++i) {
+        EXPECT_NEAR(analytic.at(i), numericalDerivative(f, input, i), 1e-2F) << "indice " << i;
+    }
+}

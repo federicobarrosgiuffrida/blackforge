@@ -1,5 +1,7 @@
 #include "blackforge/backend/cpu/ops.hpp"
 
+#include <cmath>
+
 #include <gtest/gtest.h>
 
 using blackforge::runtime::Tensor;
@@ -85,4 +87,38 @@ TEST(CpuOpsTest, GeluValeZeroInZeroEConvergeAXPerValoriGrandi) {
     EXPECT_FLOAT_EQ(result.at(0), 0.0F);
     EXPECT_NEAR(result.at(1), 20.0F, 0.01F);
     EXPECT_NEAR(result.at(2), 0.0F, 0.01F);
+}
+
+TEST(CpuOpsTest, RmsnormNormalizzaOgniRigaARadiceMediaQuadraticaUnitaria) {
+    Tensor input({2, 4}, {1.0F, 2.0F, 3.0F, 4.0F, -1.0F, -1.0F, -1.0F, -1.0F});
+    Tensor result = cpu::rmsnorm(input);
+
+    ASSERT_EQ(result.shape(), (std::vector<std::size_t>{2, 4}));
+    for (std::size_t row = 0; row < 2; ++row) {
+        double sumSquares = 0.0;
+        for (std::size_t col = 0; col < 4; ++col) {
+            float v = result.at(row * 4 + col);
+            sumSquares += static_cast<double>(v) * static_cast<double>(v);
+        }
+        // Con eps trascurabile rispetto ai valori usati, la RMS
+        // dell'uscita normalizzata deve essere vicina a 1.
+        double rms = std::sqrt(sumSquares / 4.0);
+        EXPECT_NEAR(rms, 1.0, 1e-3) << "riga " << row;
+    }
+}
+
+TEST(CpuOpsTest, RmsnormPreservaIlSegnoEIlRapportoTraElementi) {
+    Tensor input({1, 2}, {2.0F, -4.0F});
+    Tensor result = cpu::rmsnorm(input);
+
+    EXPECT_GT(result.at(0), 0.0F);
+    EXPECT_LT(result.at(1), 0.0F);
+    // Il rapporto tra i due elementi (entrambi divisi per la stessa
+    // costante rms) deve restare invariato: -2.
+    EXPECT_NEAR(result.at(1) / result.at(0), -2.0F, 1e-4F);
+}
+
+TEST(CpuOpsTest, RmsnormLanciaSeNonERango2) {
+    Tensor input({4}, {1.0F, 2.0F, 3.0F, 4.0F});
+    EXPECT_THROW((void)cpu::rmsnorm(input), std::invalid_argument);
 }

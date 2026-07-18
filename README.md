@@ -33,7 +33,7 @@ Il compilatore copre l'intera catena lettura→validazione→esecuzione,
 incluso l'addestramento (pretraining, fine-tuning, LoRA) e il
 forecasting, sia su CPU sia (per l'inferenza) su GPU CUDA. È comunque
 un progetto giovane: il sottoinsieme del linguaggio è volutamente
-piccolo (un solo tipo di layer, quattro operazioni), non generazione di
+piccolo (un solo tipo di layer, cinque operazioni), non generazione di
 codice nativo, non ottimizzazioni del grafo. La tabella seguente
 riflette lo stato **reale** del codice in questo repository, non
 obiettivi futuri.
@@ -46,14 +46,14 @@ obiettivi futuri.
 | Analisi semantica e controllo tipi numerici (dtype, target, operazioni note) | ✅ Completato per il sottoinsieme attuale |
 | Controllo forme tensoriali | ✅ Inferenza reale lungo la pipeline (via IR); vincoli locali via analisi semantica |
 | Rappresentazione interna (IR) | ✅ Completata (Value/Operation/Module, IR builder con inferenza di forma e dtype) |
-| Backend CPU di riferimento (tensori, elementwise, matmul, linear, attivazioni) | ✅ Completato per le operazioni attualmente nel linguaggio |
+| Backend CPU di riferimento (tensori, elementwise, matmul, linear, attivazioni, rmsnorm) | ✅ Completato per le operazioni attualmente nel linguaggio |
 | Esecuzione (`blackforge run`) | ✅ Esegue un modello con input sintetico e pesi deterministici |
-| Autodiff / backward | ✅ Formule analitiche per linear/matmul/addBias/silu/relu/gelu, verificate con gradient checking numerico |
+| Autodiff / backward | ✅ Formule analitiche per linear/matmul/addBias/silu/relu/gelu/rmsnorm, verificate con gradient checking numerico |
 | Loss | ✅ Errore quadratico medio (MSE, per la regressione/forecasting) e cross-entropy con softmax interna (per la classificazione multiclasse, `loss cross_entropy`), entrambe verificate con gradient checking numerico |
 | Optimizer (SGD, AdamW) | ✅ Entrambi implementati e testati (incl. weight decay disaccoppiato di AdamW) |
 | Checkpoint (salvataggio/caricamento pesi) | ✅ Formato binario proprietario BlackForge, con round-trip testato |
 | Pass manager / ottimizzazioni (fusione, dead code elimination) | ⏳ Pianificato (ancora rimandato: nessuna ottimizzazione genuina applicabile con l'attuale insieme di operazioni) |
-| Backend CUDA (tensori device, add/addBias/matmul via cuBLAS/silu/relu/gelu, esecuzione) | ✅ Implementato e testato su GPU reale (RTX 5060, sm_120) per le operazioni attualmente nel linguaggio |
+| Backend CUDA (tensori device, add/addBias/matmul via cuBLAS/silu/relu/gelu/rmsnorm, esecuzione) | ✅ Implementato e testato su GPU reale (RTX 5060, sm_120) per le operazioni attualmente nel linguaggio |
 | Rilevamento GPU (`blackforge devices`) | ✅ Elenca le GPU NVIDIA visibili tramite il driver CUDA |
 | Selezione dispositivo (`blackforge run --device cpu\|cuda`) | ✅ Implementata |
 | Tensor Core / precisioni FP8/BF16/TF32 reali su GPU | ⏳ Pianificato — il backend CUDA oggi calcola in float32 (SGEMM), come il backend CPU: nessun uso di Tensor Core o dei formati ridotti come precisione di calcolo reale ancora |

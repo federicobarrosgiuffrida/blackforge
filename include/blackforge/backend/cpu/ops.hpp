@@ -23,6 +23,15 @@ Tensor silu(const Tensor& input);
 Tensor relu(const Tensor& input);
 Tensor gelu(const Tensor& input);
 
+// RMSNorm (Zhang & Sennrich, 2019): normalizza ogni riga di un tensore
+// [batch, features] per la sua root-mean-square, y = x / sqrt(mean(x^2)
+// + eps). A differenza della formulazione piu' comune (usata ad es. in
+// LLaMA), questa versione NON ha un fattore di scala gamma allenabile:
+// e' normalizzazione pura, senza parametri. eps e' fisso a 1e-6
+// (kRmsNormEps in ops.cpp), non configurabile dal linguaggio. Lancia
+// std::invalid_argument se il tensore non e' a rango 2.
+Tensor rmsnorm(const Tensor& input);
+
 // Layer lineare: input [batch, inFeatures], weight [inFeatures, outFeatures],
 // bias [outFeatures] -> output [batch, outFeatures].
 Tensor linear(const Tensor& input, const Tensor& weight, const Tensor& bias);

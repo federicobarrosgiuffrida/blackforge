@@ -33,4 +33,10 @@ Tensor siluBackward(const Tensor& input, const Tensor& gradOutput);
 Tensor reluBackward(const Tensor& input, const Tensor& gradOutput);
 Tensor geluBackward(const Tensor& input, const Tensor& gradOutput);
 
+// rmsnorm: y = x / rms(x), rms(x) = sqrt(mean(x^2) + eps), applicato
+// riga per riga. 'input' e' l'ingresso cachato dal forward (serve a
+// ricalcolare rms(x) e la somma pesata usata dalla derivata). Lancia
+// std::invalid_argument se le forme non coincidono o non sono a rango 2.
+Tensor rmsnormBackward(const Tensor& input, const Tensor& gradOutput);
+
 }  // namespace blackforge::backend::cpu

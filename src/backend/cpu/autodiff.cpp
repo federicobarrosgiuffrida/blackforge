@@ -10,6 +10,7 @@ namespace {
 constexpr float kGeluCoeff = 0.044715F;
 constexpr float kGeluCoeffDeriv = 3.0F * kGeluCoeff;  // 0.134145
 constexpr float kSqrt2OverPi = 0.7978845608F;         // sqrt(2/pi)
+constexpr float kRmsNormEps = 1e-6F;                  // deve coincidere con ops.cpp
 
 Tensor elementwiseGrad(const Tensor& input, const Tensor& gradOutput, float (*derivative)(float)) {
     if (input.shape() != gradOutput.shape()) {
@@ -98,6 +99,47 @@ Tensor geluBackward(const Tensor& input, const Tensor& gradOutput) {
         float innerDerivative = kSqrt2OverPi * (1.0F + kGeluCoeffDeriv * x * x);
         return 0.5F * (1.0F + t) + 0.5F * x * (1.0F - t * t) * innerDerivative;
     });
+}
+
+Tensor rmsnormBackward(const Tensor& input, const Tensor& gradOutput) {
+    if (input.shape() != gradOutput.shape()) {
+        throw std::invalid_argument("rmsnormBackward: forme incompatibili " + input.shapeToString() + " e " +
+                                     gradOutput.shapeToString());
+    }
+    if (input.rank() != 2) {
+        throw std::invalid_argument("rmsnormBackward: richiede un tensore a rango 2 [batch, features], trovato " +
+                                     input.shapeToString());
+    }
+
+    std::size_t batch = input.dim(0);
+    std::size_t features = input.dim(1);
+    std::vector<float> result(input.elementCount());
+
+    // Derivazione: r = sqrt(mean(x^2) + eps), y_i = x_i / r.
+    // dr/dx_i = x_i / (features * r), quindi, con S = sum_j(gOut_j * x_j):
+    // dL/dx_i = gOut_i / r  -  x_i * S / (features * r^3).
+    for (std::size_t row = 0; row < batch; ++row) {
+        std::size_t rowOffset = row * features;
+
+        double sumSquares = 0.0;
+        double weightedSum = 0.0;  // S = sum_j(gOut_j * x_j)
+        for (std::size_t col = 0; col < features; ++col) {
+            double x = static_cast<double>(input.at(rowOffset + col));
+            sumSquares += x * x;
+            weightedSum += static_cast<double>(gradOutput.at(rowOffset + col)) * x;
+        }
+        double meanSquare = sumSquares / static_cast<double>(features);
+        double r = std::sqrt(meanSquare + static_cast<double>(kRmsNormEps));
+
+        for (std::size_t col = 0; col < features; ++col) {
+            double x = static_cast<double>(input.at(rowOffset + col));
+            double gOut = static_cast<double>(gradOutput.at(rowOffset + col));
+            double grad = gOut / r - x * weightedSum / (static_cast<double>(features) * r * r * r);
+            result[rowOffset + col] = static_cast<float>(grad);
+        }
+    }
+
+    return Tensor(input.shape(), std::move(result));
 }
 
 }  // namespace blackforge::backend::cpu

@@ -51,6 +51,7 @@ runtime::Tensor Executor::run(const ir::ModelIR& model, const runtime::Tensor& i
             case ir::OpKind::Silu: current = silu(current); break;
             case ir::OpKind::Relu: current = relu(current); break;
             case ir::OpKind::Gelu: current = gelu(current); break;
+            case ir::OpKind::RmsNorm: current = rmsnorm(current); break;
         }
     }
 

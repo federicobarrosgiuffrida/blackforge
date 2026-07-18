@@ -9,6 +9,7 @@ namespace {
 
 constexpr float kGeluCoeff = 0.044715F;
 constexpr float kSqrt2OverPi = 0.7978845608F;  // sqrt(2/pi)
+constexpr float kRmsNormEps = 1e-6F;
 
 void requireSameShape(const Tensor& a, const Tensor& b, const char* opName) {
     if (a.shape() != b.shape()) {
@@ -104,6 +105,35 @@ Tensor gelu(const Tensor& input) {
 
 Tensor linear(const Tensor& input, const Tensor& weight, const Tensor& bias) {
     return addBias(matmul(input, weight), bias);
+}
+
+Tensor rmsnorm(const Tensor& input) {
+    if (input.rank() != 2) {
+        throw std::invalid_argument("rmsnorm: richiede un tensore a rango 2 [batch, features], trovato " +
+                                     input.shapeToString());
+    }
+
+    std::size_t batch = input.dim(0);
+    std::size_t features = input.dim(1);
+    std::vector<float> result(input.elementCount());
+
+    for (std::size_t row = 0; row < batch; ++row) {
+        std::size_t rowOffset = row * features;
+
+        double sumSquares = 0.0;
+        for (std::size_t col = 0; col < features; ++col) {
+            float x = input.at(rowOffset + col);
+            sumSquares += static_cast<double>(x) * static_cast<double>(x);
+        }
+        double meanSquare = sumSquares / static_cast<double>(features);
+        float rms = static_cast<float>(std::sqrt(meanSquare + static_cast<double>(kRmsNormEps)));
+
+        for (std::size_t col = 0; col < features; ++col) {
+            result[rowOffset + col] = input.at(rowOffset + col) / rms;
+        }
+    }
+
+    return Tensor(input.shape(), std::move(result));
 }
 
 }  // namespace blackforge::backend::cpu

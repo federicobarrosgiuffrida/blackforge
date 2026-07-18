@@ -97,6 +97,26 @@ TEST(IRBuilderTest, PropagaLaFormaAttraversoLaPipeline) {
     EXPECT_EQ(afterLinear2.dtype, sema::DType::BF16);
 }
 
+TEST(IRBuilderTest, RmsnormNonAlteraFormaNeFormato) {
+    BuildResult result = buildIR(
+        "model TinyModel {\n"
+        "    input bf16[batch, 4096]\n"
+        "    input |> rmsnorm |> linear(2048)\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    const ir::ModelIR& model = result.module.models[0];
+    const ir::Pipeline& pipeline = model.pipelines[0];
+    ASSERT_EQ(pipeline.operations.size(), 2u);
+
+    const ir::Value& afterRmsnorm = model.valueById(pipeline.operations[0].output);
+    EXPECT_EQ(pipeline.operations[0].kind, ir::OpKind::RmsNorm);
+    ASSERT_EQ(afterRmsnorm.shape.size(), 2u);
+    EXPECT_TRUE(afterRmsnorm.shape[0].isSymbolic);
+    EXPECT_EQ(afterRmsnorm.shape[1].literalValue, 4096);
+    EXPECT_EQ(afterRmsnorm.dtype, sema::DType::BF16);
+}
+
 TEST(IRBuilderTest, PipelineSenzaOperazioniHaOutputUgualeAllInput) {
     BuildResult result = buildIR(
         "model M {\n"

@@ -184,7 +184,9 @@ void IRBuilder::buildPipeline(const ast::PipelineStmt& stmt, ModelIR& model, std
             // (es. 'batch') sono preservate cosi' come sono.
             outputShape.back() = Dim{false, "", linearOutFeatures};
         }
-        // silu/relu/gelu sono elementwise: forma e formato invariati.
+        // silu/relu/gelu/rmsnorm non cambiano la forma ne' il formato
+        // (rmsnorm normalizza lungo l'ultima dimensione a runtime, ma
+        // non la altera).
 
         std::size_t outputId = nextValueId++;
         model.values.push_back(Value{outputId, current.dtype, outputShape});

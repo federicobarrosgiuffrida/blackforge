@@ -62,6 +62,49 @@ __global__ void geluKernel(float* out, const float* input, std::size_t n) {
     }
 }
 
+constexpr float kRmsNormEps = 1e-6F;  // deve coincidere con src/backend/cpu/ops.cpp
+
+// Un blocco per riga del batch: ogni thread somma i quadrati di una
+// porzione della riga, poi una riduzione in shared memory calcola la
+// somma totale (e quindi la RMS) prima che tutti i thread normalizzino
+// la propria porzione.
+__global__ void rmsnormKernel(float* out, const float* input, std::size_t batch, std::size_t features) {
+    extern __shared__ float partialSums[];
+
+    std::size_t row = blockIdx.x;
+    if (row >= batch) {
+        return;
+    }
+    const float* rowIn = input + row * features;
+    float* rowOut = out + row * features;
+
+    float localSum = 0.0F;
+    for (std::size_t col = threadIdx.x; col < features; col += blockDim.x) {
+        float x = rowIn[col];
+        localSum += x * x;
+    }
+    partialSums[threadIdx.x] = localSum;
+    __syncthreads();
+
+    for (std::size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partialSums[threadIdx.x] += partialSums[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    __shared__ float rms;
+    if (threadIdx.x == 0) {
+        float meanSquare = partialSums[0] / static_cast<float>(features);
+        rms = sqrtf(meanSquare + kRmsNormEps);
+    }
+    __syncthreads();
+
+    for (std::size_t col = threadIdx.x; col < features; col += blockDim.x) {
+        rowOut[col] = rowIn[col] / rms;
+    }
+}
+
 void requireSameShape(const DeviceTensor& a, const DeviceTensor& b, const char* opName) {
     if (a.shape() != b.shape()) {
         throw std::invalid_argument(std::string(opName) + ": forme incompatibili sul device");
@@ -122,6 +165,22 @@ DeviceTensor gelu(const DeviceTensor& input) {
     std::size_t n = input.elementCount();
     if (n > 0) {
         geluKernel<<<gridSizeFor(n), kBlockSize>>>(result.data(), input.data(), n);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+DeviceTensor rmsnorm(const DeviceTensor& input) {
+    if (input.rank() != 2) {
+        throw std::invalid_argument("rmsnorm: richiede un tensore a rango 2 [batch, features] sul device");
+    }
+
+    DeviceTensor result(input.shape());
+    std::size_t batch = input.dim(0);
+    std::size_t features = input.dim(1);
+    if (batch > 0 && features > 0) {
+        rmsnormKernel<<<static_cast<int>(batch), kBlockSize, kBlockSize * sizeof(float)>>>(
+            result.data(), input.data(), batch, features);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }
     return result;

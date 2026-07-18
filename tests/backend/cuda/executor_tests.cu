@@ -55,7 +55,7 @@ TEST(CudaExecutorTest, ProduceLoStessoRisultatoDelBackendCpuAParitaDiSeme) {
     ir::Module module = buildModule(
         "model TinyModel {\n"
         "    input bf16[batch, 32]\n"
-        "    input |> linear(16) |> silu |> linear(8) |> relu |> linear(4)\n"
+        "    input |> rmsnorm |> linear(16) |> silu |> linear(8) |> relu |> linear(4)\n"
         "}\n");
 
     const ir::ModelIR& model = module.models.front();

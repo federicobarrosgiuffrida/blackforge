@@ -26,6 +26,7 @@ const std::unordered_map<std::string, int>& knownOperations() {
         {"silu", 0},
         {"relu", 0},
         {"gelu", 0},
+        {"rmsnorm", 0},
     };
     return operations;
 }
@@ -162,7 +163,7 @@ void SemanticAnalyzer::analyzeStage(const ast::PipelineStage& stage) {
     auto it = knownOperations().find(stage.name);
     if (it == knownOperations().end()) {
         diagnostics_.addError(stage.location, "operazione sconosciuta '" + stage.name +
-                                                   "'. Operazioni supportate: linear, silu, relu, gelu");
+                                                   "'. Operazioni supportate: linear, silu, relu, gelu, rmsnorm");
         return;
     }
 

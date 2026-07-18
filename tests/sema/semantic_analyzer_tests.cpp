@@ -130,6 +130,24 @@ TEST(SemanticAnalyzerTest, RifiutaLinearConFeatureNonPositive) {
     EXPECT_TRUE(analyzer.diagnostics().hasErrors());
 }
 
+TEST(SemanticAnalyzerTest, AccettaRmsnorm) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 4096]\n"
+        "    input |> rmsnorm |> linear(2048)\n"
+        "}\n");
+    EXPECT_FALSE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaRmsnormConArgomenti) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[4096]\n"
+        "    input |> rmsnorm(4096)\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
 TEST(SemanticAnalyzerTest, RifiutaIdentificatoreNonDefinitoComeSorgentePipeline) {
     auto analyzer = analyze(
         "model M {\n"
