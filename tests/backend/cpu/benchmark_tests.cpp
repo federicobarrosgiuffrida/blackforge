@@ -47,6 +47,59 @@ TEST(BenchmarkTest, ProduceStatisticheCoerenti) {
     EXPECT_EQ(result.estimatedMemoryBytes, 118u * sizeof(float));
 }
 
+TEST(BenchmarkTest, PerOperationHaUnaVoceOrdinataPerOgniOperazioneDellaPipeline) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> linear(4) |> silu |> linear(2) |> softmax\n"
+        "}\n");
+
+    backend::cpu::BenchmarkResult result =
+        backend::cpu::runBenchmark(module.models.front(), /*batchSize=*/4, /*warmup=*/2, /*measured=*/5);
+
+    ASSERT_EQ(result.perOperation.size(), 4u);
+    EXPECT_EQ(result.perOperation[0].operationName, "linear");
+    EXPECT_EQ(result.perOperation[0].operationIndex, 0u);
+    EXPECT_EQ(result.perOperation[1].operationName, "silu");
+    EXPECT_EQ(result.perOperation[1].operationIndex, 1u);
+    EXPECT_EQ(result.perOperation[2].operationName, "linear");
+    EXPECT_EQ(result.perOperation[2].operationIndex, 2u);
+    EXPECT_EQ(result.perOperation[3].operationName, "softmax");
+    EXPECT_EQ(result.perOperation[3].operationIndex, 3u);
+
+    for (const auto& op : result.perOperation) {
+        EXPECT_GT(op.meanMilliseconds, 0.0) << op.operationName;
+    }
+
+    // La somma dei tempi per operazione deve essere un'approssimazione
+    // ragionevole del tempo aggregato (misurato separatamente): non
+    // devono divergere per ordini di grandezza, che indicherebbe un
+    // bug nella cattura dell'input reale di ogni operazione.
+    double sumPerOperation = 0.0;
+    for (const auto& op : result.perOperation) {
+        sumPerOperation += op.meanMilliseconds;
+    }
+    EXPECT_LT(sumPerOperation, result.meanMilliseconds * 10.0);
+}
+
+TEST(BenchmarkTest, PerOperationRispettaLaPrecisionPolicyDichiarata) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> linear(4) |> softmax\n"
+        "}\n");
+
+    ir::PrecisionPolicy fp8Policy{sema::DType::FP8_E4M3, sema::DType::FP8_E4M3, sema::DType::FP32};
+    backend::cpu::BenchmarkResult result = backend::cpu::runBenchmark(
+        module.models.front(), /*batchSize=*/4, /*warmup=*/1, /*measured=*/2, fp8Policy);
+
+    // Non lancia e produce comunque una voce per operazione: verifica
+    // solo che il percorso con precisione non vada in crash, la
+    // correttezza numerica della quantizzazione e' gia' testata altrove
+    // (quantize_tests.cpp, executor_tests.cpp).
+    ASSERT_EQ(result.perOperation.size(), 2u);
+}
+
 TEST(BenchmarkTest, LanciaSeIlModelloNonHaPipeline) {
     ir::Module module = buildModule(
         "model M {\n"

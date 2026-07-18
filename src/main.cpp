@@ -422,6 +422,11 @@ int runBenchmark(const std::string& path, const std::string& device, std::size_t
         std::cout << "  throughput:        " << cpuResult.throughputSamplesPerSecond << " esempi/s\n";
         std::cout << "  memoria (stimata): " << (static_cast<double>(cpuResult.estimatedMemoryBytes) / 1024.0 / 1024.0)
                    << " MiB (float32; e' una stima teorica, non memoria di processo misurata)\n";
+        std::cout << "  per operazione (CPU, ciascuna misurata separatamente sul proprio input reale):\n";
+        for (const auto& op : cpuResult.perOperation) {
+            std::cout << "    [" << op.operationIndex << "] " << op.operationName << ": " << op.meanMilliseconds
+                       << " ms\n";
+        }
 
         if (spec.isCuda) {
 #if BLACKFORGE_HAS_CUDA

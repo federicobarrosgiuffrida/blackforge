@@ -70,7 +70,7 @@ obiettivi futuri.
 | Training/fine-tuning/LoRA su GPU (oltre il percorso minimo sopra) | ⏳ Pianificato: cross-entropy su GPU, LoRA su GPU |
 | CLI completa (`check`, `build`, `run`, `train`, `forecast`, `benchmark`, `inspect`, `devices`) | ✅ Tutti e 6 i comandi della visione originale implementati, più `forecast`/`devices` |
 | Benchmark (`blackforge benchmark`) | ✅ Hardware rilevato, precisione dichiarata (e realmente applicata sul backend CPU, vedi riga sopra), forma, tempo medio, throughput, memoria stimata, iterazioni/warmup configurabili; con `--device cuda` confronta automaticamente con la CPU (speedup e scarto massimo) |
-| Profiling | 🟡 Solo timing aggregato per iterazione (dentro `benchmark`); nessun breakdown per singola operazione |
+| Profiling | 🟡 Timing aggregato per iterazione più breakdown per singola operazione della pipeline, ciascuna misurata separatamente sul proprio input reale (solo backend CPU: su CUDA servirebbero timer basati su cudaEvent, i lanci di kernel sono asincroni) |
 | Selezione GPU (`--device cuda:N`) | ✅ Implementata (`cudaSetDevice`); resta comunque una sola GPU alla volta, non multi-GPU simultaneo |
 | Pass manager / ottimizzazioni del grafo, generazione di codice nativo | ⏳ Non iniziato |
 | Multi-GPU (esecuzione simultanea su più GPU) | ⏳ Pianificato |
@@ -241,6 +241,10 @@ quantizzazione simulata applicata a ogni iterazione (vedi sotto). Con
 quantizzazione, non ancora supportata su CUDA) e stampa anche lo
 speedup e lo scarto massimo rispetto all'output CPU (la "modalità di
 riferimento", anch'essa senza quantizzazione per un confronto equo).
+Riporta anche un breakdown del tempo per singola operazione della
+pipeline (solo backend CPU, ogni operazione misurata separatamente sul
+suo input reale) — utile per capire quale operazione domina il tempo
+totale.
 
 `blackforge build` compila fino alla IR e prova a costruire davvero
 ogni modello (allocando i suoi parametri): a differenza di `check`, che

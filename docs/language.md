@@ -634,6 +634,17 @@ credibile): un valore vicino a zero (tipicamente `1e-5`–`1e-6` per la
 somma di molti prodotti in float32) conferma che GPU e CPU calcolano lo
 stesso risultato, non solo che sono ugualmente veloci.
 
-**Limitazione**: nessun profiling per singola operazione (solo il
-tempo totale di una `forward()` completa); nessuna deduplicazione o
-analisi statistica oltre alla media.
+Oltre al tempo aggregato, riporta anche un **breakdown per singola
+operazione** della pipeline (solo backend CPU): ogni operazione viene
+misurata separatamente, sul suo input reale (catturato eseguendo
+un'intera pipeline una volta, poi ri-applicando solo quella singola
+operazione per `--warmup`/`--iterations` volte) — utile per capire
+quale operazione domina il tempo totale (tipicamente `linear`, per via
+del prodotto matriciale), non solo il totale stesso. Non esiste ancora
+su CUDA: un breakdown accurato per singolo kernel richiederebbe timer
+basati su `cudaEvent` (i lanci di kernel sono asincroni, un semplice
+`steady_clock` attorno a ogni chiamata misurerebbe anche tempo di
+attesa non significativo, non solo l'esecuzione del kernel).
+
+**Limitazione**: nessuna deduplicazione o analisi statistica oltre alla
+media (né per il tempo aggregato né per il breakdown per operazione).
