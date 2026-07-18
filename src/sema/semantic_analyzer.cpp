@@ -85,6 +85,8 @@ void SemanticAnalyzer::analyze(const ast::Program& program) {
     for (const auto& decl : program.declarations) {
         if (std::holds_alternative<ast::TrainDecl>(decl)) {
             analyzeTrain(std::get<ast::TrainDecl>(decl));
+        } else if (std::holds_alternative<ast::ForecastDecl>(decl)) {
+            analyzeForecast(std::get<ast::ForecastDecl>(decl));
         }
     }
 }
@@ -298,6 +300,7 @@ void SemanticAnalyzer::analyzeTrain(const ast::TrainDecl& decl) {
     int epochsCount = 0;
     int batchSizeCount = 0;
     int learningRateCount = 0;
+    int loraCount = 0;
 
     for (const auto& field : decl.fields) {
         std::visit(
@@ -364,6 +367,18 @@ void SemanticAnalyzer::analyzeTrain(const ast::TrainDecl& decl) {
                     if (node.value <= 0.0) {
                         diagnostics_.addError(node.location, "'learning_rate' deve essere positivo");
                     }
+                } else if constexpr (std::is_same_v<T, ast::TrainLoraField>) {
+                    ++loraCount;
+                    if (loraCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'lora' duplicato nel blocco 'train'");
+                    }
+                    if (node.rank <= 0) {
+                        diagnostics_.addError(node.location, "'rank' deve essere un intero positivo, trovato " +
+                                                                   std::to_string(node.rank));
+                    }
+                    if (node.alpha <= 0.0) {
+                        diagnostics_.addError(node.location, "'alpha' deve essere positivo");
+                    }
                 }
             },
             field);
@@ -386,6 +401,44 @@ void SemanticAnalyzer::analyzeTrain(const ast::TrainDecl& decl) {
     }
     if (batchSizeCount == 0) {
         diagnostics_.addError(decl.location, "il blocco 'train' non specifica 'batch_size'");
+    }
+}
+
+void SemanticAnalyzer::analyzeForecast(const ast::ForecastDecl& decl) {
+    int modelCount = 0;
+    int horizonCount = 0;
+
+    for (const auto& field : decl.fields) {
+        std::visit(
+            [&](const auto& node) {
+                using T = std::decay_t<decltype(node)>;
+                if constexpr (std::is_same_v<T, ast::ForecastModelField>) {
+                    ++modelCount;
+                    if (modelCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'model' duplicato nel blocco 'forecast'");
+                    }
+                    if (modelNames_.find(node.name) == modelNames_.end()) {
+                        diagnostics_.addError(node.location, "modello '" + node.name + "' non definito");
+                    }
+                } else if constexpr (std::is_same_v<T, ast::ForecastHorizonField>) {
+                    ++horizonCount;
+                    if (horizonCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'horizon' duplicato nel blocco 'forecast'");
+                    }
+                    if (node.value <= 0) {
+                        diagnostics_.addError(node.location, "'horizon' deve essere un intero positivo, trovato " +
+                                                                   std::to_string(node.value));
+                    }
+                }
+            },
+            field);
+    }
+
+    if (modelCount == 0) {
+        diagnostics_.addError(decl.location, "il blocco 'forecast' non specifica un 'model'");
+    }
+    if (horizonCount == 0) {
+        diagnostics_.addError(decl.location, "il blocco 'forecast' non specifica 'horizon'");
     }
 }
 

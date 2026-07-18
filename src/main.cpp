@@ -7,6 +7,7 @@
 
 #include "blackforge/ast/ast.hpp"
 #include "blackforge/backend/cpu/executor.hpp"
+#include "blackforge/backend/cpu/forecast_runner.hpp"
 #include "blackforge/backend/cpu/train_runner.hpp"
 #include "blackforge/diagnostics/diagnostic.hpp"
 #include "blackforge/frontend/lexer.hpp"
@@ -30,6 +31,7 @@ void printUsage() {
               << "  check <file>       Analizza il file e riporta gli errori (lessicali, sintattici, semantici)\n"
               << "  run <file>         Esegue il primo modello del file\n"
               << "  train <file>       Addestra il modello descritto dal blocco 'train' del file (CPU)\n"
+              << "  forecast <file>    Genera 'horizon' passi autoregressivi dal blocco 'forecast' del file (CPU)\n"
               << "  devices            Elenca i dispositivi di calcolo disponibili (CPU e GPU CUDA)\n"
               << "  --help, -h         Mostra questo messaggio\n"
               << "  --version, -v      Mostra la versione del compilatore\n\n"
@@ -40,7 +42,8 @@ void printUsage() {
               << "  --batch N          Dimensione di batch usata per risolvere le dimensioni simboliche "
                  "dell'input (solo 'run', default 1)\n"
               << "  --device cpu|cuda  Dispositivo su cui eseguire (solo 'run', default cpu)\n"
-              << "  --from-checkpoint <file>  Pesi di partenza per il fine-tuning (solo 'train')\n"
+              << "  --from-checkpoint <file>  Pesi di partenza: fine-tuning/LoRA per 'train', "
+                 "obbligatorio per 'forecast'\n"
               << "  --save-checkpoint <file>  Dove salvare i pesi al termine dell'addestramento (solo 'train')\n";
 }
 
@@ -258,6 +261,27 @@ int runTrain(const std::string& path, const std::string& fromCheckpoint, const s
     return 0;
 }
 
+int runForecast(const std::string& path, const std::string& fromCheckpoint, std::size_t batchSize) {
+    CompileOutput result = compile(path, /*verbose=*/false, /*printAst=*/false, /*printIr=*/false);
+
+    if (result.status == CompileStatus::FileNotFound) {
+        return 2;
+    }
+    if (result.status == CompileStatus::AnalysisFailed) {
+        std::cerr << path << ": impossibile eseguire il forecasting, l'analisi ha trovato errori\n";
+        return 1;
+    }
+
+    try {
+        blackforge::backend::cpu::runForecast(result.program, result.module, fromCheckpoint, batchSize, &std::cout);
+    } catch (const std::exception& e) {
+        std::cerr << "errore di forecasting: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -346,6 +370,13 @@ int main(int argc, char** argv) {
             return 2;
         }
         return runTrain(positional.front(), fromCheckpoint, saveCheckpointPath);
+    }
+    if (command == "forecast") {
+        if (positional.empty()) {
+            std::cerr << "errore: comando 'forecast' richiede il percorso di un file .bf\n";
+            return 2;
+        }
+        return runForecast(positional.front(), fromCheckpoint, batchSize);
     }
     if (command == "devices") {
         printDevices();

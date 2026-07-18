@@ -304,3 +304,65 @@ TEST(SemanticAnalyzerTest, RifiutaTrainSenzaOptimizer) {
         "}\n");
     EXPECT_TRUE(analyzer.diagnostics().hasErrors());
 }
+
+TEST(SemanticAnalyzerTest, AccettaTrainConLoraValido) {
+    std::string source = kValidTrainProgram;
+    auto pos = source.find("}\n", source.find("train {"));
+    // Inserisce il blocco lora prima della chiusura di 'train'.
+    source.insert(pos, "    lora {\n        rank 4\n        alpha 8.0\n    }\n");
+    auto analyzer = analyze(source);
+    EXPECT_FALSE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaLoraConRankNonPositivo) {
+    std::string source = kValidTrainProgram;
+    auto pos = source.find("}\n", source.find("train {"));
+    source.insert(pos, "    lora {\n        rank 0\n    }\n");
+    auto analyzer = analyze(source);
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, AccettaForecastValido) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(4)\n"
+        "}\n"
+        "forecast {\n"
+        "    model M\n"
+        "    horizon 10\n"
+        "}\n");
+    EXPECT_FALSE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaForecastConModelloNonDefinito) {
+    auto analyzer = analyze(
+        "forecast {\n"
+        "    model NonEsiste\n"
+        "    horizon 10\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaForecastConHorizonNonPositivo) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[4]\n"
+        "}\n"
+        "forecast {\n"
+        "    model M\n"
+        "    horizon 0\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaForecastSenzaHorizon) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[4]\n"
+        "}\n"
+        "forecast {\n"
+        "    model M\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}

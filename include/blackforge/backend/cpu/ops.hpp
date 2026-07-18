@@ -9,6 +9,9 @@ using runtime::Tensor;
 // Somma elementwise di due tensori con la stessa forma.
 Tensor add(const Tensor& a, const Tensor& b);
 
+// Moltiplica ogni elemento per uno scalare.
+Tensor scale(const Tensor& input, float factor);
+
 // Somma un bias di forma [features] a un tensore [batch, features],
 // trasmettendolo (broadcast) su ogni riga del batch.
 Tensor addBias(const Tensor& input, const Tensor& bias);

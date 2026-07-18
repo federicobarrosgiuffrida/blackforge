@@ -36,6 +36,14 @@ Tensor add(const Tensor& a, const Tensor& b) {
     return Tensor(a.shape(), std::move(result));
 }
 
+Tensor scale(const Tensor& input, float factor) {
+    std::vector<float> result(input.elementCount());
+    for (std::size_t i = 0; i < result.size(); ++i) {
+        result[i] = input.at(i) * factor;
+    }
+    return Tensor(input.shape(), std::move(result));
+}
+
 Tensor addBias(const Tensor& input, const Tensor& bias) {
     if (input.rank() != 2 || bias.rank() != 1 || input.dim(1) != bias.dim(0)) {
         throw std::invalid_argument("addBias: attesi input [batch, features] e bias [features] con features "

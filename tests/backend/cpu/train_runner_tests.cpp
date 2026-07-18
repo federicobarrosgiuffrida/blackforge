@@ -101,6 +101,37 @@ std::string toyProgram(const std::string& datasetPath, int epochs, const std::st
            "}\n";
 }
 
+std::string toyProgramWithLora(const std::string& datasetPath, int epochs, long long rank) {
+    return "model M {\n"
+           "    input bf16[batch, 4]\n"
+           "    input |> linear(2)\n"
+           "}\n"
+           "dataset D {\n"
+           "    path \"" +
+           toForwardSlashes(datasetPath) +
+           "\"\n"
+           "    input bf16[batch, 4]\n"
+           "    labels bf16[batch, 2]\n"
+           "}\n"
+           "train {\n"
+           "    model M\n"
+           "    dataset D\n"
+           "    loss mse\n"
+           "    optimizer adamw\n"
+           "    epochs " +
+           std::to_string(epochs) +
+           "\n"
+           "    batch_size 4\n"
+           "    learning_rate 0.3\n"
+           "    lora {\n"
+           "        rank " +
+           std::to_string(rank) +
+           "\n"
+           "        alpha 4.0\n"
+           "    }\n"
+           "}\n";
+}
+
 }  // namespace
 
 TEST(TrainRunnerTest, RiduceLaLossAttraversoLeEpoche) {
@@ -162,4 +193,56 @@ TEST(TrainRunnerTest, SalvaERicaricaUnCheckpointPerIlFineTuning) {
 
     ASSERT_FALSE(second.epochLosses.empty());
     EXPECT_LT(second.epochLosses.front(), first.epochLosses.front());
+}
+
+TEST(TrainRunnerTest, LoraRichiedeUnCheckpointDiPartenza) {
+    TempFile datasetFile("blackforge_test_train_dataset_lora_nockpt.bfdata");
+    writeToyDataset(datasetFile.path);
+
+    Compiled compiled = compile(toyProgramWithLora(datasetFile.path, 5, 2));
+
+    // 'lora' senza --from-checkpoint non ha senso (allenerebbe un
+    // adapter su pesi casuali): deve fallire con un errore chiaro,
+    // non silenziosamente.
+    EXPECT_THROW((void)backend::cpu::runTraining(compiled.program, compiled.module, "", ""), std::runtime_error);
+}
+
+TEST(TrainRunnerTest, LoraRiduceLaLossEMantieneCongelatiIPesiDiBase) {
+    TempFile datasetFile("blackforge_test_train_dataset_lora.bfdata");
+    writeToyDataset(datasetFile.path);
+    TempFile baseCheckpoint("blackforge_test_train_base.bfckpt");
+    TempFile loraCheckpoint("blackforge_test_train_lora.bfckpt");
+
+    // Prima sessione: pretraining normale, checkpoint di base.
+    Compiled compiled = compile(toyProgram(datasetFile.path, /*epochs=*/30, "adamw"));
+    backend::cpu::runTraining(compiled.program, compiled.module, "", baseCheckpoint.path);
+
+    // Seconda sessione: fine-tuning LoRA a partire da quel checkpoint.
+    Compiled compiledLora = compile(toyProgramWithLora(datasetFile.path, /*epochs=*/30, /*rank=*/2));
+    backend::cpu::TrainRunResult loraResult = backend::cpu::runTraining(
+        compiledLora.program, compiledLora.module, baseCheckpoint.path, loraCheckpoint.path);
+
+    ASSERT_FALSE(loraResult.epochLosses.empty());
+    EXPECT_LT(loraResult.epochLosses.back(), loraResult.epochLosses.front());
+
+    // I pesi di base salvati nel checkpoint LoRA devono coincidere
+    // esattamente con quelli del checkpoint pre-allenato originale:
+    // devono essere rimasti congelati durante il fine-tuning LoRA.
+    backend::cpu::Model baseModel(compiled.module.models.front());
+    backend::cpu::loadCheckpoint(baseModel, baseCheckpoint.path);
+
+    backend::cpu::Model loraModel(compiledLora.module.models.front(), 42, backend::cpu::LoraOptions{2, 4.0});
+    backend::cpu::loadCheckpoint(loraModel, loraCheckpoint.path);
+
+    auto baseParams = baseModel.allParameters();  // weight, bias
+    auto loraParams = loraModel.allParameters();  // weight, bias, loraA, loraB
+
+    ASSERT_GE(loraParams.size(), baseParams.size());
+    for (std::size_t i = 0; i < baseParams.size(); ++i) {
+        ASSERT_EQ(baseParams[i]->value.elementCount(), loraParams[i]->value.elementCount());
+        for (std::size_t j = 0; j < baseParams[i]->value.elementCount(); ++j) {
+            EXPECT_FLOAT_EQ(baseParams[i]->value.at(j), loraParams[i]->value.at(j))
+                << "parametro " << i << " indice " << j;
+        }
+    }
 }

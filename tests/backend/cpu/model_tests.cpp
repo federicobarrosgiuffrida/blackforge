@@ -164,6 +164,143 @@ TEST(ModelTest, TrainingLoopRiduceLaLossConSgd) {
     EXPECT_LT(lastLoss, firstLoss * 0.1F);
 }
 
+// --- LoRA ---
+
+TEST(ModelLoraTest, RichiedeRankPositivo) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(2)\n"
+        "}\n");
+    EXPECT_THROW(backend::cpu::Model(module.models.front(), 42, backend::cpu::LoraOptions{0, 1.0}),
+                 std::invalid_argument);
+}
+
+TEST(ModelLoraTest, ParametersRestituisceSoloAdapterQuandoLoraEAttivo) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(2)\n"
+        "}\n");
+    backend::cpu::Model model(module.models.front(), 42, backend::cpu::LoraOptions{2, 4.0});
+
+    EXPECT_EQ(model.parameters().size(), 2u);      // solo loraA, loraB
+    EXPECT_EQ(model.allParameters().size(), 4u);   // + weight, bias congelati
+}
+
+TEST(ModelLoraTest, ForwardNonAlteraLUscitaAllInizializzazione) {
+    // B e' inizializzato a zero: il contributo dell'adapter deve essere
+    // esattamente nullo, quindi l'uscita con LoRA attivo deve coincidere
+    // con quella di un modello identico senza LoRA (stesso seme, stessi
+    // pesi di base).
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(3) |> silu |> linear(2)\n"
+        "}\n");
+
+    backend::cpu::Model plain(module.models.front(), /*seed=*/7);
+    backend::cpu::Model withLora(module.models.front(), /*seed=*/7, backend::cpu::LoraOptions{2, 4.0});
+
+    runtime::Tensor input({2, 4}, {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.1F, 0.2F, -0.3F});
+    runtime::Tensor plainOut = plain.forward(input);
+    runtime::Tensor loraOut = withLora.forward(input);
+
+    ASSERT_EQ(plainOut.elementCount(), loraOut.elementCount());
+    for (std::size_t i = 0; i < plainOut.elementCount(); ++i) {
+        EXPECT_FLOAT_EQ(plainOut.at(i), loraOut.at(i)) << "indice " << i;
+    }
+}
+
+TEST(ModelLoraTest, BackwardCorrispondeAllaDerivataNumericaDelLoss) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 3]\n"
+        "    input |> linear(4)\n"
+        "}\n");
+
+    backend::cpu::Model model(module.models.front(), 42, backend::cpu::LoraOptions{2, 3.0});
+
+    // B a zero azzererebbe il gradiente di A per costruzione (matmul con
+    // una matrice nulla): si assegnano valori non nulli ad A e B per
+    // rendere il test significativo.
+    for (backend::cpu::Parameter* param : model.parameters()) {
+        for (std::size_t i = 0; i < param->value.elementCount(); ++i) {
+            param->value.at(i) = 0.05F * static_cast<float>(i % 5) - 0.1F;
+        }
+    }
+
+    runtime::Tensor input({2, 3}, {0.2F, -0.1F, 0.4F, -0.3F, 0.5F, 0.1F});
+    runtime::Tensor target({2, 4}, {0.0F, 1.0F, 1.0F, 0.0F, 0.5F, -0.5F, 0.2F, 0.1F});
+
+    model.zeroGrad();
+    runtime::Tensor output = model.forward(input);
+    backend::cpu::LossResult loss = backend::cpu::meanSquaredError(output, target);
+    model.backward(loss.grad);
+
+    auto lossOf = [&]() {
+        runtime::Tensor out = model.forward(input);
+        return backend::cpu::meanSquaredError(out, target).value;
+    };
+
+    float eps = 1e-3F;
+    for (backend::cpu::Parameter* param : model.parameters()) {
+        for (std::size_t i = 0; i < std::min<std::size_t>(4, param->value.elementCount()); ++i) {
+            float original = param->value.at(i);
+
+            param->value.at(i) = original + eps;
+            float plus = lossOf();
+            param->value.at(i) = original - eps;
+            float minus = lossOf();
+            param->value.at(i) = original;
+
+            float numeric = (plus - minus) / (2.0F * eps);
+            EXPECT_NEAR(param->grad.at(i), numeric, 1e-2F) << "parametro " << param->name << " indice " << i;
+        }
+    }
+}
+
+TEST(ModelLoraTest, TrainingLoopMantieneCongelatiIPesiDiBase) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(2)\n"
+        "}\n");
+
+    backend::cpu::Model model(module.models.front(), 42, backend::cpu::LoraOptions{2, 4.0});
+
+    // Valori di partenza dei pesi di base (congelati) e degli adapter.
+    std::vector<float> weightBefore = model.allParameters()[0]->value.data();
+    std::vector<float> biasBefore = model.allParameters()[1]->value.data();
+
+    ToyProblem problem = makeToyProblem();
+    backend::cpu::AdamW optimizer(/*learningRate=*/0.2F, 0.9F, 0.999F, 1e-8F, 0.0F);
+
+    float firstLoss = 0.0F;
+    float lastLoss = 0.0F;
+    for (int step = 0; step < 100; ++step) {
+        model.zeroGrad();
+        runtime::Tensor output = model.forward(problem.input);
+        backend::cpu::LossResult loss = backend::cpu::meanSquaredError(output, problem.target);
+        if (step == 0) {
+            firstLoss = loss.value;
+        }
+        lastLoss = loss.value;
+        model.backward(loss.grad);
+        optimizer.step(model.parameters());  // solo loraA/loraB vengono aggiornati
+    }
+
+    EXPECT_LT(lastLoss, firstLoss);
+
+    auto allParams = model.allParameters();
+    for (std::size_t i = 0; i < weightBefore.size(); ++i) {
+        EXPECT_FLOAT_EQ(allParams[0]->value.at(i), weightBefore[i]) << "il peso congelato e' cambiato";
+    }
+    for (std::size_t i = 0; i < biasBefore.size(); ++i) {
+        EXPECT_FLOAT_EQ(allParams[1]->value.at(i), biasBefore[i]) << "il bias congelato e' cambiato";
+    }
+}
+
 TEST(ModelTest, TrainingLoopRiduceLaLossConAdamW) {
     ir::Module module = buildModule(
         "model M {\n"

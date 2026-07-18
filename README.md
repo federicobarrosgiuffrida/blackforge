@@ -57,9 +57,9 @@ del codice in questo repository, non obiettivi futuri.
 | Formato dataset su disco + caricamento a batch | ✅ Formato binario proprietario BlackForge, con batching (incl. wraparound tra epoche) testato |
 | Pretraining (`blackforge train`) | ✅ Addestra un modello da zero su CPU, verificato end-to-end (la loss scende davvero, non solo "compila") |
 | Fine-tuning (`blackforge train --from-checkpoint`) | ✅ Riprende l'addestramento da un checkpoint esistente |
-| LoRA | ⏳ Pianificato (richiede nuove operazioni IR per gli adapter a basso rango) |
-| Forecasting | ⏳ Pianificato (richiede layer/loss specifici per serie temporali) |
-| Training/fine-tuning su GPU (`blackforge train --device cuda`) | ⏳ Pianificato: l'autodiff esiste solo sul backend CPU per ora (milestone 6); il backend CUDA (milestone 7) ha solo la forward pass |
+| LoRA (`train { lora { rank alpha } }`) | ✅ Adapter a basso rango su ogni layer `linear`, pesi di base congelati; verificato con gradient checking e con un test che conferma che i pesi di base restano invariati dopo l'addestramento |
+| Forecasting (`forecast { model horizon }`, `blackforge forecast`) | ✅ Rollout autoregressivo (l'output di un passo diventa l'input del successivo); richiede che l'ultima dimensione di input e output del modello coincidano e un checkpoint pre-allenato |
+| Training/fine-tuning/LoRA su GPU | ⏳ Pianificato: l'autodiff esiste solo sul backend CPU per ora (milestone 6); il backend CUDA (milestone 7) ha solo la forward pass |
 | Benchmark / profiling | ⏳ Pianificato |
 | Multi-GPU | ⏳ Pianificato |
 
@@ -151,8 +151,9 @@ blackforge run <file.bf>                # esegue il primo modello su CPU (batch=
 blackforge run <file.bf> --batch 8      # come sopra, con batch size esplicito
 blackforge run <file.bf> --device cuda  # esegue sulla GPU (richiede una build con CUDA)
 blackforge train <file.bf>              # addestra il modello del blocco 'train' (CPU)
-blackforge train <file.bf> --from-checkpoint pesi.bfckpt  # fine-tuning da pesi esistenti
+blackforge train <file.bf> --from-checkpoint pesi.bfckpt  # fine-tuning (o base per LoRA)
 blackforge train <file.bf> --save-checkpoint pesi.bfckpt  # salva i pesi finali
+blackforge forecast <file.bf> --from-checkpoint pesi.bfckpt --batch 1  # rollout autoregressivo
 blackforge devices                      # elenca i dispositivi disponibili (CPU e GPU CUDA rilevate)
 blackforge --version
 blackforge --help
@@ -169,10 +170,18 @@ esattamente gli stessi pesi iniziali e producono lo stesso risultato
 
 `blackforge train` addestra davvero il modello referenziato dal primo
 blocco `train` del file, sul dataset che referenzia (caricato da disco,
-non sintetico), stampando la loss media per epoca. Solo sul backend
-CPU per ora — l'autodiff non esiste ancora sul backend CUDA. I comandi
-`build`, `benchmark`, `inspect` descritti nella visione del progetto
-non sono ancora implementati.
+non sintetico), stampando la loss media per epoca. Con un blocco
+`lora { rank N alpha F }` dentro `train`, invece di allenare i pesi
+originali allena un adapter a basso rango (richiede `--from-checkpoint`:
+non ha senso allenare un adapter su pesi casuali). Solo sul backend CPU
+per ora — l'autodiff non esiste ancora sul backend CUDA.
+
+`blackforge forecast` esegue il modello referenziato dal primo blocco
+`forecast` ripetutamente per `horizon` passi, usando l'output di ogni
+passo come input del successivo (richiede `--from-checkpoint` e che
+l'ultima dimensione di input e output del modello coincidano). I
+comandi `build`, `benchmark`, `inspect` descritti nella visione del
+progetto non sono ancora implementati.
 
 ## Esempi
 
@@ -186,6 +195,11 @@ non sono ancora implementati.
   ([`tiny_regression_dataset.bfdata`](examples/tiny_regression_dataset.bfdata),
   8 esempi). Esegui `blackforge train examples/tiny_regression.bf` per
   vedere la loss scendere epoca dopo epoca.
+- [`examples/tiny_forecast.bf`](examples/tiny_forecast.bf) — esempio
+  di `forecast`: un layer lineare 4→4 (compatibile con il rollout
+  autoregressivo). Richiede un checkpoint pre-allenato (non incluso,
+  va generato con `blackforge train --save-checkpoint`, oppure con
+  `blackforge::backend::cpu::saveCheckpoint` da codice C++).
 
 ## Struttura del repository
 
@@ -212,7 +226,7 @@ PolyForm Noncommercial License 1.0.0 — vedi [LICENSE.md](LICENSE.md).
 5. ✅ Backend CPU di riferimento: tensori, elementwise, matmul, layer lineari, attivazioni, esecuzione (`blackforge run`)
 6. ✅ Autodiff, loss (MSE), optimizer (SGD, AdamW), checkpoint su CPU
 7. ✅ Backend CUDA: tensori device, add/addBias/matmul (cuBLAS)/silu/relu/gelu, esecuzione (`blackforge run --device cuda`), rilevamento GPU (`blackforge devices`) — testato su GPU reale. Tensor Core e precisioni ridotte reali (fp8/bf16/tf32) restano lavoro futuro.
-8. 🟡 Training: grammatica `dataset`/`train`, formato dataset su disco, pretraining e fine-tuning (`blackforge train`) completati e verificati end-to-end su CPU. LoRA e forecasting non ancora iniziati; training su GPU richiede prima l'autodiff sul backend CUDA.
+8. ✅ Training: grammatica `dataset`/`train`/`forecast`, formato dataset su disco, pretraining, fine-tuning, LoRA (`train { lora { ... } }`) e forecasting autoregressivo (`blackforge forecast`) — tutti completati e verificati end-to-end su CPU (loss che scende davvero, pesi di base verificati congelati durante LoRA, rollout autoregressivo verificato con un modello identita'). Training/fine-tuning/LoRA su GPU restano lavoro futuro: richiedono prima l'autodiff sul backend CUDA.
 9. Benchmark, profiling, CLI completa, documentazione finale
 
 ## Contribuire

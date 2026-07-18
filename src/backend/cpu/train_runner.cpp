@@ -1,6 +1,7 @@
 #include "blackforge/backend/cpu/train_runner.hpp"
 
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <variant>
 
@@ -71,11 +72,17 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
     const auto* epochsField = findField<ast::TrainEpochsField>(trainDecl->fields);
     const auto* batchSizeField = findField<ast::TrainBatchSizeField>(trainDecl->fields);
     const auto* learningRateField = findField<ast::TrainLearningRateField>(trainDecl->fields);
+    const auto* loraField = findField<ast::TrainLoraField>(trainDecl->fields);
 
     if (modelField == nullptr || datasetField == nullptr || optimizerField == nullptr || epochsField == nullptr ||
         batchSizeField == nullptr) {
         throw std::runtime_error("il blocco 'train' non e' completo (manca model/dataset/optimizer/epochs/"
                                   "batch_size): l'analisi semantica avrebbe dovuto rifiutarlo");
+    }
+    if (loraField != nullptr && fromCheckpointPath.empty()) {
+        throw std::runtime_error("il blocco 'train' usa 'lora' ma non e' stato fornito un checkpoint di partenza "
+                                  "(--from-checkpoint): allenare un adapter a basso rango su pesi casuali non ha "
+                                  "senso, serve un modello gia' pre-allenato");
     }
 
     const ir::ModelIR* modelIR = findModelIR(module, modelField->name);
@@ -94,12 +101,23 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
 
     data::Dataset dataset = data::loadDataset(pathField->path);
 
-    Model model(*modelIR);
+    std::optional<LoraOptions> loraOptions;
+    if (loraField != nullptr) {
+        loraOptions = LoraOptions{loraField->rank, loraField->alpha};
+    }
+    Model model(*modelIR, /*seed=*/42, loraOptions);
+
     if (!fromCheckpointPath.empty()) {
         loadCheckpoint(model, fromCheckpointPath);
         if (progressOutput != nullptr) {
-            *progressOutput << "Pesi caricati da '" << fromCheckpointPath << "' (fine-tuning)\n";
+            *progressOutput << "Pesi caricati da '" << fromCheckpointPath << "' ("
+                             << (loraOptions.has_value() ? "base per LoRA" : "fine-tuning") << ")\n";
         }
+    }
+
+    if (loraOptions.has_value() && progressOutput != nullptr) {
+        *progressOutput << "LoRA attivo: rank=" << loraOptions->rank << " alpha=" << loraOptions->alpha
+                         << " (" << model.parameters().size() << " parametri allenabili, pesi di base congelati)\n";
     }
 
     double learningRate = (learningRateField != nullptr) ? learningRateField->value : 1e-3;

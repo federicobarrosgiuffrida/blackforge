@@ -67,7 +67,11 @@ void saveCheckpoint(Model& model, const std::string& path) {
 
     out.write(kMagic, sizeof(kMagic));
 
-    std::vector<Parameter*> params = model.parameters();
+    // Sempre TUTTI i parametri (anche i pesi congelati durante un
+    // addestramento LoRA): il checkpoint deve essere autosufficiente,
+    // caricabile in un Model senza dover sapere se e' stato allenato
+    // con o senza adapter.
+    std::vector<Parameter*> params = model.allParameters();
     writeU32(out, static_cast<std::uint32_t>(params.size()));
     for (const Parameter* param : params) {
         writeParameter(out, *param);
@@ -91,7 +95,7 @@ void loadCheckpoint(Model& model, const std::string& path) {
     }
 
     std::unordered_map<std::string, Parameter*> byName;
-    for (Parameter* param : model.parameters()) {
+    for (Parameter* param : model.allParameters()) {
         byName[param->name] = param;
     }
 

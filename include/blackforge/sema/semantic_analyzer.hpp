@@ -34,6 +34,7 @@ private:
     void analyzeModel(const ast::ModelDecl& decl);
     void analyzeDataset(const ast::DatasetDecl& decl);
     void analyzeTrain(const ast::TrainDecl& decl);
+    void analyzeForecast(const ast::ForecastDecl& decl);
 
     void analyzeTensorType(const ast::TensorType& type);
     void analyzePipelineStmt(const ast::PipelineStmt& stmt, bool modelHasInput, const std::string& modelName);

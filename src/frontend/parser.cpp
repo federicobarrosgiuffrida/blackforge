@@ -50,7 +50,7 @@ Parser::ParseError Parser::error(const SourceLocation& location, const std::stri
 void Parser::synchronizeToDeclaration() {
     while (!isAtEnd()) {
         if (check(TokenKind::KwTarget) || check(TokenKind::KwPrecision) || check(TokenKind::KwModel) ||
-            check(TokenKind::KwDataset) || check(TokenKind::KwTrain)) {
+            check(TokenKind::KwDataset) || check(TokenKind::KwTrain) || check(TokenKind::KwForecast)) {
             return;
         }
         advance();
@@ -100,10 +100,13 @@ std::optional<ast::Decl> Parser::parseDeclaration() {
     if (check(TokenKind::KwTrain)) {
         return ast::Decl{parseTrainDecl()};
     }
+    if (check(TokenKind::KwForecast)) {
+        return ast::Decl{parseForecastDecl()};
+    }
 
     throw error(peek().location,
-                "attesa una dichiarazione top-level ('target', 'precision', 'model', 'dataset' o 'train'), "
-                "trovato " +
+                "attesa una dichiarazione top-level ('target', 'precision', 'model', 'dataset', 'train' o "
+                "'forecast'), trovato " +
                     tokenKindName(peek().kind));
 }
 
@@ -406,16 +409,104 @@ ast::TrainDecl Parser::parseTrainDecl() {
                              "atteso un numero dopo 'learning_rate', trovato " + tokenKindName(peek().kind));
             }
             fields.push_back(ast::TrainField{ast::TrainLearningRateField{value, fieldStart}});
+        } else if (check(TokenKind::KwLora)) {
+            fields.push_back(ast::TrainField{parseTrainLoraField()});
         } else {
             throw error(peek().location,
                          "atteso un campo di 'train' ('model', 'dataset', 'loss', 'optimizer', 'epochs', "
-                         "'batch_size' o 'learning_rate'), trovato " +
+                         "'batch_size', 'learning_rate' o 'lora'), trovato " +
                              tokenKindName(peek().kind));
         }
     }
 
     expect(TokenKind::RBrace, "atteso '}' per chiudere il blocco 'train'");
     return ast::TrainDecl{std::move(fields), start};
+}
+
+ast::TrainLoraField Parser::parseTrainLoraField() {
+    SourceLocation start = peek().location;
+    expect(TokenKind::KwLora, "atteso 'lora'");
+    expect(TokenKind::LBrace, "atteso '{' dopo 'lora'");
+
+    std::optional<long long> rank;
+    std::optional<double> alpha;
+
+    while (!check(TokenKind::RBrace) && !isAtEnd()) {
+        SourceLocation fieldStart = peek().location;
+
+        if (check(TokenKind::KwRank)) {
+            advance();
+            const Token& valueToken = expect(TokenKind::IntegerLiteral, "atteso un intero dopo 'rank'");
+            if (rank.has_value()) {
+                throw error(fieldStart, "campo 'rank' duplicato nel blocco 'lora'");
+            }
+            try {
+                rank = std::stoll(valueToken.lexeme);
+            } catch (const std::out_of_range&) {
+                throw error(fieldStart, "valore intero troppo grande per 'rank': '" + valueToken.lexeme + "'");
+            }
+        } else if (check(TokenKind::KwAlpha)) {
+            advance();
+            if (!check(TokenKind::FloatLiteral) && !check(TokenKind::IntegerLiteral)) {
+                throw error(peek().location,
+                             "atteso un numero dopo 'alpha', trovato " + tokenKindName(peek().kind));
+            }
+            const Token& valueToken = advance();
+            if (alpha.has_value()) {
+                throw error(fieldStart, "campo 'alpha' duplicato nel blocco 'lora'");
+            }
+            try {
+                alpha = std::stod(valueToken.lexeme);
+            } catch (const std::out_of_range&) {
+                throw error(fieldStart, "valore troppo grande per 'alpha': '" + valueToken.lexeme + "'");
+            }
+        } else {
+            throw error(peek().location, "atteso un campo di 'lora' ('rank' o 'alpha'), trovato " +
+                                              tokenKindName(peek().kind));
+        }
+    }
+
+    expect(TokenKind::RBrace, "atteso '}' per chiudere il blocco 'lora'");
+
+    if (!rank.has_value()) {
+        throw error(start, "il blocco 'lora' richiede il campo 'rank'");
+    }
+
+    // Convenzione comune di LoRA: se 'alpha' e' omesso, alpha == rank
+    // (fattore di scala iniziale pari a 1).
+    return ast::TrainLoraField{*rank, alpha.value_or(static_cast<double>(*rank)), start};
+}
+
+ast::ForecastDecl Parser::parseForecastDecl() {
+    SourceLocation start = peek().location;
+    expect(TokenKind::KwForecast, "atteso 'forecast'");
+    expect(TokenKind::LBrace, "atteso '{' dopo 'forecast'");
+
+    std::vector<ast::ForecastField> fields;
+    while (!check(TokenKind::RBrace) && !isAtEnd()) {
+        SourceLocation fieldStart = peek().location;
+
+        if (check(TokenKind::KwModel)) {
+            advance();
+            const Token& nameToken = expect(TokenKind::Identifier, "atteso il nome del modello dopo 'model'");
+            fields.push_back(ast::ForecastField{ast::ForecastModelField{nameToken.lexeme, fieldStart}});
+        } else if (check(TokenKind::KwHorizon)) {
+            advance();
+            const Token& valueToken = expect(TokenKind::IntegerLiteral, "atteso un intero dopo 'horizon'");
+            try {
+                fields.push_back(
+                    ast::ForecastField{ast::ForecastHorizonField{std::stoll(valueToken.lexeme), fieldStart}});
+            } catch (const std::out_of_range&) {
+                throw error(fieldStart, "valore intero troppo grande per 'horizon': '" + valueToken.lexeme + "'");
+            }
+        } else {
+            throw error(peek().location, "atteso un campo di 'forecast' ('model' o 'horizon'), trovato " +
+                                              tokenKindName(peek().kind));
+        }
+    }
+
+    expect(TokenKind::RBrace, "atteso '}' per chiudere il blocco 'forecast'");
+    return ast::ForecastDecl{std::move(fields), start};
 }
 
 }  // namespace blackforge

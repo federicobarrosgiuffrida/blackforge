@@ -59,6 +59,8 @@ private:
     ast::PipelineStage parsePipelineStage();
     ast::DatasetDecl parseDatasetDecl();
     ast::TrainDecl parseTrainDecl();
+    ast::TrainLoraField parseTrainLoraField();
+    ast::ForecastDecl parseForecastDecl();
 
     std::vector<Token> tokens_;
     std::size_t current_ = 0;

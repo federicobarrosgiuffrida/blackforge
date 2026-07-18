@@ -165,17 +165,53 @@ struct TrainLearningRateField {
     SourceLocation location;
 };
 
+// 'lora { rank N [alpha F] }' dentro un blocco 'train': quando presente,
+// invece di allenare i pesi originali del modello, addestra un adapter
+// a basso rango (matrici A/B) applicato a ogni layer 'linear', con i
+// pesi originali congelati. Richiede un modello pre-allenato (vedi
+// --from-checkpoint nella CLI): non ha senso applicare un adapter a
+// pesi casuali.
+struct TrainLoraField {
+    long long rank;
+    double alpha;
+    SourceLocation location;
+};
+
 using TrainField = std::variant<TrainModelField, TrainDatasetField, TrainLossField, TrainOptimizerField,
-                                 TrainEpochsField, TrainBatchSizeField, TrainLearningRateField>;
+                                 TrainEpochsField, TrainBatchSizeField, TrainLearningRateField, TrainLoraField>;
 
 struct TrainDecl {
     std::vector<TrainField> fields;
     SourceLocation location;
 };
 
+// --- forecast { ... } ---
+
+struct ForecastModelField {
+    std::string name;
+    SourceLocation location;
+};
+
+struct ForecastHorizonField {
+    long long value;
+    SourceLocation location;
+};
+
+using ForecastField = std::variant<ForecastModelField, ForecastHorizonField>;
+
+// Descrive una sessione di forecasting autoregressivo: a partire da un
+// input iniziale, il modello referenziato viene applicato ripetutamente
+// 'horizon' volte, usando ogni output come input del passo successivo.
+// Richiede che l'ultima dimensione della forma di input e di output del
+// modello coincidano (controllato a runtime, non qui: dipende dalla IR).
+struct ForecastDecl {
+    std::vector<ForecastField> fields;
+    SourceLocation location;
+};
+
 // --- Programma ---
 
-using Decl = std::variant<TargetDecl, PrecisionDecl, ModelDecl, DatasetDecl, TrainDecl>;
+using Decl = std::variant<TargetDecl, PrecisionDecl, ModelDecl, DatasetDecl, TrainDecl, ForecastDecl>;
 
 struct Program {
     std::vector<Decl> declarations;

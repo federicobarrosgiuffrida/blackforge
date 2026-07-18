@@ -24,7 +24,8 @@ Le seguenti parole sono riservate e non possono essere usate come nomi:
 ```
 target precision storage compute accumulate parameters forward backward
 model input output dataset loss optimizer train pretrain finetune lora
-forecast benchmark path labels epochs batch_size learning_rate
+forecast benchmark path labels epochs batch_size learning_rate rank
+alpha horizon
 ```
 
 Nomi di formati numerici (`bf16`, `fp8`, `fp16`, `fp32`, `tf32`, `e4m3`,
@@ -82,7 +83,7 @@ delle forme ed esecuzione arriveranno nelle prossime milestone.
 
 ```
 Program        := Declaration*
-Declaration    := TargetDecl | PrecisionDecl | ModelDecl | DatasetDecl | TrainDecl
+Declaration    := TargetDecl | PrecisionDecl | ModelDecl | DatasetDecl | TrainDecl | ForecastDecl
 
 TargetDecl     := 'target' DottedName
 
@@ -116,6 +117,13 @@ TrainField     := 'model' Identifier
                 | 'epochs' IntegerLiteral
                 | 'batch_size' IntegerLiteral
                 | 'learning_rate' (IntegerLiteral | FloatLiteral)
+                | LoraField
+
+LoraField      := 'lora' '{' LoraSubField* '}'
+LoraSubField   := 'rank' IntegerLiteral | 'alpha' (IntegerLiteral | FloatLiteral)
+
+ForecastDecl   := 'forecast' '{' ForecastField* '}'
+ForecastField  := 'model' Identifier | 'horizon' IntegerLiteral
 
 DottedName     := Identifier ('.' Identifier)*
 ```
@@ -167,7 +175,15 @@ Dopo il parsing, `blackforge check` valida:
   `batch_size` (interi positivi); `learning_rate` è opzionale (default
   `0.001` se omesso) e deve essere positivo se presente. I riferimenti
   a `model`/`dataset` sono risolti per nome in tutto il programma,
-  indipendentemente dall'ordine delle dichiarazioni.
+  indipendentemente dall'ordine delle dichiarazioni. Il blocco `lora`
+  opzionale richiede `rank` (intero positivo); `alpha` è opzionale
+  (default `rank`, cioè fattore di scala 1) e deve essere positivo se
+  presente.
+- **Forecast**: esattamente un `model` (deve esistere) e un `horizon`
+  (intero positivo). La compatibilità tra forma di input e di output
+  del modello (necessaria per il rollout autoregressivo) non è
+  verificabile qui: richiede la IR, quindi viene controllata a runtime
+  da `blackforge forecast`.
 
 ## Rappresentazione interna (IR)
 
@@ -316,7 +332,7 @@ dei valori visibilmente sbagliati).
   `BLACKFORGE_CUDA_ARCHITECTURES` (120, Blackwell consumer); altre
   architetture non sono state verificate.
 
-## Training (pretraining e fine-tuning)
+## Training (pretraining, fine-tuning, LoRA, forecasting)
 
 `dataset { ... }` e `train { ... }` collegano il linguaggio al motore
 di addestramento CPU (autodiff/loss/optimizer/checkpoint, vedi sopra).
@@ -375,14 +391,81 @@ scritto con `/` (es. `"C:/dati/train.bfdata"`) o con `\\` raddoppiati.
    step dell'optimizer, stampando la loss media dell'epoca.
 6. Se `--save-checkpoint <path>` è specificato, salva i pesi finali.
 
+### LoRA
+
+Aggiungendo un blocco `lora` dentro `train`:
+
+```blackforge
+train {
+    model TinyRegression
+    dataset ToyData
+    loss mse
+    optimizer adamw
+    epochs 50
+    batch_size 8
+    learning_rate 0.01
+    lora {
+        rank 4
+        alpha 8.0
+    }
+}
+```
+
+`blackforge train ... --from-checkpoint base.bfckpt` diventa allora un
+fine-tuning LoRA: **richiede** `--from-checkpoint` (rifiutato altrimenti
+con un errore esplicito — allenare un adapter su pesi casuali non ha
+senso). Ogni layer `linear` del modello riceve due matrici a basso
+rango A `[inFeatures, rank]` e B `[rank, outFeatures]`, inizializzate
+rispettivamente con piccoli valori deterministici e a **zero** (cosí il
+contributo dell'adapter è esattamente nullo all'inizio: il modello si
+comporta come i soli pesi di base finché A/B non si allenano — la
+convenzione standard di LoRA). L'uscita del layer diventa:
+
+```
+output = linear(x, W, b) + (alpha / rank) * (x @ A) @ B
+```
+
+con `W`/`b` **congelati** (nessun gradiente accumulato, non restituiti
+dall'optimizer): solo A e B vengono allenati. Un checkpoint salvato
+durante un addestramento LoRA (`--save-checkpoint`) contiene sia i pesi
+di base sia gli adapter — è autosufficiente, caricabile con
+`blackforge run`/`blackforge forecast` senza bisogno di sapere che è
+stato allenato con LoRA.
+
+### Forecasting
+
+```blackforge
+model DriftModel {
+    input bf16[batch, 4]
+    input |> linear(4)
+}
+
+forecast {
+    model DriftModel
+    horizon 8
+}
+```
+
+`blackforge forecast <file.bf> --from-checkpoint pesi.bfckpt --batch N`
+esegue un **rollout autoregressivo**: genera un input sintetico iniziale
+con la forma dichiarata dal modello (dimensioni simboliche risolte a
+`--batch`), poi applica il modello `horizon` volte, usando l'output di
+ogni passo come input del passo successivo. Questo richiede che
+l'ultima dimensione (le feature) di input e output del modello
+coincidano — altrimenti l'output non potrebbe diventare il prossimo
+input — e viene verificato a runtime (non nell'analisi semantica, che
+non ha accesso alla IR con le forme inferite): un modello come
+`linear(2)` con input a 4 feature viene rifiutato con un errore chiaro.
+Come per `train`, `--from-checkpoint` è obbligatorio.
+
 ### Limitazioni esplicite
 
 - Solo sul backend CPU: l'autodiff non esiste ancora sul backend CUDA
-  (milestone 7 ha implementato solo la forward pass su GPU).
-- Solo il primo blocco `train` del file viene eseguito.
+  (milestone 7 ha implementato solo la forward pass su GPU) — questo
+  vale anche per LoRA e forecasting.
+- Solo il primo blocco `train`/`forecast` del file viene eseguito.
 - Nessuno shuffle dei dati tra le epoche; nessun batch parziale (un
   dataset con `numEsempi % batch_size != 0` scarta gli esempi in eccesso).
 - Nessun learning rate scheduler, nessuna validazione/early stopping.
-- **LoRA e forecasting non sono ancora implementati**: richiedono
-  rispettivamente nuove operazioni IR per gli adapter a basso rango e
-  layer/loss specifici per serie temporali.
+- Il forecasting usa un input sintetico iniziale (nessun modo ancora di
+  fornire una sequenza "seed" reale da cui partire).

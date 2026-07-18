@@ -227,3 +227,88 @@ TEST(ParserTest, SegnalaErroreSuCampoTrainSconosciuto) {
         "}\n");
     EXPECT_TRUE(result.diagnostics.hasErrors());
 }
+
+TEST(ParserTest, ParsaTrainDeclConLora) {
+    ParseResult result = parse(
+        "train {\n"
+        "    model M\n"
+        "    dataset D\n"
+        "    loss mse\n"
+        "    optimizer adamw\n"
+        "    epochs 5\n"
+        "    batch_size 8\n"
+        "    lora {\n"
+        "        rank 4\n"
+        "        alpha 8.0\n"
+        "    }\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    const auto& train = std::get<ast::TrainDecl>(result.program.declarations[0]);
+    ASSERT_EQ(train.fields.size(), 7u);
+
+    const auto& lora = std::get<ast::TrainLoraField>(train.fields[6]);
+    EXPECT_EQ(lora.rank, 4);
+    EXPECT_DOUBLE_EQ(lora.alpha, 8.0);
+}
+
+TEST(ParserTest, ParsaTrainDeclConLoraSenzaAlphaUsaRankComeDefault) {
+    ParseResult result = parse(
+        "train {\n"
+        "    model M\n"
+        "    dataset D\n"
+        "    loss mse\n"
+        "    optimizer sgd\n"
+        "    epochs 1\n"
+        "    batch_size 1\n"
+        "    lora {\n"
+        "        rank 6\n"
+        "    }\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    const auto& train = std::get<ast::TrainDecl>(result.program.declarations[0]);
+    const auto& lora = std::get<ast::TrainLoraField>(train.fields[6]);
+    EXPECT_EQ(lora.rank, 6);
+    EXPECT_DOUBLE_EQ(lora.alpha, 6.0);
+}
+
+TEST(ParserTest, SegnalaErroreSeLoraNonHaRank) {
+    ParseResult result = parse(
+        "train {\n"
+        "    model M\n"
+        "    dataset D\n"
+        "    loss mse\n"
+        "    optimizer sgd\n"
+        "    epochs 1\n"
+        "    batch_size 1\n"
+        "    lora {\n"
+        "        alpha 8.0\n"
+        "    }\n"
+        "}\n");
+    EXPECT_TRUE(result.diagnostics.hasErrors());
+}
+
+TEST(ParserTest, ParsaForecastDeclCompleto) {
+    ParseResult result = parse(
+        "forecast {\n"
+        "    model M\n"
+        "    horizon 10\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    ASSERT_EQ(result.program.declarations.size(), 1u);
+
+    const auto& forecast = std::get<ast::ForecastDecl>(result.program.declarations[0]);
+    ASSERT_EQ(forecast.fields.size(), 2u);
+    EXPECT_EQ(std::get<ast::ForecastModelField>(forecast.fields[0]).name, "M");
+    EXPECT_EQ(std::get<ast::ForecastHorizonField>(forecast.fields[1]).value, 10);
+}
+
+TEST(ParserTest, SegnalaErroreSuCampoForecastSconosciuto) {
+    ParseResult result = parse(
+        "forecast {\n"
+        "    foo bar\n"
+        "}\n");
+    EXPECT_TRUE(result.diagnostics.hasErrors());
+}

@@ -172,6 +172,8 @@ void dumpTrainField(std::ostringstream& out, int depth, const TrainField& field)
                 out << "batch_size = " << node.value << "\n";
             } else if constexpr (std::is_same_v<T, TrainLearningRateField>) {
                 out << "learning_rate = " << node.value << "\n";
+            } else if constexpr (std::is_same_v<T, TrainLoraField>) {
+                out << "lora rank=" << node.rank << " alpha=" << node.alpha << "\n";
             }
         },
         field);
@@ -182,6 +184,28 @@ void dumpTrainDecl(std::ostringstream& out, int depth, const TrainDecl& decl) {
     out << "TrainDecl\n";
     for (const auto& field : decl.fields) {
         dumpTrainField(out, depth + 1, field);
+    }
+}
+
+void dumpForecastField(std::ostringstream& out, int depth, const ForecastField& field) {
+    std::visit(
+        [&](const auto& node) {
+            using T = std::decay_t<decltype(node)>;
+            indent(out, depth);
+            if constexpr (std::is_same_v<T, ForecastModelField>) {
+                out << "model = " << node.name << "\n";
+            } else if constexpr (std::is_same_v<T, ForecastHorizonField>) {
+                out << "horizon = " << node.value << "\n";
+            }
+        },
+        field);
+}
+
+void dumpForecastDecl(std::ostringstream& out, int depth, const ForecastDecl& decl) {
+    indent(out, depth);
+    out << "ForecastDecl\n";
+    for (const auto& field : decl.fields) {
+        dumpForecastField(out, depth + 1, field);
     }
 }
 
@@ -199,6 +223,8 @@ void dumpDecl(std::ostringstream& out, int depth, const Decl& decl) {
                 dumpDatasetDecl(out, depth, node);
             } else if constexpr (std::is_same_v<T, TrainDecl>) {
                 dumpTrainDecl(out, depth, node);
+            } else if constexpr (std::is_same_v<T, ForecastDecl>) {
+                dumpForecastDecl(out, depth, node);
             }
         },
         decl);
