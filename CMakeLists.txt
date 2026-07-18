@@ -139,6 +139,11 @@ if(BLACKFORGE_ENABLE_CUDA)
         src/backend/cuda/ops_gemm.cu
         src/backend/cuda/executor.cu
         src/backend/cuda/device_query.cu
+        src/backend/cuda/autodiff.cu
+        src/backend/cuda/loss.cu
+        src/backend/cuda/model.cu
+        src/backend/cuda/optimizer.cu
+        src/backend/cuda/train_runner.cu
     )
 endif()
 

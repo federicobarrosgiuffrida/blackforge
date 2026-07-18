@@ -54,6 +54,17 @@ DeviceTensor DeviceTensor::fromHost(const runtime::Tensor& host) {
     return device;
 }
 
+DeviceTensor DeviceTensor::zeros(std::vector<std::size_t> shape) {
+    DeviceTensor device(std::move(shape));
+    if (device.elementCount() > 0) {
+        // Un pattern di byte tutto a zero e' anche il float 0.0f valido
+        // (rappresentazione IEEE 754), quindi cudaMemset(...,0,...) e'
+        // corretto qui (non lo sarebbe per un valore diverso da zero).
+        BLACKFORGE_CUDA_CHECK(cudaMemset(device.data_, 0, device.elementCount() * sizeof(float)));
+    }
+    return device;
+}
+
 runtime::Tensor DeviceTensor::toHost() const {
     std::vector<float> hostData(elementCount());
     if (!hostData.empty()) {
@@ -61,6 +72,15 @@ runtime::Tensor DeviceTensor::toHost() const {
             cudaMemcpy(hostData.data(), data_, hostData.size() * sizeof(float), cudaMemcpyDeviceToHost));
     }
     return runtime::Tensor(shape_, std::move(hostData));
+}
+
+DeviceTensor DeviceTensor::clone() const {
+    DeviceTensor copy(shape_);
+    if (copy.elementCount() > 0) {
+        BLACKFORGE_CUDA_CHECK(
+            cudaMemcpy(copy.data_, data_, copy.elementCount() * sizeof(float), cudaMemcpyDeviceToDevice));
+    }
+    return copy;
 }
 
 std::size_t DeviceTensor::elementCount() const { return product(shape_); }

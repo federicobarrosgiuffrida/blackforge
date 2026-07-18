@@ -40,6 +40,11 @@ if(BLACKFORGE_ENABLE_CUDA)
         backend/cuda/ops_tests.cu
         backend/cuda/executor_tests.cu
         backend/cuda/device_query_tests.cu
+        backend/cuda/autodiff_tests.cu
+        backend/cuda/loss_tests.cu
+        backend/cuda/model_tests.cu
+        backend/cuda/optimizer_tests.cu
+        backend/cuda/train_runner_tests.cu
     )
 endif()
 

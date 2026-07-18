@@ -65,7 +65,8 @@ obiettivi futuri.
 | Fine-tuning (`blackforge train --from-checkpoint`) | ✅ Riprende l'addestramento da un checkpoint esistente |
 | LoRA (`train { lora { rank alpha } }`) | ✅ Adapter a basso rango su ogni layer `linear`, pesi di base congelati; verificato con gradient checking e con un test che conferma che i pesi di base restano invariati dopo l'addestramento |
 | Forecasting (`forecast { model horizon }`, `blackforge forecast`) | ✅ Rollout autoregressivo (l'output di un passo diventa l'input del successivo); richiede che l'ultima dimensione di input e output del modello coincidano e un checkpoint pre-allenato |
-| Training/fine-tuning/LoRA su GPU | ⏳ Pianificato: l'autodiff esiste solo sul backend CPU per ora (milestone 6); il backend CUDA (milestone 7) ha solo la forward pass |
+| Autodiff su GPU (`blackforge train --device cuda`) | ✅ Kernel CUDA scritti a mano per ogni backward (matmul, addBias, silu/relu/gelu, rmsnorm), loss MSE e optimizer (SGD, AdamW) interamente su device; ogni kernel confrontato numericamente contro la controparte CPU, incluso un test di parità sull'intero training loop (stessa loss finale, stessi pesi finali, CPU vs GPU). Percorso minimo: solo `loss mse`, nessun LoRA, nessun `--from-checkpoint`/`--save-checkpoint` — errore esplicito (non fallback silenzioso) se richiesti |
+| Training/fine-tuning/LoRA su GPU (oltre il percorso minimo sopra) | ⏳ Pianificato: cross-entropy su GPU, LoRA su GPU, checkpoint su GPU |
 | CLI completa (`check`, `build`, `run`, `train`, `forecast`, `benchmark`, `inspect`, `devices`) | ✅ Tutti e 6 i comandi della visione originale implementati, più `forecast`/`devices` |
 | Benchmark (`blackforge benchmark`) | ✅ Hardware rilevato, precisione dichiarata (e realmente applicata sul backend CPU, vedi riga sopra), forma, tempo medio, throughput, memoria stimata, iterazioni/warmup configurabili; con `--device cuda` confronta automaticamente con la CPU (speedup e scarto massimo) |
 | Profiling | 🟡 Solo timing aggregato per iterazione (dentro `benchmark`); nessun breakdown per singola operazione |
@@ -162,8 +163,9 @@ blackforge run <file.bf>                # esegue il primo modello su CPU (batch=
 blackforge run <file.bf> --batch 8      # come sopra, con batch size esplicito
 blackforge run <file.bf> --device cuda:0  # esegue sulla GPU 0 (richiede una build con CUDA)
 blackforge train <file.bf>              # addestra il modello del blocco 'train' (CPU)
-blackforge train <file.bf> --from-checkpoint pesi.bfckpt  # fine-tuning (o base per LoRA)
-blackforge train <file.bf> --save-checkpoint pesi.bfckpt  # salva i pesi finali
+blackforge train <file.bf> --from-checkpoint pesi.bfckpt  # fine-tuning (o base per LoRA, solo CPU)
+blackforge train <file.bf> --save-checkpoint pesi.bfckpt  # salva i pesi finali (solo CPU)
+blackforge train <file.bf> --device cuda  # addestra sulla GPU (solo loss 'mse', niente lora/checkpoint per ora)
 blackforge forecast <file.bf> --from-checkpoint pesi.bfckpt --batch 1  # rollout autoregressivo
 blackforge benchmark <file.bf> --batch 8 --warmup 5 --iterations 20  # tempo/throughput/memoria
 blackforge benchmark <file.bf> --device cuda  # come sopra + confronto automatico con la CPU
@@ -205,8 +207,20 @@ blocco `train` del file, sul dataset che referenzia (caricato da disco,
 non sintetico), stampando la loss media per epoca. Con un blocco
 `lora { rank N alpha F }` dentro `train`, invece di allenare i pesi
 originali allena un adapter a basso rango (richiede `--from-checkpoint`:
-non ha senso allenare un adapter su pesi casuali). Solo sul backend CPU
-per ora — l'autodiff non esiste ancora sul backend CUDA.
+non ha senso allenare un adapter su pesi casuali).
+
+Con `--device cuda`, l'intero ciclo di addestramento (forward, loss,
+backward, aggiornamento dei pesi) avviene su device: ogni kernel di
+backward (matmul, addBias, silu/relu/gelu, rmsnorm) e ogni optimizer
+(SGD, AdamW) sono implementazioni CUDA scritte a mano, verificate contro
+la controparte CPU sia kernel per kernel sia sull'intero training loop
+(vedi `tests/backend/cuda/`). E' un **percorso minimo, non ancora alla
+pari con la CPU**: supporta solo `loss mse` (non `cross_entropy`),
+nessun blocco `lora`, e nessun `--from-checkpoint`/`--save-checkpoint`
+(il formato di checkpoint non è ancora collegato al `Model` CUDA). Se
+il programma richiede una di queste funzionalità con `--device cuda`,
+il comando fallisce con un errore esplicito — non esegue un fallback
+silenzioso sulla CPU né ignora la richiesta.
 
 `blackforge forecast` esegue il modello referenziato dal primo blocco
 `forecast` ripetutamente per `horizon` passi, usando l'output di ogni
@@ -282,7 +296,7 @@ PolyForm Noncommercial License 1.0.0 — vedi [LICENSE.md](LICENSE.md).
 5. ✅ Backend CPU di riferimento: tensori, elementwise, matmul, layer lineari, attivazioni, esecuzione (`blackforge run`)
 6. ✅ Autodiff, loss (MSE), optimizer (SGD, AdamW), checkpoint su CPU
 7. ✅ Backend CUDA: tensori device, add/addBias/matmul (cuBLAS)/silu/relu/gelu, esecuzione (`blackforge run --device cuda`), rilevamento GPU (`blackforge devices`) — testato su GPU reale. Tensor Core e precisioni ridotte reali (fp8/bf16/tf32) restano lavoro futuro.
-8. ✅ Training: grammatica `dataset`/`train`/`forecast`, formato dataset su disco, pretraining, fine-tuning, LoRA (`train { lora { ... } }`) e forecasting autoregressivo (`blackforge forecast`) — tutti completati e verificati end-to-end su CPU (loss che scende davvero, pesi di base verificati congelati durante LoRA, rollout autoregressivo verificato con un modello identita'). Training/fine-tuning/LoRA su GPU restano lavoro futuro: richiedono prima l'autodiff sul backend CUDA.
+8. ✅ Training: grammatica `dataset`/`train`/`forecast`, formato dataset su disco, pretraining, fine-tuning, LoRA (`train { lora { ... } }`) e forecasting autoregressivo (`blackforge forecast`) — tutti completati e verificati end-to-end su CPU (loss che scende davvero, pesi di base verificati congelati durante LoRA, rollout autoregressivo verificato con un modello identita'). Alla fine di questa milestone, training/fine-tuning/LoRA su GPU erano ancora lavoro futuro (l'autodiff esisteva solo su CPU): risolto in parte da lavoro successivo, vedi la riga "Autodiff su GPU" nella tabella di stato sopra.
 9. ✅ CLI completa (`build`, `benchmark`, `inspect` aggiunti — tutti e 6 i comandi della visione originale ora esistono), benchmark con confronto CPU/GPU automatico, selezione GPU per indice (`--device cuda:N`), documentazione finale aggiornata. Profiling resta parziale (solo timing aggregato, nessun breakdown per operazione); pass manager e generazione di codice nativo non sono stati iniziati.
 
 ## Contribuire

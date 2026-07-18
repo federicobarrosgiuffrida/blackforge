@@ -509,17 +509,52 @@ non ha accesso alla IR con le forme inferite): un modello come
 `linear(2)` con input a 4 feature viene rifiutato con un errore chiaro.
 Come per `train`, `--from-checkpoint` è obbligatorio.
 
-### Limitazioni esplicite
+### Addestramento su GPU (`blackforge train --device cuda`)
 
-- Solo sul backend CPU: l'autodiff non esiste ancora sul backend CUDA
-  (milestone 7 ha implementato solo la forward pass su GPU) — questo
-  vale anche per LoRA e forecasting.
+`blackforge::backend::cuda` include ora un motore di addestramento
+completo (autodiff, loss, optimizer), interamente su device: forward,
+loss, backward e l'aggiornamento dei pesi non lasciano mai la GPU
+tranne per lo scalare finale della loss (necessario solo per stamparlo
+a schermo). Ogni kernel di backward — `matmul`, `addBias`,
+`silu`/`relu`/`gelu`, `rmsnorm` — è un kernel CUDA scritto a mano, non
+un wrapper attorno al backend CPU: correttezza-prima-che-prestazioni,
+quindi `matmulBackward` usa un kernel "ingenuo" (un thread per elemento
+di output, loop di riduzione interno) invece di cuBLAS con
+trasposizioni, la stessa struttura a triplo loop del backend CPU già
+verificato, solo parallelizzata. Ogni kernel è confrontato
+numericamente contro la controparte CPU (`tests/backend/cuda/
+autodiff_tests.cu`, `loss_tests.cu`, `optimizer_tests.cu`), e l'intero
+training loop è verificato end-to-end: uno stesso modello, allenato
+indipendentemente su CPU e su GPU con lo stesso seme, stessi dati,
+stesso optimizer, deve arrivare a una loss finale e a pesi finali
+numericamente equivalenti (`CudaModelTest.
+TrainingLoopCorrispondeAllaVersioneCpuAParitaDiSeme`).
+
+**Percorso minimo, non ancora alla pari con la CPU.** Queste sono
+limitazioni esplicite di questa prima versione, non omissioni
+nascoste: se richieste, `blackforge train --device cuda` fallisce con
+un errore chiaro (mai un fallback silenzioso sulla CPU, mai un
+risultato quietamente sbagliato):
+
+- Solo `loss mse`: `cross_entropy` su GPU è lavoro futuro.
+- Nessun blocco `lora`: nessun adapter a basso rango implementato su
+  `cuda::Model`.
+- Nessun `--from-checkpoint`/`--save-checkpoint`: il formato di
+  checkpoint (`blackforge::backend::cpu::checkpoint`) non è ancora
+  collegato a `cuda::Model`.
+- L'inizializzazione dei pesi usa lo stesso generatore deterministico
+  del backend CPU (non Xavier/Kaiming), come per `Executor`/`Model`
+  CPU.
+
+### Limitazioni esplicite (comuni a CPU e GPU)
+
 - Solo il primo blocco `train`/`forecast` del file viene eseguito.
 - Nessuno shuffle dei dati tra le epoche; nessun batch parziale (un
   dataset con `numEsempi % batch_size != 0` scarta gli esempi in eccesso).
 - Nessun learning rate scheduler, nessuna validazione/early stopping.
 - Il forecasting usa un input sintetico iniziale (nessun modo ancora di
-  fornire una sequenza "seed" reale da cui partire).
+  fornire una sequenza "seed" reale da cui partire), ed esiste solo sul
+  backend CPU per ora.
 
 ## CLI: comandi completi
 
@@ -527,7 +562,7 @@ Come per `train`, `--from-checkpoint` è obbligatorio.
 blackforge check <file>      Analizza (lessico, sintassi, semantica); --verbose, --print-ast, --print-ir
 blackforge build <file>      Compila e costruisce ogni modello (alloca i parametri) senza eseguirlo
 blackforge run <file>        Esegue il primo modello; --batch N, --device cpu|cuda|cuda:N
-blackforge train <file>      Addestra (CPU); --from-checkpoint, --save-checkpoint
+blackforge train <file>      Addestra (CPU o CUDA); --device, --from-checkpoint/--save-checkpoint (solo CPU)
 blackforge forecast <file>   Rollout autoregressivo (CPU); --from-checkpoint (obbligatorio), --batch N
 blackforge benchmark <file>  Tempo/throughput/memoria; --device, --batch, --warmup, --iterations
 blackforge inspect <file>    Riepilogo: input, pipeline, numero di parametri per ogni modello

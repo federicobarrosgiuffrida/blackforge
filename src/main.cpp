@@ -28,6 +28,7 @@
 #if BLACKFORGE_HAS_CUDA
 #include "blackforge/backend/cuda/device_query.hpp"
 #include "blackforge/backend/cuda/executor.hpp"
+#include "blackforge/backend/cuda/train_runner.hpp"
 #endif
 
 namespace {
@@ -38,7 +39,7 @@ void printUsage() {
               << "  check <file>       Analizza il file e riporta gli errori (lessicali, sintattici, semantici)\n"
               << "  build <file>       Compila e costruisce ogni modello (alloca i parametri), senza eseguirlo\n"
               << "  run <file>         Esegue il primo modello del file\n"
-              << "  train <file>       Addestra il modello descritto dal blocco 'train' del file (CPU)\n"
+              << "  train <file>       Addestra il modello descritto dal blocco 'train' del file (CPU o CUDA)\n"
               << "  forecast <file>    Genera 'horizon' passi autoregressivi dal blocco 'forecast' del file (CPU)\n"
               << "  benchmark <file>   Misura tempo/throughput/memoria del primo modello del file\n"
               << "  inspect <file>     Mostra un riepilogo dei modelli (input, pipeline, numero di parametri)\n"
@@ -51,10 +52,13 @@ void printUsage() {
               << "  --print-ir         Mostra la rappresentazione interna (IR) del programma (solo 'check')\n"
               << "  --batch N          Dimensione di batch usata per risolvere le dimensioni simboliche "
                  "dell'input (default 1)\n"
-              << "  --device cpu|cuda|cuda:N  Dispositivo su cui eseguire ('run'/'benchmark', default cpu)\n"
-              << "  --from-checkpoint <file>  Pesi di partenza: fine-tuning/LoRA per 'train', "
+              << "  --device cpu|cuda|cuda:N  Dispositivo su cui eseguire ('run'/'train'/'benchmark', default "
+                 "cpu). Su 'train', il backend CUDA supporta solo loss 'mse', nessun 'lora' e nessun "
+                 "--from-checkpoint/--save-checkpoint per ora (errore esplicito se richiesti)\n"
+              << "  --from-checkpoint <file>  Pesi di partenza: fine-tuning/LoRA per 'train' (solo CPU), "
                  "obbligatorio per 'forecast'\n"
-              << "  --save-checkpoint <file>  Dove salvare i pesi al termine dell'addestramento (solo 'train')\n"
+              << "  --save-checkpoint <file>  Dove salvare i pesi al termine dell'addestramento (solo 'train', "
+                 "solo CPU)\n"
               << "  --warmup N         Iterazioni di riscaldamento scartate (solo 'benchmark', default 5)\n"
               << "  --iterations N     Iterazioni misurate (solo 'benchmark', default 20)\n";
 }
@@ -290,7 +294,20 @@ int runRun(const std::string& path, std::size_t batchSize, const std::string& de
     return 0;
 }
 
-int runTrain(const std::string& path, const std::string& fromCheckpoint, const std::string& saveCheckpointPath) {
+int runTrain(const std::string& path, const std::string& fromCheckpoint, const std::string& saveCheckpointPath,
+             const std::string& device) {
+    DeviceSpec spec;
+    std::string deviceError;
+    if (!parseDeviceSpec(device, spec, deviceError)) {
+        std::cerr << "errore: " << deviceError << "\n";
+        return 2;
+    }
+    if (spec.isCuda && !BLACKFORGE_HAS_CUDA) {
+        std::cerr << "errore: '--device " << device << "' richiesto ma questa build di blackforge e' stata "
+                     "compilata senza supporto CUDA (BLACKFORGE_ENABLE_CUDA=OFF in fase di compilazione)\n";
+        return 1;
+    }
+
     CompileOutput result = compile(path, /*verbose=*/false, /*printAst=*/false, /*printIr=*/false);
 
     if (result.status == CompileStatus::FileNotFound) {
@@ -302,8 +319,16 @@ int runTrain(const std::string& path, const std::string& fromCheckpoint, const s
     }
 
     try {
-        blackforge::backend::cpu::runTraining(result.program, result.module, fromCheckpoint, saveCheckpointPath,
-                                               &std::cout);
+        if (!spec.isCuda) {
+            blackforge::backend::cpu::runTraining(result.program, result.module, fromCheckpoint, saveCheckpointPath,
+                                                   &std::cout);
+        } else {
+#if BLACKFORGE_HAS_CUDA
+            blackforge::backend::cuda::setActiveDevice(spec.cudaIndex);
+            blackforge::backend::cuda::runTraining(result.program, result.module, fromCheckpoint, saveCheckpointPath,
+                                                    &std::cout);
+#endif
+        }
     } catch (const std::exception& e) {
         std::cerr << "errore di addestramento: " << e.what() << "\n";
         return 1;
@@ -665,7 +690,7 @@ int main(int argc, char** argv) {
             std::cerr << "errore: comando 'train' richiede il percorso di un file .bf\n";
             return 2;
         }
-        return runTrain(positional.front(), fromCheckpoint, saveCheckpointPath);
+        return runTrain(positional.front(), fromCheckpoint, saveCheckpointPath, device);
     }
     if (command == "forecast") {
         if (positional.empty()) {

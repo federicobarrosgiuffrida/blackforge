@@ -34,8 +34,20 @@ public:
     // Copia i dati di un runtime::Tensor host su un nuovo DeviceTensor.
     static DeviceTensor fromHost(const runtime::Tensor& host);
 
+    // Alloca un buffer device della forma data, azzerato (cudaMemset):
+    // usato per gradienti e stato dell'optimizer (momenti di AdamW), che
+    // devono partire da zero prima di essere accumulati.
+    static DeviceTensor zeros(std::vector<std::size_t> shape);
+
     // Copia i dati da device a un nuovo runtime::Tensor host.
     [[nodiscard]] runtime::Tensor toHost() const;
+
+    // Copia device-to-device su un nuovo DeviceTensor indipendente:
+    // serve dove servono due handle allo stesso contenuto che evolvono
+    // in modo indipendente (es. un'attivazione cachata per il backward
+    // mentre il forward continua a trasformarla), dato che DeviceTensor
+    // non e' copiabile per evitare doppie cudaFree accidentali.
+    [[nodiscard]] DeviceTensor clone() const;
 
     [[nodiscard]] float* data() { return data_; }
     [[nodiscard]] const float* data() const { return data_; }
