@@ -127,6 +127,7 @@ set(
     src/backend/cpu/train_runner.cpp
     src/backend/cpu/forecast_runner.cpp
     src/backend/cpu/benchmark.cpp
+    src/backend/cpu/quantize.cpp
     src/data/dataset.cpp
 )
 

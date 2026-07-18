@@ -41,7 +41,7 @@ std::size_t estimateElementCount(const ir::ModelIR& model, std::size_t batchSize
 }  // namespace
 
 BenchmarkResult runBenchmark(const ir::ModelIR& model, std::size_t batchSize, std::size_t warmupIterations,
-                              std::size_t measuredIterations) {
+                              std::size_t measuredIterations, const std::optional<ir::PrecisionPolicy>& precision) {
     if (model.pipelines.empty()) {
         throw std::invalid_argument("runBenchmark: il modello '" + model.name + "' non ha pipeline da eseguire");
     }
@@ -53,13 +53,13 @@ BenchmarkResult runBenchmark(const ir::ModelIR& model, std::size_t batchSize, st
     runtime::Tensor input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
 
     for (std::size_t i = 0; i < warmupIterations; ++i) {
-        runtime::Tensor output = executor.run(model, input);
+        runtime::Tensor output = executor.run(model, input, precision);
         (void)output;
     }
 
     auto start = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < measuredIterations; ++i) {
-        runtime::Tensor output = executor.run(model, input);
+        runtime::Tensor output = executor.run(model, input, precision);
         (void)output;
     }
     auto end = std::chrono::steady_clock::now();

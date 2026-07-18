@@ -52,8 +52,20 @@ public:
     // con pesi pre-allenati (caricando un checkpoint) prima
     // dell'addestramento: allenare un adapter su pesi casuali non ha
     // senso.
+    //
+    // Se 'precision' e' presente, forward() applica la quantizzazione
+    // simulata (vedi quantize.hpp) alle attivazioni (formato 'storage')
+    // e agli operandi di ogni matmul (formato 'compute'). ATTENZIONE:
+    // questo e' pensato SOLO per l'inferenza (es. blackforge forecast).
+    // backward() calcola comunque il gradiente della funzione originale
+    // non quantizzata rispetto alle attivazioni cachate (che, se
+    // precision e' attivo, sono gia' quantizzate): non e' uno
+    // straight-through estimator corretto per l'addestramento. Per
+    // questo train_runner.cpp non passa mai 'precision' a Model: il
+    // training resta sempre a piena precisione float32.
     explicit Model(const ir::ModelIR& modelIR, unsigned int seed = 42,
-                   std::optional<LoraOptions> lora = std::nullopt);
+                   std::optional<LoraOptions> lora = std::nullopt,
+                   std::optional<ir::PrecisionPolicy> precision = std::nullopt);
 
     // Esegue la pipeline e salva le attivazioni intermedie necessarie a
     // backward(). Va chiamata prima di ogni backward().
@@ -102,6 +114,7 @@ private:
     std::string name_;
     std::vector<LayerState> layers_;
     std::optional<LoraOptions> loraOptions_;
+    std::optional<ir::PrecisionPolicy> precision_;
 };
 
 }  // namespace blackforge::backend::cpu

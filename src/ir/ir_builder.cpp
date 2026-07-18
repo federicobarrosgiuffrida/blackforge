@@ -28,6 +28,44 @@ Module IRBuilder::build(const ast::Program& program) {
             } else {
                 module.target = target.target.toString();
             }
+        } else if (std::holds_alternative<ast::PrecisionDecl>(decl)) {
+            const auto& precisionDecl = std::get<ast::PrecisionDecl>(decl);
+            if (module.precision.has_value()) {
+                diagnostics_.addError(precisionDecl.location, "blocco 'precision' duplicato");
+                continue;
+            }
+
+            PrecisionPolicy policy;
+            for (const auto& field : precisionDecl.fields) {
+                std::optional<sema::DType> dtype = sema::parseDType(field.value);
+                if (!dtype.has_value()) {
+                    // Formato sconosciuto: gia' segnalato dall'analisi
+                    // semantica, qui si ignora silenziosamente il campo
+                    // (mantiene fp32, il default sicuro).
+                    continue;
+                }
+                switch (field.kind) {
+                    case ast::PrecisionFieldKind::Storage:
+                    case ast::PrecisionFieldKind::Parameters:
+                        policy.storage = *dtype;
+                        break;
+                    case ast::PrecisionFieldKind::Compute:
+                    case ast::PrecisionFieldKind::Forward:
+                        policy.compute = *dtype;
+                        break;
+                    case ast::PrecisionFieldKind::Accumulate:
+                        policy.accumulate = *dtype;
+                        break;
+                    case ast::PrecisionFieldKind::Backward:
+                        // La precisione del backward pass non e' ancora
+                        // gestita separatamente da quella del forward:
+                        // l'autodiff opera sempre alla precisione delle
+                        // attivazioni memorizzate (storage) e accumula
+                        // sempre in fp32.
+                        break;
+                }
+            }
+            module.precision = policy;
         }
     }
 

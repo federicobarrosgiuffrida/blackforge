@@ -129,6 +129,49 @@ TEST(IRBuilderTest, RifiutaSorgentePipelineNonInput) {
     EXPECT_TRUE(result.diagnostics.hasErrors());
 }
 
+TEST(IRBuilderTest, ModuloSenzaBloccoPrecisionNonHaPolicy) {
+    BuildResult result = buildIR(
+        "model M {\n"
+        "    input bf16[4096]\n"
+        "}\n");
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    EXPECT_FALSE(result.module.precision.has_value());
+}
+
+TEST(IRBuilderTest, EstraeLaPrecisionPolicyDalBloccoPrecision) {
+    BuildResult result = buildIR(
+        "precision {\n"
+        "    storage bf16\n"
+        "    compute fp8.e4m3\n"
+        "    accumulate fp32\n"
+        "}\n"
+        "model M {\n"
+        "    input bf16[4096]\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    ASSERT_TRUE(result.module.precision.has_value());
+    EXPECT_EQ(result.module.precision->storage, sema::DType::BF16);
+    EXPECT_EQ(result.module.precision->compute, sema::DType::FP8_E4M3);
+    EXPECT_EQ(result.module.precision->accumulate, sema::DType::FP32);
+}
+
+TEST(IRBuilderTest, ParametersEForwardSonoAliasDiStorageECompute) {
+    BuildResult result = buildIR(
+        "precision {\n"
+        "    parameters bf16\n"
+        "    forward fp8.e5m2\n"
+        "}\n"
+        "model M {\n"
+        "    input bf16[4096]\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    ASSERT_TRUE(result.module.precision.has_value());
+    EXPECT_EQ(result.module.precision->storage, sema::DType::BF16);
+    EXPECT_EQ(result.module.precision->compute, sema::DType::FP8_E5M2);
+}
+
 TEST(IRBuilderTest, DumpModuloContieneNomeModelloEForme) {
     BuildResult result = buildIR(
         "model TinyModel {\n"

@@ -51,6 +51,13 @@ std::string dump(const Module& module) {
     }
     out << "\n";
 
+    if (module.precision.has_value()) {
+        indent(out, 1);
+        out << "precision: storage=" << sema::dtypeName(module.precision->storage)
+            << " compute=" << sema::dtypeName(module.precision->compute)
+            << " accumulate=" << sema::dtypeName(module.precision->accumulate) << "\n";
+    }
+
     for (const auto& model : module.models) {
         dumpModel(out, 1, model);
     }

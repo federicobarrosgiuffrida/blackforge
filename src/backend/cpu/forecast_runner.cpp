@@ -80,7 +80,10 @@ ForecastRunResult runForecast(const ast::Program& program, const ir::Module& mod
                                   "dell'input e quella dell'output devono coincidere ed essere concrete");
     }
 
-    Model model(*modelIR);
+    // Il forecasting e' inferenza pura (nessun backward()): applicare la
+    // precisione dichiarata dal blocco 'precision' del programma qui e'
+    // sicuro, a differenza del training (vedi model.hpp).
+    Model model(*modelIR, /*seed=*/42, /*lora=*/std::nullopt, module.precision);
     loadCheckpoint(model, fromCheckpointPath);
 
     std::vector<std::size_t> shape;

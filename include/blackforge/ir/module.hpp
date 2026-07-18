@@ -7,6 +7,7 @@
 
 #include "blackforge/ir/operation.hpp"
 #include "blackforge/ir/value.hpp"
+#include "blackforge/sema/dtype.hpp"
 
 namespace blackforge::ir {
 
@@ -36,10 +37,21 @@ struct ModelIR {
     [[nodiscard]] const Value& valueById(std::size_t id) const { return values.at(id); }
 };
 
+// Precisione numerica dichiarata da un blocco 'precision' del
+// programma. I campi non dichiarati esplicitamente restano fp32 (il
+// default piu' sicuro): un programma senza blocco 'precision' equivale
+// a PrecisionPolicy{} (tutto fp32, nessun arrotondamento).
+struct PrecisionPolicy {
+    sema::DType storage = sema::DType::FP32;
+    sema::DType compute = sema::DType::FP32;
+    sema::DType accumulate = sema::DType::FP32;
+};
+
 // Rappresentazione interna dell'intero programma: target hardware
-// (se dichiarato) e i modelli definiti.
+// (se dichiarato), precisione dichiarata e i modelli definiti.
 struct Module {
     std::optional<std::string> target;
+    std::optional<PrecisionPolicy> precision;
     std::vector<ModelIR> models;
 };
 

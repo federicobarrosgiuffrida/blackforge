@@ -263,13 +263,18 @@ int runRun(const std::string& path, std::size_t batchSize, const std::string& de
         if (!spec.isCuda) {
             blackforge::backend::cpu::Executor executor;
             input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
-            output = executor.run(model, input);
+            output = executor.run(model, input, result.module.precision);
         } else {
 #if BLACKFORGE_HAS_CUDA
             blackforge::backend::cuda::setActiveDevice(spec.cudaIndex);
             blackforge::backend::cuda::Executor executor;
             input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
             output = executor.run(model, input);
+            if (result.module.precision.has_value()) {
+                std::cout << "nota: un blocco 'precision' e' dichiarato, ma il backend CUDA non applica ancora "
+                             "la quantizzazione simulata (solo il backend CPU lo fa per ora): l'esecuzione "
+                             "sulla GPU e' in piena precisione float32.\n";
+            }
 #endif
         }
 
@@ -372,13 +377,20 @@ int runBenchmark(const std::string& path, const std::string& device, std::size_t
     std::string dtypeName = blackforge::sema::dtypeName(model.valueById(model.inputValue).dtype);
 
     try {
-        blackforge::backend::cpu::BenchmarkResult cpuResult =
-            blackforge::backend::cpu::runBenchmark(model, batchSize, warmupIterations, measuredIterations);
+        blackforge::backend::cpu::BenchmarkResult cpuResult = blackforge::backend::cpu::runBenchmark(
+            model, batchSize, warmupIterations, measuredIterations, result.module.precision);
 
         std::cout << "Benchmark di '" << model.name << "'\n";
         std::cout << "  hardware:          CPU (backend di riferimento; nome del processore non rilevato)\n";
-        std::cout << "  precisione:        " << dtypeName
-                   << " dichiarata (il backend CPU calcola sempre in float32)\n";
+        if (result.module.precision.has_value()) {
+            std::cout << "  precisione:        " << dtypeName << " dichiarata; quantizzazione simulata applicata "
+                       << "(storage=" << blackforge::sema::dtypeName(result.module.precision->storage)
+                       << " compute=" << blackforge::sema::dtypeName(result.module.precision->compute)
+                       << "), accumulo interno sempre in float32\n";
+        } else {
+            std::cout << "  precisione:        " << dtypeName
+                       << " dichiarata (nessun blocco 'precision': calcolo in piena float32)\n";
+        }
         std::cout << "  forma input:       " << formatShape(cpuResult.inputShape) << "\n";
         std::cout << "  warmup:            " << cpuResult.warmupIterations << " iterazioni\n";
         std::cout << "  iterazioni:        " << cpuResult.measuredIterations << "\n";
@@ -459,6 +471,13 @@ int runInspect(const std::string& path) {
     std::cout << path << "\n";
     if (result.module.target.has_value()) {
         std::cout << "target: " << *result.module.target << "\n";
+    }
+    if (result.module.precision.has_value()) {
+        std::cout << "precision: storage=" << blackforge::sema::dtypeName(result.module.precision->storage)
+                   << " compute=" << blackforge::sema::dtypeName(result.module.precision->compute)
+                   << " accumulate=" << blackforge::sema::dtypeName(result.module.precision->accumulate)
+                   << " (applicata da 'run'/'forecast'/'benchmark' su CPU; non ancora su CUDA; ignorata durante "
+                      "'train')\n";
     }
     std::cout << result.module.models.size() << " modello/i\n";
 

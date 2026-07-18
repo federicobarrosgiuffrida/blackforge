@@ -219,13 +219,31 @@ una a una sul backend CPU (`blackforge::backend::cpu`):
   Xavier/Kaiming);
 - `silu`, `relu`, `gelu`: applicate elemento per elemento.
 
+Se il programma dichiara un blocco `precision { storage ... compute ...
+accumulate ... }` (vedi `include/blackforge/backend/cpu/quantize.hpp`),
+`run` applica una **quantizzazione simulata**: ogni attivazione viene
+arrotondata (con saturazione, non overflow a infinito) al formato
+`storage` dopo ogni operazione, e gli operandi di ogni `linear` vengono
+arrotondati al formato `compute` prima del prodotto matriciale. I
+numeri restano rappresentati come `float` C++: si tratta di
+un'emulazione via arrotondamento della mantissa (bit-esatta per BF16,
+via frexp/ldexp per TF32/FP16/FP8), non di un vero calcolo hardware in
+formato ridotto. `accumulate` è analizzato ma non ancora usato (non c'è
+un accumulatore separato da quantizzare nell'attuale insieme di
+operazioni). Senza un blocco `precision`, il comportamento resta quello
+originale: calcolo sempre in piena float32.
+
 Limitazioni note, esplicite:
 
-- Il backend CPU calcola sempre in **float32**, indipendentemente dal
-  formato numerico dichiarato (`bf16`, `fp8`, ...): serve a verificare
-  la correttezza funzionale, non a riprodurre la precisione reale
-  dell'hardware. L'emulazione dei formati ridotti arriverà con il
-  backend CUDA.
+- Il backend CUDA non applica ancora la quantizzazione: calcola sempre
+  in float32 indipendentemente da `precision`. Solo il backend CPU la
+  applica per ora.
+- `blackforge train` ignora sempre `precision` (a prescindere dal
+  device): la quantizzazione non è differenziabile così com'è
+  implementata (servirebbe uno straight-through estimator per il
+  backward, non ancora presente), quindi l'addestramento resta sempre
+  a piena precisione float32 per non comprometterne la correttezza
+  verificata via gradient checking.
 - Viene eseguita solo la prima pipeline del primo modello del file.
 - `blackforge run` usa `Executor`, che rigenera pesi casuali ad ogni
   chiamata (comodo per ispezionare rapidamente un'esecuzione, ma non
@@ -515,10 +533,15 @@ allocazioni) seguite da `--iterations N` iterazioni misurate (default
 20) con `std::chrono::steady_clock`. Riporta hardware (per la CPU: solo
 "backend di riferimento", nessun rilevamento del modello di processore;
 per la GPU: nome e indice via il driver CUDA), la precisione dichiarata
-nel modello (il calcolo avviene comunque sempre in float32), la forma
-dell'input, tempo medio, throughput (campioni/secondo) e una stima
-della memoria (elementi di input + attivazioni intermedie + parametri,
-× 4 byte — una stima teorica, non memoria di processo misurata).
+nel modello, la forma dell'input, tempo medio, throughput
+(campioni/secondo) e una stima della memoria (elementi di input +
+attivazioni intermedie + parametri, × 4 byte — una stima teorica, non
+memoria di processo misurata). Se il modello dichiara un blocco
+`precision`, la misura sul backend CPU applica davvero la
+quantizzazione simulata a ogni iterazione (il tempo riportato include
+quindi anche il suo costo); il confronto `--device cuda` calcola invece
+sempre in piena float32 su entrambi i lati (CUDA non applica ancora
+`precision`), per restare un confronto equo tra le due esecuzioni.
 
 Con `--device cuda`, dopo la misura CPU esegue la stessa misura sulla
 GPU e stampa anche lo speedup (`tempoCPU / tempoGPU`) e lo scarto

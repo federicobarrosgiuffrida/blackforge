@@ -4,6 +4,7 @@
 
 #include "blackforge/backend/cpu/autodiff.hpp"
 #include "blackforge/backend/cpu/ops.hpp"
+#include "blackforge/backend/cpu/quantize.hpp"
 #include "blackforge/backend/cpu/random_init.hpp"
 
 namespace blackforge::backend::cpu {
@@ -22,8 +23,9 @@ void accumulate(runtime::Tensor& target, const runtime::Tensor& delta) {
 
 }  // namespace
 
-Model::Model(const ir::ModelIR& modelIR, unsigned int seed, std::optional<LoraOptions> lora)
-    : name_(modelIR.name), loraOptions_(lora) {
+Model::Model(const ir::ModelIR& modelIR, unsigned int seed, std::optional<LoraOptions> lora,
+             std::optional<ir::PrecisionPolicy> precision)
+    : name_(modelIR.name), loraOptions_(lora), precision_(precision) {
     if (modelIR.pipelines.empty()) {
         throw std::invalid_argument("Model: il modello '" + modelIR.name + "' non ha pipeline da addestrare");
     }
@@ -78,15 +80,31 @@ Model::Model(const ir::ModelIR& modelIR, unsigned int seed, std::optional<LoraOp
 
 runtime::Tensor Model::forward(const runtime::Tensor& input) {
     runtime::Tensor current = input;
+    if (precision_.has_value()) {
+        current = quantize(current, precision_->storage);
+    }
 
     for (auto& layer : layers_) {
         layer.cachedInput = current;
 
         switch (layer.kind) {
             case ir::OpKind::Linear: {
-                runtime::Tensor base = linear(current, layer.weight->value, layer.bias->value);
+                runtime::Tensor computeInput = current;
+                runtime::Tensor computeWeight = layer.weight->value;
+                if (precision_.has_value()) {
+                    computeInput = quantize(computeInput, precision_->compute);
+                    computeWeight = quantize(computeWeight, precision_->compute);
+                }
+                runtime::Tensor base = linear(computeInput, computeWeight, layer.bias->value);
+
                 if (layer.loraA.has_value()) {
-                    layer.cachedLoraHidden = matmul(current, layer.loraA->value);
+                    runtime::Tensor loraInput = current;
+                    runtime::Tensor loraA = layer.loraA->value;
+                    if (precision_.has_value()) {
+                        loraInput = quantize(loraInput, precision_->compute);
+                        loraA = quantize(loraA, precision_->compute);
+                    }
+                    layer.cachedLoraHidden = matmul(loraInput, loraA);
                     runtime::Tensor loraOut = matmul(layer.cachedLoraHidden, layer.loraB->value);
                     auto factor = static_cast<float>(loraOptions_->alpha / static_cast<double>(loraOptions_->rank));
                     current = add(base, scale(loraOut, factor));
@@ -98,6 +116,10 @@ runtime::Tensor Model::forward(const runtime::Tensor& input) {
             case ir::OpKind::Silu: current = silu(current); break;
             case ir::OpKind::Relu: current = relu(current); break;
             case ir::OpKind::Gelu: current = gelu(current); break;
+        }
+
+        if (precision_.has_value()) {
+            current = quantize(current, precision_->storage);
         }
     }
 

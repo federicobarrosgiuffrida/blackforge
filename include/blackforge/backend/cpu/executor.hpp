@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 
 #include "blackforge/ir/module.hpp"
 #include "blackforge/runtime/tensor.hpp"
@@ -26,9 +27,16 @@ public:
     [[nodiscard]] runtime::Tensor makeSyntheticInput(const ir::Value& inputValue, std::size_t batchSize) const;
 
     // Esegue la prima pipeline del modello sul tensore di input fornito.
-    // Lancia std::invalid_argument se il modello non ha pipeline o se
-    // la forma dell'input non e' compatibile con la prima operazione.
-    [[nodiscard]] runtime::Tensor run(const ir::ModelIR& model, const runtime::Tensor& input) const;
+    // Se 'precision' e' presente, applica la quantizzazione simulata
+    // (vedi quantize.hpp) a input/pesi (formato 'compute', prima di
+    // ogni matmul) e alle attivazioni intermedie (formato 'storage',
+    // dopo ogni operazione): e' cosi' che un blocco 'precision' del
+    // programma influisce davvero sui numeri, non solo sulla
+    // validazione. Lancia std::invalid_argument se il modello non ha
+    // pipeline o se la forma dell'input non e' compatibile con la
+    // prima operazione.
+    [[nodiscard]] runtime::Tensor run(const ir::ModelIR& model, const runtime::Tensor& input,
+                                       const std::optional<ir::PrecisionPolicy>& precision = std::nullopt) const;
 
 private:
     unsigned int seed_;

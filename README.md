@@ -58,7 +58,7 @@ obiettivi futuri.
 | Selezione dispositivo (`blackforge run --device cpu\|cuda`) | ✅ Implementata |
 | Tensor Core / precisioni FP8/BF16/TF32 reali su GPU | ⏳ Pianificato — il backend CUDA oggi calcola in float32 (SGEMM), come il backend CPU: nessun uso di Tensor Core o dei formati ridotti come precisione di calcolo reale ancora |
 | Supporto multi-architettura CUDA oltre Blackwell (sm_120) | ⏳ Non testato: il progetto compila solo per l'architettura configurata in `BLACKFORGE_CUDA_ARCHITECTURES` |
-| Precisioni FP8 (e4m3/e5m2), FP16, BF16, TF32, FP32 | 🟡 Riconosciute e validate nel linguaggio; sia il backend CPU sia quello CUDA calcolano sempre in float32 come riferimento (nessuna emulazione/uso reale dei formati ridotti ancora) |
+| Precisioni FP8 (e4m3/e5m2), FP16, BF16, TF32, FP32 | 🟡 Riconosciute, validate e ora applicate come **quantizzazione simulata** (arrotondamento del valore float32 al formato dichiarato, con saturazione) dal backend CPU per `blackforge run`/`forecast`/`benchmark`: un blocco `precision` cambia davvero i numeri prodotti. Il backend CUDA calcola ancora sempre in float32 (nessun uso reale di Tensor Core o dei formati ridotti). `blackforge train` ignora sempre `precision` e resta a piena precisione float32 (la quantizzazione non è differenziabile: servirebbe uno straight-through estimator, non ancora implementato) |
 | Grammatica `dataset { ... }` e `train { ... }` | ✅ Completata (parser, analisi semantica con validazione incrociata dei riferimenti a model/dataset) |
 | Formato dataset su disco + caricamento a batch | ✅ Formato binario proprietario BlackForge, con batching (incl. wraparound tra epoche) testato |
 | Pretraining (`blackforge train`) | ✅ Addestra un modello da zero su CPU, verificato end-to-end (la loss scende davvero, non solo "compila") |
@@ -67,7 +67,7 @@ obiettivi futuri.
 | Forecasting (`forecast { model horizon }`, `blackforge forecast`) | ✅ Rollout autoregressivo (l'output di un passo diventa l'input del successivo); richiede che l'ultima dimensione di input e output del modello coincidano e un checkpoint pre-allenato |
 | Training/fine-tuning/LoRA su GPU | ⏳ Pianificato: l'autodiff esiste solo sul backend CPU per ora (milestone 6); il backend CUDA (milestone 7) ha solo la forward pass |
 | CLI completa (`check`, `build`, `run`, `train`, `forecast`, `benchmark`, `inspect`, `devices`) | ✅ Tutti e 6 i comandi della visione originale implementati, più `forecast`/`devices` |
-| Benchmark (`blackforge benchmark`) | ✅ Hardware rilevato, precisione dichiarata, forma, tempo medio, throughput, memoria stimata, iterazioni/warmup configurabili; con `--device cuda` confronta automaticamente con la CPU (speedup e scarto massimo) |
+| Benchmark (`blackforge benchmark`) | ✅ Hardware rilevato, precisione dichiarata (e realmente applicata sul backend CPU, vedi riga sopra), forma, tempo medio, throughput, memoria stimata, iterazioni/warmup configurabili; con `--device cuda` confronta automaticamente con la CPU (speedup e scarto massimo) |
 | Profiling | 🟡 Solo timing aggregato per iterazione (dentro `benchmark`); nessun breakdown per singola operazione |
 | Selezione GPU (`--device cuda:N`) | ✅ Implementata (`cudaSetDevice`); resta comunque una sola GPU alla volta, non multi-GPU simultaneo |
 | Pass manager / ottimizzazioni del grafo, generazione di codice nativo | ⏳ Non iniziato |
@@ -178,11 +178,27 @@ input sintetico (deterministico, non un dataset reale) e pesi generati
 in modo deterministico ma statisticamente arbitrario (non Xavier/Kaiming,
 non caricati da checkpoint): serve a dimostrare che l'intera catena
 letto→validato→compilato→eseguito funziona, non a produrre un modello
-utile. A parità di seme, `--device cpu` e `--device cuda` usano
-esattamente gli stessi pesi iniziali e producono lo stesso risultato
-(verificato nei test di parità CPU/GPU). `--device cuda:N` seleziona
-l'indice della GPU quando ce n'è più di una (non è multi-GPU: si esegue
-comunque su una sola GPU alla volta).
+utile. A parità di seme e **senza un blocco `precision`**, `--device cpu`
+e `--device cuda` usano esattamente gli stessi pesi iniziali e producono
+lo stesso risultato (verificato nei test di parità CPU/GPU). `--device
+cuda:N` seleziona l'indice della GPU quando ce n'è più di una (non è
+multi-GPU: si esegue comunque su una sola GPU alla volta).
+
+Se il programma dichiara un blocco `precision { storage ... compute ...
+accumulate ... }`, `blackforge run`/`forecast`/`benchmark` lo applicano
+davvero sul backend CPU: ogni attivazione viene arrotondata (con
+saturazione, non overflow a infinito) al formato `storage` dopo ogni
+operazione, e gli operandi di ogni prodotto matriciale (`linear`)
+vengono arrotondati al formato `compute` prima del calcolo — è una
+**quantizzazione simulata** (i numeri restano `float`, solo con meno
+bit di mantissa "effettivi"), non un vero calcolo in FP8/BF16/TF32 su
+hardware dedicato. Il campo `accumulate` è analizzato ma non ancora
+usato (nell'attuale insieme di operazioni non c'è un accumulatore
+separato da quantizzare). Con `precision` dichiarato, `--device cpu` e `--device cuda` **non**
+producono più lo stesso risultato: il backend CUDA ignora ancora
+`precision` e calcola sempre in piena float32. `blackforge train`
+ignora sempre `precision` a prescindere dal device: solo i percorsi di
+sola inferenza (`run`/`forecast`/`benchmark`) la applicano.
 
 `blackforge train` addestra davvero il modello referenziato dal primo
 blocco `train` del file, sul dataset che referenzia (caricato da disco,
@@ -201,9 +217,13 @@ l'ultima dimensione di input e output del modello coincidano).
 pipeline del primo modello, riportando hardware, precisione dichiarata,
 forma dell'input, tempo medio, throughput e una stima della memoria
 (elementi × 4 byte, dato che il backend CPU memorizza sempre float32 —
-non è RSS di processo misurata). Con `--device cuda` ripete la stessa
-misura sulla GPU e stampa anche lo speedup e lo scarto massimo rispetto
-all'output CPU (la "modalità di riferimento").
+non è RSS di processo misurata). Se il programma dichiara un blocco
+`precision`, il tempo misurato include anche il costo della
+quantizzazione simulata applicata a ogni iterazione (vedi sotto). Con
+`--device cuda` ripete la stessa misura sulla GPU (senza applicare la
+quantizzazione, non ancora supportata su CUDA) e stampa anche lo
+speedup e lo scarto massimo rispetto all'output CPU (la "modalità di
+riferimento", anch'essa senza quantizzazione per un confronto equo).
 
 `blackforge build` compila fino alla IR e prova a costruire davvero
 ogni modello (allocando i suoi parametri): a differenza di `check`, che

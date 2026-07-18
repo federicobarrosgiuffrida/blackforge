@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "blackforge/backend/cpu/ops.hpp"
+#include "blackforge/backend/cpu/quantize.hpp"
 #include "blackforge/backend/cpu/random_init.hpp"
 
 namespace blackforge::backend::cpu {
@@ -16,13 +17,17 @@ runtime::Tensor Executor::makeSyntheticInput(const ir::Value& inputValue, std::s
     return randomTensor(std::move(shape), seedFor(seed_, 0, 0x9E3779B1U));
 }
 
-runtime::Tensor Executor::run(const ir::ModelIR& model, const runtime::Tensor& input) const {
+runtime::Tensor Executor::run(const ir::ModelIR& model, const runtime::Tensor& input,
+                               const std::optional<ir::PrecisionPolicy>& precision) const {
     if (model.pipelines.empty()) {
         throw std::invalid_argument("il modello '" + model.name + "' non ha pipeline da eseguire");
     }
 
     const ir::Pipeline& pipeline = model.pipelines.front();
     runtime::Tensor current = input;
+    if (precision.has_value()) {
+        current = quantize(current, precision->storage);
+    }
 
     for (const auto& op : pipeline.operations) {
         switch (op.kind) {
@@ -38,12 +43,25 @@ runtime::Tensor Executor::run(const ir::ModelIR& model, const runtime::Tensor& i
                     randomTensor({inFeatures, outFeatures}, seedFor(seed_, op.output, 0x2545F491U));
                 runtime::Tensor bias = randomTensor({outFeatures}, seedFor(seed_, op.output, 0x27D4EB2FU));
 
-                current = linear(current, weight, bias);
+                if (precision.has_value()) {
+                    // Simula il calcolo alla precisione dichiarata:
+                    // input e pesi vengono arrotondati al formato
+                    // 'compute' prima del prodotto matriciale (il bias
+                    // viene sommato dopo, non partecipa al prodotto).
+                    current = linear(quantize(current, precision->compute), quantize(weight, precision->compute),
+                                      bias);
+                } else {
+                    current = linear(current, weight, bias);
+                }
                 break;
             }
             case ir::OpKind::Silu: current = silu(current); break;
             case ir::OpKind::Relu: current = relu(current); break;
             case ir::OpKind::Gelu: current = gelu(current); break;
+        }
+
+        if (precision.has_value()) {
+            current = quantize(current, precision->storage);
         }
     }
 

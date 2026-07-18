@@ -329,3 +329,73 @@ TEST(ModelTest, TrainingLoopRiduceLaLossConAdamW) {
 
     EXPECT_LT(lastLoss, firstLoss * 0.1F);
 }
+
+// --- Precisione numerica (quantizzazione simulata) ---
+
+TEST(ModelPrecisionTest, SenzaPrecisionPolicyIlForwardENonQuantizzato) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(3) |> silu |> linear(2)\n"
+        "}\n");
+
+    runtime::Tensor input({2, 4}, {0.1F, 0.2F, 0.3F, 0.4F, -0.1F, -0.2F, -0.3F, -0.4F});
+
+    backend::cpu::Model plain(module.models.front());
+    backend::cpu::Model withFp32Policy(module.models.front(), 42, std::nullopt, ir::PrecisionPolicy{});
+
+    runtime::Tensor plainOut = plain.forward(input);
+    runtime::Tensor fp32Out = withFp32Policy.forward(input);
+
+    ASSERT_EQ(plainOut.elementCount(), fp32Out.elementCount());
+    for (std::size_t i = 0; i < plainOut.elementCount(); ++i) {
+        EXPECT_FLOAT_EQ(plainOut.at(i), fp32Out.at(i));
+    }
+}
+
+TEST(ModelPrecisionTest, UnaPrecisionPolicyRidottaCambiaDavveroIlForward) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(3) |> silu |> linear(2)\n"
+        "}\n");
+
+    runtime::Tensor input({2, 4}, {0.1F, 0.2F, 0.3F, 0.4F, -0.1F, -0.2F, -0.3F, -0.4F});
+
+    backend::cpu::Model plain(module.models.front());
+    ir::PrecisionPolicy fp8Policy{sema::DType::FP8_E4M3, sema::DType::FP8_E4M3, sema::DType::FP32};
+    backend::cpu::Model quantized(module.models.front(), 42, std::nullopt, fp8Policy);
+
+    runtime::Tensor plainOut = plain.forward(input);
+    runtime::Tensor quantizedOut = quantized.forward(input);
+
+    ASSERT_EQ(plainOut.elementCount(), quantizedOut.elementCount());
+    bool anyDifferent = false;
+    for (std::size_t i = 0; i < plainOut.elementCount(); ++i) {
+        if (plainOut.at(i) != quantizedOut.at(i)) {
+            anyDifferent = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(anyDifferent) << "una policy fp8 dovrebbe produrre numeri diversi da fp32 pieno";
+}
+
+TEST(ModelPrecisionTest, LoraFunzionaAncheConUnaPrecisionPolicyAttiva) {
+    // Verifica solo che LoRA + precision policy insieme non vadano in
+    // crash e producano una forma corretta: la combinazione dei due
+    // percorsi di quantizzazione dentro il ramo 'linear' e' quella piu'
+    // a rischio di un errore di distrazione nel codice.
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(2)\n"
+        "}\n");
+
+    backend::cpu::Model model(module.models.front(), 42, backend::cpu::LoraOptions{2, 4.0},
+                               ir::PrecisionPolicy{sema::DType::BF16, sema::DType::BF16, sema::DType::FP32});
+
+    runtime::Tensor input({2, 4}, {0.1F, 0.2F, 0.3F, 0.4F, -0.1F, -0.2F, -0.3F, -0.4F});
+    runtime::Tensor output = model.forward(input);
+
+    EXPECT_EQ(output.shape(), (std::vector<std::size_t>{2, 2}));
+}
