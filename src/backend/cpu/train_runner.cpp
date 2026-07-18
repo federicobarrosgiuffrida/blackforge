@@ -1,5 +1,6 @@
 #include "blackforge/backend/cpu/train_runner.hpp"
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -68,15 +69,16 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
     // funzione) garantisce la presenza di questi campi.
     const auto* modelField = findField<ast::TrainModelField>(trainDecl->fields);
     const auto* datasetField = findField<ast::TrainDatasetField>(trainDecl->fields);
+    const auto* lossField = findField<ast::TrainLossField>(trainDecl->fields);
     const auto* optimizerField = findField<ast::TrainOptimizerField>(trainDecl->fields);
     const auto* epochsField = findField<ast::TrainEpochsField>(trainDecl->fields);
     const auto* batchSizeField = findField<ast::TrainBatchSizeField>(trainDecl->fields);
     const auto* learningRateField = findField<ast::TrainLearningRateField>(trainDecl->fields);
     const auto* loraField = findField<ast::TrainLoraField>(trainDecl->fields);
 
-    if (modelField == nullptr || datasetField == nullptr || optimizerField == nullptr || epochsField == nullptr ||
-        batchSizeField == nullptr) {
-        throw std::runtime_error("il blocco 'train' non e' completo (manca model/dataset/optimizer/epochs/"
+    if (modelField == nullptr || datasetField == nullptr || lossField == nullptr || optimizerField == nullptr ||
+        epochsField == nullptr || batchSizeField == nullptr) {
+        throw std::runtime_error("il blocco 'train' non e' completo (manca model/dataset/loss/optimizer/epochs/"
                                   "batch_size): l'analisi semantica avrebbe dovuto rifiutarlo");
     }
     if (loraField != nullptr && fromCheckpointPath.empty()) {
@@ -120,6 +122,13 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
                          << " (" << model.parameters().size() << " parametri allenabili, pesi di base congelati)\n";
     }
 
+    std::function<LossResult(const runtime::Tensor&, const runtime::Tensor&)> lossFn;
+    if (lossField->name == "cross_entropy") {
+        lossFn = softmaxCrossEntropy;
+    } else {
+        lossFn = meanSquaredError;
+    }
+
     double learningRate = (learningRateField != nullptr) ? learningRateField->value : 1e-3;
     std::unique_ptr<Optimizer> optimizer;
     if (optimizerField->name == "sgd") {
@@ -141,7 +150,8 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
     if (progressOutput != nullptr) {
         *progressOutput << "Addestramento di '" << modelIR->name << "' su " << dataset.numExamples() << " esempi ("
                          << batchesPerEpoch << " batch/epoca, batch_size=" << batchSize
-                         << ", optimizer=" << optimizerField->name << ", learning_rate=" << learningRate << ")\n";
+                         << ", loss=" << lossField->name << ", optimizer=" << optimizerField->name
+                         << ", learning_rate=" << learningRate << ")\n";
     }
 
     TrainRunResult result;
@@ -154,7 +164,7 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
 
             model.zeroGrad();
             runtime::Tensor output = model.forward(batch.input);
-            LossResult loss = meanSquaredError(output, batch.target);
+            LossResult loss = lossFn(output, batch.target);
             model.backward(loss.grad);
             optimizer->step(model.parameters());
 

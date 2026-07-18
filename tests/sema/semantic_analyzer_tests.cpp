@@ -256,9 +256,17 @@ TEST(SemanticAnalyzerTest, RifiutaTrainConDatasetNonDefinito) {
 TEST(SemanticAnalyzerTest, RifiutaLossSconosciuta) {
     std::string source = kValidTrainProgram;
     auto pos = source.find("loss mse");
-    source.replace(pos, std::string("loss mse").size(), "loss cross_entropy");
+    source.replace(pos, std::string("loss mse").size(), "loss huber");
     auto analyzer = analyze(source);
     EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, AccettaLossCrossEntropy) {
+    std::string source = kValidTrainProgram;
+    auto pos = source.find("loss mse");
+    source.replace(pos, std::string("loss mse").size(), "loss cross_entropy");
+    auto analyzer = analyze(source);
+    EXPECT_FALSE(analyzer.diagnostics().hasErrors());
 }
 
 TEST(SemanticAnalyzerTest, RifiutaOptimizerSconosciuto) {

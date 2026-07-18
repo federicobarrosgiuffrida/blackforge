@@ -49,7 +49,7 @@ obiettivi futuri.
 | Backend CPU di riferimento (tensori, elementwise, matmul, linear, attivazioni) | ✅ Completato per le operazioni attualmente nel linguaggio |
 | Esecuzione (`blackforge run`) | ✅ Esegue un modello con input sintetico e pesi deterministici |
 | Autodiff / backward | ✅ Formule analitiche per linear/matmul/addBias/silu/relu/gelu, verificate con gradient checking numerico |
-| Loss | 🟡 Solo errore quadratico medio (MSE); altre (es. cross-entropy) richiedono prima una sintassi per dichiarare il tipo di compito |
+| Loss | ✅ Errore quadratico medio (MSE, per la regressione/forecasting) e cross-entropy con softmax interna (per la classificazione multiclasse, `loss cross_entropy`), entrambe verificate con gradient checking numerico |
 | Optimizer (SGD, AdamW) | ✅ Entrambi implementati e testati (incl. weight decay disaccoppiato di AdamW) |
 | Checkpoint (salvataggio/caricamento pesi) | ✅ Formato binario proprietario BlackForge, con round-trip testato |
 | Pass manager / ottimizzazioni (fusione, dead code elimination) | ⏳ Pianificato (ancora rimandato: nessuna ottimizzazione genuina applicabile con l'attuale insieme di operazioni) |
@@ -248,6 +248,14 @@ allocazione (es. una dimensione delle feature ancora simbolica).
   autoregressivo). Richiede un checkpoint pre-allenato (non incluso,
   va generato con `blackforge train --save-checkpoint`, oppure con
   `blackforge::backend::cpu::saveCheckpoint` da codice C++).
+- [`examples/tiny_classification.bf`](examples/tiny_classification.bf)
+  — esempio **eseguibile end-to-end** di classificazione con
+  `loss cross_entropy` (softmax applicata internamente su logit
+  grezzi), con il dataset one-hot sintetico incluso
+  ([`tiny_classification_dataset.bfdata`](examples/tiny_classification_dataset.bfdata),
+  8 esempi, 2 classi). Esegui
+  `blackforge train examples/tiny_classification.bf` per vedere la loss
+  scendere da ~`ln(2)` (predizione casuale a 2 classi) verso zero.
 
 ## Struttura del repository
 

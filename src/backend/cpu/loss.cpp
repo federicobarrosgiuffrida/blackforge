@@ -1,5 +1,7 @@
 #include "blackforge/backend/cpu/loss.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 namespace blackforge::backend::cpu {
@@ -23,6 +25,54 @@ LossResult meanSquaredError(const runtime::Tensor& prediction, const runtime::Te
 
     float value = static_cast<float>(sumSquares / static_cast<double>(n));
     return LossResult{value, runtime::Tensor(prediction.shape(), std::move(grad))};
+}
+
+LossResult softmaxCrossEntropy(const runtime::Tensor& logits, const runtime::Tensor& target) {
+    if (logits.shape() != target.shape()) {
+        throw std::invalid_argument("softmaxCrossEntropy: forme incompatibili " + logits.shapeToString() + " e " +
+                                     target.shapeToString());
+    }
+    if (logits.rank() != 2) {
+        throw std::invalid_argument("softmaxCrossEntropy: richiede un tensore a rango 2 [batch, classi], trovato " +
+                                     logits.shapeToString());
+    }
+
+    std::size_t batch = logits.dim(0);
+    std::size_t numClasses = logits.dim(1);
+
+    std::vector<float> grad(logits.elementCount());
+    double totalLoss = 0.0;
+    std::vector<double> probs(numClasses);
+
+    for (std::size_t b = 0; b < batch; ++b) {
+        std::size_t rowOffset = b * numClasses;
+
+        float maxLogit = logits.at(rowOffset);
+        for (std::size_t c = 1; c < numClasses; ++c) {
+            maxLogit = std::max(maxLogit, logits.at(rowOffset + c));
+        }
+
+        double sumExp = 0.0;
+        for (std::size_t c = 0; c < numClasses; ++c) {
+            probs[c] = std::exp(static_cast<double>(logits.at(rowOffset + c) - maxLogit));
+            sumExp += probs[c];
+        }
+
+        for (std::size_t c = 0; c < numClasses; ++c) {
+            probs[c] /= sumExp;
+            float t = target.at(rowOffset + c);
+            if (t != 0.0F) {
+                // 1e-12 evita log(0) se una probabilita' softmax collassa
+                // a zero in virgola mobile (target con massa nulla non
+                // contribuiscono comunque alla somma).
+                totalLoss += -static_cast<double>(t) * std::log(std::max(probs[c], 1e-12));
+            }
+            grad[rowOffset + c] = static_cast<float>((probs[c] - static_cast<double>(t)) / static_cast<double>(batch));
+        }
+    }
+
+    float value = static_cast<float>(totalLoss / static_cast<double>(batch));
+    return LossResult{value, runtime::Tensor(logits.shape(), std::move(grad))};
 }
 
 }  // namespace blackforge::backend::cpu

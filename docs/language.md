@@ -379,6 +379,26 @@ train {
 }
 ```
 
+Il campo `loss` accetta due valori:
+
+- **`mse`** (errore quadratico medio): `mean((prediction - target)^2)`
+  su tutti gli elementi. Adatta alla regressione, incluso il
+  forecasting; `prediction`/`target` possono avere qualunque forma,
+  purché coincidano.
+- **`cross_entropy`** (cross-entropy con softmax interna): pensata per
+  la classificazione multiclasse. Richiede `prediction`/`target` a
+  rango 2 `[batch, classi]`; `prediction` sono i logit grezzi del
+  modello (l'operazione applica una softmax internamente, in modo
+  numericamente stabile), `target` è una distribuzione di probabilità
+  per esempio (tipicamente one-hot). Il gradiente restituito è la
+  forma chiusa standard per softmax+cross-entropy combinati
+  (`softmax(logits) - target`, diviso per la dimensione del batch), non
+  richiede quindi un backward separato per la softmax.
+
+Entrambe sono implementate in `blackforge::backend::cpu` (vedi
+`loss.hpp`) e verificate con gradient checking numerico (differenze
+finite centrali).
+
 ### Formato dataset su disco
 
 `path` punta a un file nel formato binario proprietario di BlackForge

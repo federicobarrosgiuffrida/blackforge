@@ -46,10 +46,13 @@ bool isStorageField(ast::PrecisionFieldKind kind) {
     return kind == ast::PrecisionFieldKind::Storage || kind == ast::PrecisionFieldKind::Parameters;
 }
 
-// Uniche loss/optimizer implementati dal motore CPU (milestone 6):
-// l'elenco crescera' insieme al motore stesso.
+// Loss/optimizer implementati dal motore CPU: l'elenco crescera' insieme
+// al motore stesso. 'mse' e' pensata per la regressione (forecasting
+// incluso); 'cross_entropy' per la classificazione multiclasse (softmax
+// applicata internamente, target one-hot o soft della stessa forma
+// dell'uscita del modello, vedi loss.hpp).
 const std::unordered_set<std::string>& knownLossNames() {
-    static const std::unordered_set<std::string> names = {"mse"};
+    static const std::unordered_set<std::string> names = {"mse", "cross_entropy"};
     return names;
 }
 
@@ -328,8 +331,9 @@ void SemanticAnalyzer::analyzeTrain(const ast::TrainDecl& decl) {
                         diagnostics_.addError(node.location, "campo 'loss' duplicato nel blocco 'train'");
                     }
                     if (knownLossNames().find(node.name) == knownLossNames().end()) {
-                        diagnostics_.addError(node.location,
-                                               "loss sconosciuta '" + node.name + "'. Loss supportate: mse");
+                        diagnostics_.addError(
+                            node.location,
+                            "loss sconosciuta '" + node.name + "'. Loss supportate: mse, cross_entropy");
                     }
                 } else if constexpr (std::is_same_v<T, ast::TrainOptimizerField>) {
                     ++optimizerCount;

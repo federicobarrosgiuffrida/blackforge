@@ -60,6 +60,21 @@ void writeToyDataset(const std::string& path) {
     data::saveDataset(path, inputShape, targetShape, inputs, targets, 4);
 }
 
+// Un piccolo problema di classificazione a 2 classi, linearmente
+// separabile: 4 esempi one-hot in ingresso (4 feature), target one-hot
+// a 2 classi (ogni riga somma a 1, coerente con softmaxCrossEntropy).
+void writeToyClassificationDataset(const std::string& path) {
+    std::vector<std::size_t> inputShape{4};
+    std::vector<std::size_t> targetShape{2};
+    std::vector<float> inputs{
+        1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F,
+    };
+    std::vector<float> targets{
+        1.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 1.0F,
+    };
+    data::saveDataset(path, inputShape, targetShape, inputs, targets, 4);
+}
+
 // I letterali stringa di BlackForge interpretano '\' come inizio di
 // escape (come C/C++/Python): un percorso Windows con backslash va
 // convertito in forward slash prima di essere incorporato in un
@@ -93,6 +108,31 @@ std::string toyProgram(const std::string& datasetPath, int epochs, const std::st
            "    optimizer " +
            optimizerName +
            "\n"
+           "    epochs " +
+           std::to_string(epochs) +
+           "\n"
+           "    batch_size 4\n"
+           "    learning_rate 0.3\n"
+           "}\n";
+}
+
+std::string toyProgramCrossEntropy(const std::string& datasetPath, int epochs) {
+    return "model M {\n"
+           "    input bf16[batch, 4]\n"
+           "    input |> linear(2)\n"
+           "}\n"
+           "dataset D {\n"
+           "    path \"" +
+           toForwardSlashes(datasetPath) +
+           "\"\n"
+           "    input bf16[batch, 4]\n"
+           "    labels bf16[batch, 2]\n"
+           "}\n"
+           "train {\n"
+           "    model M\n"
+           "    dataset D\n"
+           "    loss cross_entropy\n"
+           "    optimizer adamw\n"
            "    epochs " +
            std::to_string(epochs) +
            "\n"
@@ -156,6 +196,17 @@ TEST(TrainRunnerTest, FunzionaAncheConSgd) {
 
     ASSERT_EQ(result.epochLosses.size(), 50u);
     EXPECT_LT(result.epochLosses.back(), result.epochLosses.front());
+}
+
+TEST(TrainRunnerTest, RiduceLaLossConCrossEntropy) {
+    TempFile datasetFile("blackforge_test_train_dataset_ce.bfdata");
+    writeToyClassificationDataset(datasetFile.path);
+
+    Compiled compiled = compile(toyProgramCrossEntropy(datasetFile.path, /*epochs=*/50));
+    backend::cpu::TrainRunResult result = backend::cpu::runTraining(compiled.program, compiled.module, "", "");
+
+    ASSERT_EQ(result.epochLosses.size(), 50u);
+    EXPECT_LT(result.epochLosses.back(), result.epochLosses.front() * 0.1);
 }
 
 TEST(TrainRunnerTest, LanciaSeIlProgrammaNonHaBloccoTrain) {
