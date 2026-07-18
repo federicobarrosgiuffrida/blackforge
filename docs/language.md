@@ -164,10 +164,7 @@ dimensioni" che l'analisi semantica locale non può vedere.
 
 Non esiste ancora un pass manager con ottimizzazioni (fusione,
 eliminazione di operazioni morte): con l'attuale insieme minimo di
-operazioni non c'è ancora nulla di genuino da ottimizzare. Arriverà con
-l'autodiff/training, quando la IR guadagnerà la struttura (nodi
-backward, sequenze più lunghe) necessaria perché queste ottimizzazioni
-abbiano un effetto misurabile.
+operazioni non c'è ancora nulla di genuino da ottimizzare.
 
 ## Backend CPU di riferimento ed esecuzione
 
@@ -180,7 +177,7 @@ una a una sul backend CPU (`blackforge::backend::cpu`):
 - `linear(n)`: prodotto matriciale `[batch, in] x [in, n]` più bias
   `[n]`, con pesi generati in modo deterministico (seme fisso, non una
   strategia di inizializzazione statisticamente valida come
-  Xavier/Kaiming, e non ancora caricabili da checkpoint);
+  Xavier/Kaiming);
 - `silu`, `relu`, `gelu`: applicate elemento per elemento.
 
 Limitazioni note, esplicite:
@@ -190,6 +187,43 @@ Limitazioni note, esplicite:
   la correttezza funzionale, non a riprodurre la precisione reale
   dell'hardware. L'emulazione dei formati ridotti arriverà con il
   backend CUDA.
-- I pesi non sono allenabili: non esiste ancora autodiff, loss,
-  optimizer né caricamento di checkpoint.
 - Viene eseguita solo la prima pipeline del primo modello del file.
+- `blackforge run` usa `Executor`, che rigenera pesi casuali ad ogni
+  chiamata (comodo per ispezionare rapidamente un'esecuzione, ma non
+  allenabile). Per l'addestramento vero e proprio esiste un tipo
+  separato, `Model` (vedi sotto), che possiede i propri parametri e li
+  mantiene tra una chiamata e l'altra.
+
+## Autodiff, loss, optimizer, checkpoint (motore CPU)
+
+`blackforge::backend::cpu` include ora un motore di addestramento
+completo, utilizzabile oggi solo come API C++ (non ancora da sintassi
+`.bf`: le parole chiave `dataset`, `loss`, `optimizer`, `train` sono
+lessate ma non hanno ancora grammatica — arriverà con la milestone di
+training/fine-tuning/LoRA):
+
+- **`Model`**: costruito da un `ir::ModelIR`, possiede i pesi (`Parameter`,
+  con `value` e `grad`) e li mantiene tra `forward()` e `backward()`.
+  `forward()` salva le attivazioni intermedie necessarie a
+  `backward()`. `backward(outputGrad)` **accumula** i gradienti (non li
+  azzera): va chiamato `zeroGrad()` prima di ogni step.
+- **Autodiff**: formule di backward scritte a mano per ogni operazione
+  (`matmulBackward`, `addBiasBackward`, `siluBackward`, `reluBackward`,
+  `geluBackward`) — non un autodiff generico basato su un grafo di
+  espressioni, dato il piccolo insieme fisso di operazioni. Verificate
+  con *gradient checking* numerico (differenze finite) nei test.
+- **Loss**: solo `meanSquaredError` (errore quadratico medio) per ora.
+  Altre loss (es. cross-entropy) richiedono prima che il linguaggio
+  possa dichiarare il tipo di compito (classificazione vs regressione).
+- **Optimizer**: `SGD` (senza momento: `param -= lr * grad`) e `AdamW`
+  (Loshchilov & Hutter 2019, con weight decay disaccoppiato dal
+  gradiente).
+- **Checkpoint**: `saveCheckpoint`/`loadCheckpoint` in un formato
+  binario proprietario di BlackForge (magic `BFCKPT1`, non compatibile
+  con formati esterni come safetensors), che salva ogni parametro per
+  nome e forma.
+
+Limitazione esplicita: l'inizializzazione dei pesi resta deterministica
+ma non statisticamente valida (niente Xavier/Kaiming). Una strategia di
+inizializzazione seria è lavoro futuro, cosi' come il caricamento di
+pesi pre-allenati esterni.

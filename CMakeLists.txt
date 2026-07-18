@@ -116,6 +116,12 @@ set(
     src/runtime/device.cpp
     src/backend/cpu/ops.cpp
     src/backend/cpu/executor.cpp
+    src/backend/cpu/random_init.cpp
+    src/backend/cpu/autodiff.cpp
+    src/backend/cpu/loss.cpp
+    src/backend/cpu/model.cpp
+    src/backend/cpu/optimizer.cpp
+    src/backend/cpu/checkpoint.cpp
 )
 
 # I sorgenti del backend CUDA (kernels/, src/backend/cuda/) verranno

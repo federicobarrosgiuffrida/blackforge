@@ -40,12 +40,13 @@ del codice in questo repository, non obiettivi futuri.
 | Analisi semantica e controllo tipi numerici (dtype, target, operazioni note) | ✅ Completato per il sottoinsieme attuale |
 | Controllo forme tensoriali | ✅ Inferenza reale lungo la pipeline (via IR); vincoli locali via analisi semantica |
 | Rappresentazione interna (IR) | ✅ Completata (Value/Operation/Module, IR builder con inferenza di forma e dtype) |
-| Pass manager / ottimizzazioni (fusione, dead code elimination) | ⏳ Pianificato (rimandato: senza pesi/tensori reali non c'e' ancora nulla di genuino da ottimizzare; arriva con l'autodiff/training) |
 | Backend CPU di riferimento (tensori, elementwise, matmul, linear, attivazioni) | ✅ Completato per le operazioni attualmente nel linguaggio |
-| Esecuzione (`blackforge run`) | ✅ Esegue un modello con input sintetico e pesi deterministici (nessun training/checkpoint ancora) |
-| Autodiff / backward | ⏳ Pianificato |
-| Optimizer (SGD, AdamW) | ⏳ Pianificato |
-| Checkpoint (salvataggio/caricamento pesi) | ⏳ Pianificato |
+| Esecuzione (`blackforge run`) | ✅ Esegue un modello con input sintetico e pesi deterministici |
+| Autodiff / backward | ✅ Formule analitiche per linear/matmul/addBias/silu/relu/gelu, verificate con gradient checking numerico |
+| Loss | 🟡 Solo errore quadratico medio (MSE); altre (es. cross-entropy) richiedono prima una sintassi per dichiarare il tipo di compito |
+| Optimizer (SGD, AdamW) | ✅ Entrambi implementati e testati (incl. weight decay disaccoppiato di AdamW) |
+| Checkpoint (salvataggio/caricamento pesi) | ✅ Formato binario proprietario BlackForge, con round-trip testato |
+| Pass manager / ottimizzazioni (fusione, dead code elimination) | ⏳ Pianificato (ancora rimandato: nessuna ottimizzazione genuina applicabile con l'attuale insieme di operazioni) |
 | Backend CUDA | ⏳ Pianificato |
 | Supporto Blackwell / Tensor Core | ⏳ Pianificato |
 | Precisioni FP8 (e4m3/e5m2), FP16, BF16, TF32, FP32 | 🟡 Riconosciute e validate; il backend CPU calcola sempre in fp32 come riferimento (nessuna emulazione di precisione ridotta ancora) |
@@ -87,6 +88,18 @@ Opzioni CMake principali:
 > host compiler. Se è installato solo un toolchain MinGW/GCC, il backend
 > CUDA non compilerà finché non viene installato Visual Studio Build
 > Tools con i componenti C++.
+
+> **Nota Windows/Controlled Folder Access**: se il repository si trova
+> dentro una cartella protetta da Windows (es. `Documents`, con la
+> protezione anti-ransomware "Controlled Folder Access" attiva),
+> eseguibili non ancora riconosciuti dal sistema — inclusi i binari
+> appena compilati di BlackForge — possono non riuscire a **creare**
+> nuovi file lì (es. `saveCheckpoint`), pur riuscendo a leggerli. L'API
+> restituisce un errore chiaro (`errno`/messaggio) in questo caso, non
+> un crash silenzioso: se capita, salva i checkpoint in un percorso
+> fuori da cartelle protette (es. `%TEMP%`) oppure aggiungi
+> `blackforge.exe` alle app consentite in Windows Security → Protezione
+> da ransomware.
 
 ### Eseguire i test
 
@@ -148,7 +161,7 @@ PolyForm Noncommercial License 1.0.0 — vedi [LICENSE.md](LICENSE.md).
 3. ✅ Analisi semantica: tipi numerici, precisioni, forme tensoriali (base)
 4. ✅ Rappresentazione interna (IR): valori, operazioni, inferenza di forma
 5. ✅ Backend CPU di riferimento: tensori, elementwise, matmul, layer lineari, attivazioni, esecuzione (`blackforge run`)
-6. Autodiff, loss, optimizer, checkpoint, pass manager con ottimizzazioni reali
+6. ✅ Autodiff, loss (MSE), optimizer (SGD, AdamW), checkpoint su CPU
 7. Backend CUDA (kernel, Tensor Core, Blackwell)
 8. Training, fine-tuning, LoRA, forecasting
 9. Benchmark, profiling, CLI completa, documentazione finale

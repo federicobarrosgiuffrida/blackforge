@@ -22,6 +22,11 @@ set(
     runtime/tensor_tests.cpp
     backend/cpu/ops_tests.cpp
     backend/cpu/executor_tests.cpp
+    backend/cpu/autodiff_tests.cpp
+    backend/cpu/loss_tests.cpp
+    backend/cpu/model_tests.cpp
+    backend/cpu/optimizer_tests.cpp
+    backend/cpu/checkpoint_tests.cpp
 )
 
 add_executable(
