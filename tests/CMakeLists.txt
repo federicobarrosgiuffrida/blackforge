@@ -27,6 +27,8 @@ set(
     backend/cpu/model_tests.cpp
     backend/cpu/optimizer_tests.cpp
     backend/cpu/checkpoint_tests.cpp
+    backend/cpu/train_runner_tests.cpp
+    data/dataset_tests.cpp
 )
 
 if(BLACKFORGE_ENABLE_CUDA)

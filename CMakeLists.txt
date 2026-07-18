@@ -124,6 +124,8 @@ set(
     src/backend/cpu/model.cpp
     src/backend/cpu/optimizer.cpp
     src/backend/cpu/checkpoint.cpp
+    src/backend/cpu/train_runner.cpp
+    src/data/dataset.cpp
 )
 
 if(BLACKFORGE_ENABLE_CUDA)

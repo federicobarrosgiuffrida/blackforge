@@ -127,6 +127,64 @@ void dumpModelDecl(std::ostringstream& out, int depth, const ModelDecl& decl) {
     }
 }
 
+void dumpDatasetField(std::ostringstream& out, int depth, const DatasetField& field) {
+    std::visit(
+        [&](const auto& node) {
+            using T = std::decay_t<decltype(node)>;
+            indent(out, depth);
+            if constexpr (std::is_same_v<T, DatasetPathField>) {
+                out << "path = \"" << node.path << "\"\n";
+            } else if constexpr (std::is_same_v<T, DatasetInputField>) {
+                out << "input\n";
+                dumpTensorType(out, depth + 1, node.type);
+            } else if constexpr (std::is_same_v<T, DatasetLabelsField>) {
+                out << "labels\n";
+                dumpTensorType(out, depth + 1, node.type);
+            }
+        },
+        field);
+}
+
+void dumpDatasetDecl(std::ostringstream& out, int depth, const DatasetDecl& decl) {
+    indent(out, depth);
+    out << "DatasetDecl " << decl.name << "\n";
+    for (const auto& field : decl.fields) {
+        dumpDatasetField(out, depth + 1, field);
+    }
+}
+
+void dumpTrainField(std::ostringstream& out, int depth, const TrainField& field) {
+    std::visit(
+        [&](const auto& node) {
+            using T = std::decay_t<decltype(node)>;
+            indent(out, depth);
+            if constexpr (std::is_same_v<T, TrainModelField>) {
+                out << "model = " << node.name << "\n";
+            } else if constexpr (std::is_same_v<T, TrainDatasetField>) {
+                out << "dataset = " << node.name << "\n";
+            } else if constexpr (std::is_same_v<T, TrainLossField>) {
+                out << "loss = " << node.name << "\n";
+            } else if constexpr (std::is_same_v<T, TrainOptimizerField>) {
+                out << "optimizer = " << node.name << "\n";
+            } else if constexpr (std::is_same_v<T, TrainEpochsField>) {
+                out << "epochs = " << node.value << "\n";
+            } else if constexpr (std::is_same_v<T, TrainBatchSizeField>) {
+                out << "batch_size = " << node.value << "\n";
+            } else if constexpr (std::is_same_v<T, TrainLearningRateField>) {
+                out << "learning_rate = " << node.value << "\n";
+            }
+        },
+        field);
+}
+
+void dumpTrainDecl(std::ostringstream& out, int depth, const TrainDecl& decl) {
+    indent(out, depth);
+    out << "TrainDecl\n";
+    for (const auto& field : decl.fields) {
+        dumpTrainField(out, depth + 1, field);
+    }
+}
+
 void dumpDecl(std::ostringstream& out, int depth, const Decl& decl) {
     std::visit(
         [&](const auto& node) {
@@ -137,6 +195,10 @@ void dumpDecl(std::ostringstream& out, int depth, const Decl& decl) {
                 dumpPrecisionDecl(out, depth, node);
             } else if constexpr (std::is_same_v<T, ModelDecl>) {
                 dumpModelDecl(out, depth, node);
+            } else if constexpr (std::is_same_v<T, DatasetDecl>) {
+                dumpDatasetDecl(out, depth, node);
+            } else if constexpr (std::is_same_v<T, TrainDecl>) {
+                dumpTrainDecl(out, depth, node);
             }
         },
         decl);

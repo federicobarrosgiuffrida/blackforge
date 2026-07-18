@@ -8,12 +8,20 @@
 
 namespace blackforge::backend::cpu {
 
+// Interfaccia comune, usata dove l'optimizer va scelto a runtime (es.
+// dal nome 'sgd'/'adamw' in un blocco 'train' di BlackForge).
+class Optimizer {
+public:
+    virtual ~Optimizer() = default;
+    virtual void step(const std::vector<Parameter*>& parameters) = 0;
+};
+
 // Discesa del gradiente stocastica, senza momento: param -= lr * grad.
-class SGD {
+class SGD : public Optimizer {
 public:
     explicit SGD(float learningRate) : learningRate_(learningRate) {}
 
-    void step(const std::vector<Parameter*>& parameters);
+    void step(const std::vector<Parameter*>& parameters) override;
 
 private:
     float learningRate_;
@@ -21,12 +29,12 @@ private:
 
 // AdamW (Loshchilov & Hutter, "Decoupled Weight Decay Regularization",
 // 2019): Adam con weight decay disaccoppiato dal gradiente.
-class AdamW {
+class AdamW : public Optimizer {
 public:
     explicit AdamW(float learningRate = 1e-3F, float beta1 = 0.9F, float beta2 = 0.999F, float eps = 1e-8F,
                     float weightDecay = 0.01F);
 
-    void step(const std::vector<Parameter*>& parameters);
+    void step(const std::vector<Parameter*>& parameters) override;
 
 private:
     struct MomentState {

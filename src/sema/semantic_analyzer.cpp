@@ -46,9 +46,25 @@ bool isStorageField(ast::PrecisionFieldKind kind) {
     return kind == ast::PrecisionFieldKind::Storage || kind == ast::PrecisionFieldKind::Parameters;
 }
 
+// Uniche loss/optimizer implementati dal motore CPU (milestone 6):
+// l'elenco crescera' insieme al motore stesso.
+const std::unordered_set<std::string>& knownLossNames() {
+    static const std::unordered_set<std::string> names = {"mse"};
+    return names;
+}
+
+const std::unordered_set<std::string>& knownOptimizerNames() {
+    static const std::unordered_set<std::string> names = {"sgd", "adamw"};
+    return names;
+}
+
 }  // namespace
 
 void SemanticAnalyzer::analyze(const ast::Program& program) {
+    // 'train' puo' fare riferimento a 'model'/'dataset' dichiarati in
+    // qualunque punto del programma: prima si analizzano (e si
+    // registrano i nomi di) tutte le altre dichiarazioni, poi si
+    // validano i 'train' che le referenziano.
     for (const auto& decl : program.declarations) {
         std::visit(
             [&](const auto& node) {
@@ -59,9 +75,17 @@ void SemanticAnalyzer::analyze(const ast::Program& program) {
                     analyzePrecision(node);
                 } else if constexpr (std::is_same_v<T, ast::ModelDecl>) {
                     analyzeModel(node);
+                } else if constexpr (std::is_same_v<T, ast::DatasetDecl>) {
+                    analyzeDataset(node);
                 }
             },
             decl);
+    }
+
+    for (const auto& decl : program.declarations) {
+        if (std::holds_alternative<ast::TrainDecl>(decl)) {
+            analyzeTrain(std::get<ast::TrainDecl>(decl));
+        }
     }
 }
 
@@ -214,6 +238,154 @@ void SemanticAnalyzer::analyzeModel(const ast::ModelDecl& decl) {
 
     if (!hasInput) {
         diagnostics_.addError(decl.location, "il modello '" + decl.name + "' non dichiara alcun input");
+    }
+}
+
+void SemanticAnalyzer::analyzeDataset(const ast::DatasetDecl& decl) {
+    if (!datasetNames_.insert(decl.name).second) {
+        diagnostics_.addError(decl.location, "dataset '" + decl.name + "' dichiarato piu' volte");
+    }
+
+    int pathCount = 0;
+    int inputCount = 0;
+    int labelsCount = 0;
+
+    for (const auto& field : decl.fields) {
+        std::visit(
+            [&](const auto& node) {
+                using T = std::decay_t<decltype(node)>;
+                if constexpr (std::is_same_v<T, ast::DatasetPathField>) {
+                    ++pathCount;
+                    if (pathCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'path' duplicato nel dataset '" + decl.name +
+                                                                   "'");
+                    }
+                } else if constexpr (std::is_same_v<T, ast::DatasetInputField>) {
+                    ++inputCount;
+                    if (inputCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'input' duplicato nel dataset '" + decl.name +
+                                                                   "'");
+                    }
+                    analyzeTensorType(node.type);
+                } else if constexpr (std::is_same_v<T, ast::DatasetLabelsField>) {
+                    ++labelsCount;
+                    if (labelsCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'labels' duplicato nel dataset '" + decl.name +
+                                                                   "'");
+                    }
+                    analyzeTensorType(node.type);
+                }
+            },
+            field);
+    }
+
+    if (pathCount == 0) {
+        diagnostics_.addError(decl.location, "il dataset '" + decl.name + "' non dichiara un campo 'path'");
+    }
+    if (inputCount == 0) {
+        diagnostics_.addError(decl.location, "il dataset '" + decl.name + "' non dichiara un campo 'input'");
+    }
+    if (labelsCount == 0) {
+        diagnostics_.addError(decl.location, "il dataset '" + decl.name + "' non dichiara un campo 'labels'");
+    }
+}
+
+void SemanticAnalyzer::analyzeTrain(const ast::TrainDecl& decl) {
+    int modelCount = 0;
+    int datasetCount = 0;
+    int lossCount = 0;
+    int optimizerCount = 0;
+    int epochsCount = 0;
+    int batchSizeCount = 0;
+    int learningRateCount = 0;
+
+    for (const auto& field : decl.fields) {
+        std::visit(
+            [&](const auto& node) {
+                using T = std::decay_t<decltype(node)>;
+                if constexpr (std::is_same_v<T, ast::TrainModelField>) {
+                    ++modelCount;
+                    if (modelCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'model' duplicato nel blocco 'train'");
+                    }
+                    if (modelNames_.find(node.name) == modelNames_.end()) {
+                        diagnostics_.addError(node.location, "modello '" + node.name + "' non definito");
+                    }
+                } else if constexpr (std::is_same_v<T, ast::TrainDatasetField>) {
+                    ++datasetCount;
+                    if (datasetCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'dataset' duplicato nel blocco 'train'");
+                    }
+                    if (datasetNames_.find(node.name) == datasetNames_.end()) {
+                        diagnostics_.addError(node.location, "dataset '" + node.name + "' non definito");
+                    }
+                } else if constexpr (std::is_same_v<T, ast::TrainLossField>) {
+                    ++lossCount;
+                    if (lossCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'loss' duplicato nel blocco 'train'");
+                    }
+                    if (knownLossNames().find(node.name) == knownLossNames().end()) {
+                        diagnostics_.addError(node.location,
+                                               "loss sconosciuta '" + node.name + "'. Loss supportate: mse");
+                    }
+                } else if constexpr (std::is_same_v<T, ast::TrainOptimizerField>) {
+                    ++optimizerCount;
+                    if (optimizerCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'optimizer' duplicato nel blocco 'train'");
+                    }
+                    if (knownOptimizerNames().find(node.name) == knownOptimizerNames().end()) {
+                        diagnostics_.addError(
+                            node.location, "optimizer sconosciuto '" + node.name + "'. Optimizer supportati: sgd, adamw");
+                    }
+                } else if constexpr (std::is_same_v<T, ast::TrainEpochsField>) {
+                    ++epochsCount;
+                    if (epochsCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'epochs' duplicato nel blocco 'train'");
+                    }
+                    if (node.value <= 0) {
+                        diagnostics_.addError(node.location, "'epochs' deve essere un intero positivo, trovato " +
+                                                                   std::to_string(node.value));
+                    }
+                } else if constexpr (std::is_same_v<T, ast::TrainBatchSizeField>) {
+                    ++batchSizeCount;
+                    if (batchSizeCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'batch_size' duplicato nel blocco 'train'");
+                    }
+                    if (node.value <= 0) {
+                        diagnostics_.addError(node.location,
+                                               "'batch_size' deve essere un intero positivo, trovato " +
+                                                   std::to_string(node.value));
+                    }
+                } else if constexpr (std::is_same_v<T, ast::TrainLearningRateField>) {
+                    ++learningRateCount;
+                    if (learningRateCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'learning_rate' duplicato nel blocco 'train'");
+                    }
+                    if (node.value <= 0.0) {
+                        diagnostics_.addError(node.location, "'learning_rate' deve essere positivo");
+                    }
+                }
+            },
+            field);
+    }
+
+    if (modelCount == 0) {
+        diagnostics_.addError(decl.location, "il blocco 'train' non specifica un 'model'");
+    }
+    if (datasetCount == 0) {
+        diagnostics_.addError(decl.location, "il blocco 'train' non specifica un 'dataset'");
+    }
+    if (lossCount == 0) {
+        diagnostics_.addError(decl.location, "il blocco 'train' non specifica una 'loss'");
+    }
+    if (optimizerCount == 0) {
+        diagnostics_.addError(decl.location, "il blocco 'train' non specifica un 'optimizer'");
+    }
+    if (epochsCount == 0) {
+        diagnostics_.addError(decl.location, "il blocco 'train' non specifica 'epochs'");
+    }
+    if (batchSizeCount == 0) {
+        diagnostics_.addError(decl.location, "il blocco 'train' non specifica 'batch_size'");
     }
 }
 

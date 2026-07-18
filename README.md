@@ -53,8 +53,13 @@ del codice in questo repository, non obiettivi futuri.
 | Tensor Core / precisioni FP8/BF16/TF32 reali su GPU | ⏳ Pianificato — il backend CUDA oggi calcola in float32 (SGEMM), come il backend CPU: nessun uso di Tensor Core o dei formati ridotti come precisione di calcolo reale ancora |
 | Supporto multi-architettura CUDA oltre Blackwell (sm_120) | ⏳ Non testato: il progetto compila solo per l'architettura configurata in `BLACKFORGE_CUDA_ARCHITECTURES` |
 | Precisioni FP8 (e4m3/e5m2), FP16, BF16, TF32, FP32 | 🟡 Riconosciute e validate nel linguaggio; sia il backend CPU sia quello CUDA calcolano sempre in float32 come riferimento (nessuna emulazione/uso reale dei formati ridotti ancora) |
-| Pretraining / fine-tuning / LoRA | ⏳ Pianificato |
-| Forecasting | ⏳ Pianificato |
+| Grammatica `dataset { ... }` e `train { ... }` | ✅ Completata (parser, analisi semantica con validazione incrociata dei riferimenti a model/dataset) |
+| Formato dataset su disco + caricamento a batch | ✅ Formato binario proprietario BlackForge, con batching (incl. wraparound tra epoche) testato |
+| Pretraining (`blackforge train`) | ✅ Addestra un modello da zero su CPU, verificato end-to-end (la loss scende davvero, non solo "compila") |
+| Fine-tuning (`blackforge train --from-checkpoint`) | ✅ Riprende l'addestramento da un checkpoint esistente |
+| LoRA | ⏳ Pianificato (richiede nuove operazioni IR per gli adapter a basso rango) |
+| Forecasting | ⏳ Pianificato (richiede layer/loss specifici per serie temporali) |
+| Training/fine-tuning su GPU (`blackforge train --device cuda`) | ⏳ Pianificato: l'autodiff esiste solo sul backend CPU per ora (milestone 6); il backend CUDA (milestone 7) ha solo la forward pass |
 | Benchmark / profiling | ⏳ Pianificato |
 | Multi-GPU | ⏳ Pianificato |
 
@@ -145,6 +150,9 @@ blackforge check <file.bf> --print-ir   # mostra la rappresentazione interna (IR
 blackforge run <file.bf>                # esegue il primo modello su CPU (batch=1)
 blackforge run <file.bf> --batch 8      # come sopra, con batch size esplicito
 blackforge run <file.bf> --device cuda  # esegue sulla GPU (richiede una build con CUDA)
+blackforge train <file.bf>              # addestra il modello del blocco 'train' (CPU)
+blackforge train <file.bf> --from-checkpoint pesi.bfckpt  # fine-tuning da pesi esistenti
+blackforge train <file.bf> --save-checkpoint pesi.bfckpt  # salva i pesi finali
 blackforge devices                      # elenca i dispositivi disponibili (CPU e GPU CUDA rilevate)
 blackforge --version
 blackforge --help
@@ -157,10 +165,14 @@ non caricati da checkpoint): serve a dimostrare che l'intera catena
 letto→validato→compilato→eseguito funziona, non a produrre un modello
 utile. A parità di seme, `--device cpu` e `--device cuda` usano
 esattamente gli stessi pesi iniziali e producono lo stesso risultato
-(verificato nei test di parità CPU/GPU). I comandi `build`, `train`,
-`benchmark`, `inspect` descritti nella visione del progetto non sono
-ancora implementati e verranno aggiunti man mano che le fasi
-corrispondenti (training, benchmark) saranno pronte.
+(verificato nei test di parità CPU/GPU).
+
+`blackforge train` addestra davvero il modello referenziato dal primo
+blocco `train` del file, sul dataset che referenzia (caricato da disco,
+non sintetico), stampando la loss media per epoca. Solo sul backend
+CPU per ora — l'autodiff non esiste ancora sul backend CUDA. I comandi
+`build`, `benchmark`, `inspect` descritti nella visione del progetto
+non sono ancora implementati.
 
 ## Esempi
 
@@ -168,6 +180,12 @@ corrispondenti (training, benchmark) saranno pronte.
   modello minimale. Il compilatore oggi lo tokenizza, lo analizza
   sintatticamente e ne valida la semantica (target, precisioni, forme,
   operazioni di pipeline). Non genera ancora codice ne' lo esegue.
+- [`examples/tiny_regression.bf`](examples/tiny_regression.bf) —
+  esempio **eseguibile end-to-end**: `model` + `dataset` + `train`,
+  con il dataset sintetico incluso
+  ([`tiny_regression_dataset.bfdata`](examples/tiny_regression_dataset.bfdata),
+  8 esempi). Esegui `blackforge train examples/tiny_regression.bf` per
+  vedere la loss scendere epoca dopo epoca.
 
 ## Struttura del repository
 
@@ -194,7 +212,7 @@ PolyForm Noncommercial License 1.0.0 — vedi [LICENSE.md](LICENSE.md).
 5. ✅ Backend CPU di riferimento: tensori, elementwise, matmul, layer lineari, attivazioni, esecuzione (`blackforge run`)
 6. ✅ Autodiff, loss (MSE), optimizer (SGD, AdamW), checkpoint su CPU
 7. ✅ Backend CUDA: tensori device, add/addBias/matmul (cuBLAS)/silu/relu/gelu, esecuzione (`blackforge run --device cuda`), rilevamento GPU (`blackforge devices`) — testato su GPU reale. Tensor Core e precisioni ridotte reali (fp8/bf16/tf32) restano lavoro futuro.
-8. Training, fine-tuning, LoRA, forecasting
+8. 🟡 Training: grammatica `dataset`/`train`, formato dataset su disco, pretraining e fine-tuning (`blackforge train`) completati e verificati end-to-end su CPU. LoRA e forecasting non ancora iniziati; training su GPU richiede prima l'autodiff sul backend CUDA.
 9. Benchmark, profiling, CLI completa, documentazione finale
 
 ## Contribuire

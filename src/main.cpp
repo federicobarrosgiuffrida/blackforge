@@ -7,6 +7,7 @@
 
 #include "blackforge/ast/ast.hpp"
 #include "blackforge/backend/cpu/executor.hpp"
+#include "blackforge/backend/cpu/train_runner.hpp"
 #include "blackforge/diagnostics/diagnostic.hpp"
 #include "blackforge/frontend/lexer.hpp"
 #include "blackforge/frontend/parser.hpp"
@@ -28,6 +29,7 @@ void printUsage() {
               << "Comandi:\n"
               << "  check <file>       Analizza il file e riporta gli errori (lessicali, sintattici, semantici)\n"
               << "  run <file>         Esegue il primo modello del file\n"
+              << "  train <file>       Addestra il modello descritto dal blocco 'train' del file (CPU)\n"
               << "  devices            Elenca i dispositivi di calcolo disponibili (CPU e GPU CUDA)\n"
               << "  --help, -h         Mostra questo messaggio\n"
               << "  --version, -v      Mostra la versione del compilatore\n\n"
@@ -37,7 +39,9 @@ void printUsage() {
               << "  --print-ir         Mostra la rappresentazione interna (IR) del programma (solo 'check')\n"
               << "  --batch N          Dimensione di batch usata per risolvere le dimensioni simboliche "
                  "dell'input (solo 'run', default 1)\n"
-              << "  --device cpu|cuda  Dispositivo su cui eseguire (solo 'run', default cpu)\n";
+              << "  --device cpu|cuda  Dispositivo su cui eseguire (solo 'run', default cpu)\n"
+              << "  --from-checkpoint <file>  Pesi di partenza per il fine-tuning (solo 'train')\n"
+              << "  --save-checkpoint <file>  Dove salvare i pesi al termine dell'addestramento (solo 'train')\n";
 }
 
 void printDevices() {
@@ -232,6 +236,28 @@ int runRun(const std::string& path, std::size_t batchSize, const std::string& de
     return 0;
 }
 
+int runTrain(const std::string& path, const std::string& fromCheckpoint, const std::string& saveCheckpointPath) {
+    CompileOutput result = compile(path, /*verbose=*/false, /*printAst=*/false, /*printIr=*/false);
+
+    if (result.status == CompileStatus::FileNotFound) {
+        return 2;
+    }
+    if (result.status == CompileStatus::AnalysisFailed) {
+        std::cerr << path << ": impossibile addestrare, l'analisi ha trovato errori\n";
+        return 1;
+    }
+
+    try {
+        blackforge::backend::cpu::runTraining(result.program, result.module, fromCheckpoint, saveCheckpointPath,
+                                               &std::cout);
+    } catch (const std::exception& e) {
+        std::cerr << "errore di addestramento: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -247,6 +273,8 @@ int main(int argc, char** argv) {
     bool printIr = false;
     std::size_t batchSize = 1;
     std::string device = "cpu";
+    std::string fromCheckpoint;
+    std::string saveCheckpointPath;
     std::vector<std::string> positional;
     std::string command = args.front();
 
@@ -273,6 +301,18 @@ int main(int argc, char** argv) {
                 return 2;
             }
             device = args[++i];
+        } else if (args[i] == "--from-checkpoint") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--from-checkpoint' richiede un percorso\n";
+                return 2;
+            }
+            fromCheckpoint = args[++i];
+        } else if (args[i] == "--save-checkpoint") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--save-checkpoint' richiede un percorso\n";
+                return 2;
+            }
+            saveCheckpointPath = args[++i];
         } else {
             positional.push_back(args[i]);
         }
@@ -299,6 +339,13 @@ int main(int argc, char** argv) {
             return 2;
         }
         return runRun(positional.front(), batchSize, device);
+    }
+    if (command == "train") {
+        if (positional.empty()) {
+            std::cerr << "errore: comando 'train' richiede il percorso di un file .bf\n";
+            return 2;
+        }
+        return runTrain(positional.front(), fromCheckpoint, saveCheckpointPath);
     }
     if (command == "devices") {
         printDevices();

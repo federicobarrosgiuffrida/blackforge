@@ -28,6 +28,11 @@ std::string tokenKindName(TokenKind kind) {
         case TokenKind::KwLora: return "'lora'";
         case TokenKind::KwForecast: return "'forecast'";
         case TokenKind::KwBenchmark: return "'benchmark'";
+        case TokenKind::KwPath: return "'path'";
+        case TokenKind::KwLabels: return "'labels'";
+        case TokenKind::KwEpochs: return "'epochs'";
+        case TokenKind::KwBatchSize: return "'batch_size'";
+        case TokenKind::KwLearningRate: return "'learning_rate'";
         case TokenKind::LBrace: return "'{'";
         case TokenKind::RBrace: return "'}'";
         case TokenKind::LParen: return "'('";

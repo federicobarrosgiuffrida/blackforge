@@ -159,3 +159,71 @@ TEST(ParserTest, DumpAstNonVuotoPerProgrammaValido) {
     EXPECT_NE(text.find("TargetDecl"), std::string::npos);
     EXPECT_NE(text.find("nvidia.blackwell"), std::string::npos);
 }
+
+TEST(ParserTest, ParsaDatasetDeclCompleto) {
+    ParseResult result = parse(
+        "dataset MyData {\n"
+        "    path \"data/train.bin\"\n"
+        "    input bf16[batch, 4]\n"
+        "    labels bf16[batch, 2]\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    ASSERT_EQ(result.program.declarations.size(), 1u);
+
+    const auto& dataset = std::get<ast::DatasetDecl>(result.program.declarations[0]);
+    EXPECT_EQ(dataset.name, "MyData");
+    ASSERT_EQ(dataset.fields.size(), 3u);
+
+    const auto& pathField = std::get<ast::DatasetPathField>(dataset.fields[0]);
+    EXPECT_EQ(pathField.path, "data/train.bin");
+
+    const auto& inputField = std::get<ast::DatasetInputField>(dataset.fields[1]);
+    EXPECT_EQ(inputField.type.dtype.toString(), "bf16");
+
+    const auto& labelsField = std::get<ast::DatasetLabelsField>(dataset.fields[2]);
+    EXPECT_EQ(labelsField.type.dtype.toString(), "bf16");
+}
+
+TEST(ParserTest, ParsaTrainDeclCompleto) {
+    ParseResult result = parse(
+        "train {\n"
+        "    model TinyModel\n"
+        "    dataset MyData\n"
+        "    loss mse\n"
+        "    optimizer adamw\n"
+        "    epochs 10\n"
+        "    batch_size 32\n"
+        "    learning_rate 0.001\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    ASSERT_EQ(result.program.declarations.size(), 1u);
+
+    const auto& train = std::get<ast::TrainDecl>(result.program.declarations[0]);
+    ASSERT_EQ(train.fields.size(), 7u);
+
+    EXPECT_EQ(std::get<ast::TrainModelField>(train.fields[0]).name, "TinyModel");
+    EXPECT_EQ(std::get<ast::TrainDatasetField>(train.fields[1]).name, "MyData");
+    EXPECT_EQ(std::get<ast::TrainLossField>(train.fields[2]).name, "mse");
+    EXPECT_EQ(std::get<ast::TrainOptimizerField>(train.fields[3]).name, "adamw");
+    EXPECT_EQ(std::get<ast::TrainEpochsField>(train.fields[4]).value, 10);
+    EXPECT_EQ(std::get<ast::TrainBatchSizeField>(train.fields[5]).value, 32);
+    EXPECT_DOUBLE_EQ(std::get<ast::TrainLearningRateField>(train.fields[6]).value, 0.001);
+}
+
+TEST(ParserTest, SegnalaErroreSuCampoDatasetSconosciuto) {
+    ParseResult result = parse(
+        "dataset MyData {\n"
+        "    foo \"bar\"\n"
+        "}\n");
+    EXPECT_TRUE(result.diagnostics.hasErrors());
+}
+
+TEST(ParserTest, SegnalaErroreSuCampoTrainSconosciuto) {
+    ParseResult result = parse(
+        "train {\n"
+        "    foo bar\n"
+        "}\n");
+    EXPECT_TRUE(result.diagnostics.hasErrors());
+}

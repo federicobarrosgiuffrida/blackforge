@@ -1,11 +1,10 @@
 # Sintassi di BlackForge — stato attuale
 
-Questo documento descrive solo ciò che il compilatore riconosce **oggi**
-(lexer + parser + analisi semantica di base). Verrà esteso con la
-rappresentazione interna (IR) e l'esecuzione man mano che le milestone
-successive vengono completate. Non c'è ancora generazione di codice o
-esecuzione: il compilatore sa solo dire se un programma è lessicalmente,
-sintatticamente e semanticamente valido.
+Questo documento descrive ciò che il compilatore riconosce **oggi**:
+lexer, parser, analisi semantica, rappresentazione interna (IR) ed
+esecuzione (backend CPU e CUDA, incluso l'addestramento su CPU). Non
+c'è ancora generazione di codice nativo: BlackForge interpreta la IR
+tramite i backend, non compila verso un binario standalone.
 
 ## Commenti
 
@@ -18,14 +17,14 @@ sintatticamente e semanticamente valido.
 ## Identificatori e parole chiave
 
 Un identificatore inizia con una lettera o `_`, seguito da lettere,
-cifre o `_` (es. `TinyModel`, `batch_size`, `bf16`).
+cifre o `_` (es. `TinyModel`, `hidden_dim`, `bf16`).
 
 Le seguenti parole sono riservate e non possono essere usate come nomi:
 
 ```
 target precision storage compute accumulate parameters forward backward
 model input output dataset loss optimizer train pretrain finetune lora
-forecast benchmark
+forecast benchmark path labels epochs batch_size learning_rate
 ```
 
 Nomi di formati numerici (`bf16`, `fp8`, `fp16`, `fp32`, `tf32`, `e4m3`,
@@ -83,7 +82,7 @@ delle forme ed esecuzione arriveranno nelle prossime milestone.
 
 ```
 Program        := Declaration*
-Declaration    := TargetDecl | PrecisionDecl | ModelDecl
+Declaration    := TargetDecl | PrecisionDecl | ModelDecl | DatasetDecl | TrainDecl
 
 TargetDecl     := 'target' DottedName
 
@@ -103,6 +102,20 @@ PipelineStmt   := PipelineSource ('|>' PipelineStage)+
 PipelineSource := 'input' | Identifier
 PipelineStage  := Identifier ( '(' (Arg (',' Arg)*)? ')' )?
 Arg            := IntegerLiteral | FloatLiteral | StringLiteral | Identifier
+
+DatasetDecl    := 'dataset' Identifier '{' DatasetField* '}'
+DatasetField   := 'path' StringLiteral
+                | 'input' TensorType
+                | 'labels' TensorType
+
+TrainDecl      := 'train' '{' TrainField* '}'
+TrainField     := 'model' Identifier
+                | 'dataset' Identifier
+                | 'loss' Identifier
+                | 'optimizer' Identifier
+                | 'epochs' IntegerLiteral
+                | 'batch_size' IntegerLiteral
+                | 'learning_rate' (IntegerLiteral | FloatLiteral)
 
 DottedName     := Identifier ('.' Identifier)*
 ```
@@ -145,6 +158,16 @@ Dopo il parsing, `blackforge check` valida:
   note — `linear(n)` (un intero positivo), `silu`, `relu`, `gelu`
   (zero argomenti). Questo elenco crescerà quando il backend implementerà
   davvero le operazioni.
+- **Dataset**: nome univoco nel programma; esattamente un campo `path`,
+  un `input` e un `labels`, entrambi tensori validi (stesse regole di
+  forma/dtype di un `model`).
+- **Train**: esattamente un `model` (che deve riferirsi a un modello
+  dichiarato nel programma), un `dataset` (idem), una `loss` (solo
+  `mse` per ora), un `optimizer` (`sgd` o `adamw`), `epochs` e
+  `batch_size` (interi positivi); `learning_rate` è opzionale (default
+  `0.001` se omesso) e deve essere positivo se presente. I riferimenti
+  a `model`/`dataset` sono risolti per nome in tutto il programma,
+  indipendentemente dall'ordine delle dichiarazioni.
 
 ## Rappresentazione interna (IR)
 
@@ -292,3 +315,74 @@ dei valori visibilmente sbagliati).
 - Testato solo per l'architettura configurata in
   `BLACKFORGE_CUDA_ARCHITECTURES` (120, Blackwell consumer); altre
   architetture non sono state verificate.
+
+## Training (pretraining e fine-tuning)
+
+`dataset { ... }` e `train { ... }` collegano il linguaggio al motore
+di addestramento CPU (autodiff/loss/optimizer/checkpoint, vedi sopra).
+`blackforge train <file.bf>` esegue il primo blocco `train` trovato:
+
+```blackforge
+model TinyRegression {
+    input bf16[batch, 4]
+    input |> linear(2)
+}
+
+dataset ToyData {
+    path "dati/train.bfdata"
+    input bf16[batch, 4]
+    labels bf16[batch, 2]
+}
+
+train {
+    model TinyRegression
+    dataset ToyData
+    loss mse
+    optimizer adamw
+    epochs 100
+    batch_size 8
+    learning_rate 0.1
+}
+```
+
+### Formato dataset su disco
+
+`path` punta a un file nel formato binario proprietario di BlackForge
+(`blackforge::data`, magic `BFDATA1`, non compatibile con formati
+esterni come safetensors/numpy): numero di esempi, forma di un singolo
+esempio di input e di labels, poi tutti gli input concatenati seguiti
+da tutti i target concatenati, come float32. Non esiste ancora uno
+strumento BlackForge per generare questo file da sorgenti reali (CSV,
+immagini, ...): va scritto con `blackforge::data::saveDataset()` da
+codice C++ (vedi `examples/tiny_regression.bf` e il dataset che lo
+accompagna per un esempio minimo completo).
+
+Nota sui letterali stringa: come in C/C++/Python, `\` in una stringa
+BlackForge introduce un escape. Un percorso Windows con backslash va
+scritto con `/` (es. `"C:/dati/train.bfdata"`) o con `\\` raddoppiati.
+
+### Cosa fa `blackforge train`
+
+1. Compila il file (lexer → parser → analisi semantica → IR); si
+   ferma con errore se una qualunque fase fallisce.
+2. Risolve i riferimenti `model`/`dataset` del blocco `train` nella IR
+   e nell'AST.
+3. Carica il dataset da disco.
+4. Costruisce un `backend::cpu::Model` dal modello referenziato (pesi
+   nuovi, oppure caricati da `--from-checkpoint` per il fine-tuning).
+5. Per ogni epoca, itera i batch del dataset (in ordine, senza
+   mescolamento/shuffle ancora) eseguendo forward → loss → backward →
+   step dell'optimizer, stampando la loss media dell'epoca.
+6. Se `--save-checkpoint <path>` è specificato, salva i pesi finali.
+
+### Limitazioni esplicite
+
+- Solo sul backend CPU: l'autodiff non esiste ancora sul backend CUDA
+  (milestone 7 ha implementato solo la forward pass su GPU).
+- Solo il primo blocco `train` del file viene eseguito.
+- Nessuno shuffle dei dati tra le epoche; nessun batch parziale (un
+  dataset con `numEsempi % batch_size != 0` scarta gli esempi in eccesso).
+- Nessun learning rate scheduler, nessuna validazione/early stopping.
+- **LoRA e forecasting non sono ancora implementati**: richiedono
+  rispettivamente nuove operazioni IR per gli adapter a basso rango e
+  layer/loss specifici per serie temporali.

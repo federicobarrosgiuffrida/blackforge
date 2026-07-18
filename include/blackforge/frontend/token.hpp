@@ -44,6 +44,13 @@ enum class TokenKind {
     KwForecast,
     KwBenchmark,
 
+    // Parole chiave di 'dataset { ... }' e 'train { ... }'
+    KwPath,
+    KwLabels,
+    KwEpochs,
+    KwBatchSize,
+    KwLearningRate,
+
     // Punteggiatura
     LBrace,     // {
     RBrace,     // }

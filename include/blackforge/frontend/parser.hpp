@@ -57,6 +57,8 @@ private:
     ast::ShapeDim parseShapeDim();
     ast::Expr parseArgExpr();
     ast::PipelineStage parsePipelineStage();
+    ast::DatasetDecl parseDatasetDecl();
+    ast::TrainDecl parseTrainDecl();
 
     std::vector<Token> tokens_;
     std::size_t current_ = 0;

@@ -103,9 +103,79 @@ struct ModelDecl {
     SourceLocation location;
 };
 
+// --- dataset { ... } ---
+
+struct DatasetPathField {
+    std::string path;
+    SourceLocation location;
+};
+
+struct DatasetInputField {
+    TensorType type;
+    SourceLocation location;
+};
+
+struct DatasetLabelsField {
+    TensorType type;
+    SourceLocation location;
+};
+
+using DatasetField = std::variant<DatasetPathField, DatasetInputField, DatasetLabelsField>;
+
+struct DatasetDecl {
+    std::string name;
+    std::vector<DatasetField> fields;
+    SourceLocation location;
+};
+
+// --- train { ... } ---
+
+struct TrainModelField {
+    std::string name;
+    SourceLocation location;
+};
+
+struct TrainDatasetField {
+    std::string name;
+    SourceLocation location;
+};
+
+struct TrainLossField {
+    std::string name;  // es. "mse"
+    SourceLocation location;
+};
+
+struct TrainOptimizerField {
+    std::string name;  // es. "sgd", "adamw"
+    SourceLocation location;
+};
+
+struct TrainEpochsField {
+    long long value;
+    SourceLocation location;
+};
+
+struct TrainBatchSizeField {
+    long long value;
+    SourceLocation location;
+};
+
+struct TrainLearningRateField {
+    double value;
+    SourceLocation location;
+};
+
+using TrainField = std::variant<TrainModelField, TrainDatasetField, TrainLossField, TrainOptimizerField,
+                                 TrainEpochsField, TrainBatchSizeField, TrainLearningRateField>;
+
+struct TrainDecl {
+    std::vector<TrainField> fields;
+    SourceLocation location;
+};
+
 // --- Programma ---
 
-using Decl = std::variant<TargetDecl, PrecisionDecl, ModelDecl>;
+using Decl = std::variant<TargetDecl, PrecisionDecl, ModelDecl, DatasetDecl, TrainDecl>;
 
 struct Program {
     std::vector<Decl> declarations;

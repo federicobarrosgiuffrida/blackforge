@@ -154,3 +154,153 @@ TEST(SemanticAnalyzerTest, RifiutaTargetDuplicato) {
     auto analyzer = analyze("target cpu\ntarget cpu\n");
     EXPECT_TRUE(analyzer.diagnostics().hasErrors());
 }
+
+namespace {
+
+// Programma valido riusato dai test di dataset/train: un modello con
+// input compatibile, un dataset con path/input/labels completi e un
+// blocco train che li referenzia entrambi.
+const char* kValidTrainProgram =
+    "model M {\n"
+    "    input bf16[batch, 4]\n"
+    "    input |> linear(2)\n"
+    "}\n"
+    "dataset D {\n"
+    "    path \"data/train.bin\"\n"
+    "    input bf16[batch, 4]\n"
+    "    labels bf16[batch, 2]\n"
+    "}\n"
+    "train {\n"
+    "    model M\n"
+    "    dataset D\n"
+    "    loss mse\n"
+    "    optimizer adamw\n"
+    "    epochs 10\n"
+    "    batch_size 32\n"
+    "}\n";
+
+}  // namespace
+
+TEST(SemanticAnalyzerTest, AccettaDatasetETrainValidi) {
+    auto analyzer = analyze(kValidTrainProgram);
+    EXPECT_FALSE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaDatasetSenzaPath) {
+    auto analyzer = analyze(
+        "dataset D {\n"
+        "    input bf16[4]\n"
+        "    labels bf16[2]\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaDatasetSenzaLabels) {
+    auto analyzer = analyze(
+        "dataset D {\n"
+        "    path \"data/train.bin\"\n"
+        "    input bf16[4]\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaDatasetDuplicato) {
+    auto analyzer = analyze(
+        "dataset D {\n"
+        "    path \"a.bin\"\n"
+        "    input bf16[4]\n"
+        "    labels bf16[2]\n"
+        "}\n"
+        "dataset D {\n"
+        "    path \"b.bin\"\n"
+        "    input bf16[4]\n"
+        "    labels bf16[2]\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaTrainConModelloNonDefinito) {
+    auto analyzer = analyze(
+        "dataset D {\n"
+        "    path \"a.bin\"\n"
+        "    input bf16[4]\n"
+        "    labels bf16[2]\n"
+        "}\n"
+        "train {\n"
+        "    model NonEsiste\n"
+        "    dataset D\n"
+        "    loss mse\n"
+        "    optimizer sgd\n"
+        "    epochs 1\n"
+        "    batch_size 1\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaTrainConDatasetNonDefinito) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[4]\n"
+        "}\n"
+        "train {\n"
+        "    model M\n"
+        "    dataset NonEsiste\n"
+        "    loss mse\n"
+        "    optimizer sgd\n"
+        "    epochs 1\n"
+        "    batch_size 1\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaLossSconosciuta) {
+    std::string source = kValidTrainProgram;
+    auto pos = source.find("loss mse");
+    source.replace(pos, std::string("loss mse").size(), "loss cross_entropy");
+    auto analyzer = analyze(source);
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaOptimizerSconosciuto) {
+    std::string source = kValidTrainProgram;
+    auto pos = source.find("optimizer adamw");
+    source.replace(pos, std::string("optimizer adamw").size(), "optimizer rmsprop");
+    auto analyzer = analyze(source);
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaEpochsNonPositivo) {
+    std::string source = kValidTrainProgram;
+    auto pos = source.find("epochs 10");
+    source.replace(pos, std::string("epochs 10").size(), "epochs 0");
+    auto analyzer = analyze(source);
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaBatchSizeNonPositivo) {
+    std::string source = kValidTrainProgram;
+    auto pos = source.find("batch_size 32");
+    source.replace(pos, std::string("batch_size 32").size(), "batch_size 0");
+    auto analyzer = analyze(source);
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaTrainSenzaOptimizer) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[4]\n"
+        "}\n"
+        "dataset D {\n"
+        "    path \"a.bin\"\n"
+        "    input bf16[4]\n"
+        "    labels bf16[2]\n"
+        "}\n"
+        "train {\n"
+        "    model M\n"
+        "    dataset D\n"
+        "    loss mse\n"
+        "    epochs 1\n"
+        "    batch_size 1\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}

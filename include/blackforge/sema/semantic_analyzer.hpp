@@ -32,6 +32,8 @@ private:
     void analyzeTarget(const ast::TargetDecl& decl);
     void analyzePrecision(const ast::PrecisionDecl& decl);
     void analyzeModel(const ast::ModelDecl& decl);
+    void analyzeDataset(const ast::DatasetDecl& decl);
+    void analyzeTrain(const ast::TrainDecl& decl);
 
     void analyzeTensorType(const ast::TensorType& type);
     void analyzePipelineStmt(const ast::PipelineStmt& stmt, bool modelHasInput, const std::string& modelName);
@@ -41,6 +43,7 @@ private:
     int targetCount_ = 0;
     int precisionCount_ = 0;
     std::set<std::string> modelNames_;
+    std::set<std::string> datasetNames_;
 };
 
 }  // namespace blackforge::sema

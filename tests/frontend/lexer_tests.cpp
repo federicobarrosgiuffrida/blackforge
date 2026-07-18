@@ -43,7 +43,7 @@ TEST(LexerTest, RiconosceParoleChiave) {
 }
 
 TEST(LexerTest, RiconosceIdentificatoriNonParoleChiave) {
-    Lexer lexer("TinyModel bf16 linear silu batch_size", "test.bf");
+    Lexer lexer("TinyModel bf16 linear silu hidden_dim", "test.bf");
     auto tokens = lexer.tokenize();
 
     ASSERT_EQ(tokens.size(), 6u);

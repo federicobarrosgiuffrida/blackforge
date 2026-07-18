@@ -49,7 +49,8 @@ Parser::ParseError Parser::error(const SourceLocation& location, const std::stri
 
 void Parser::synchronizeToDeclaration() {
     while (!isAtEnd()) {
-        if (check(TokenKind::KwTarget) || check(TokenKind::KwPrecision) || check(TokenKind::KwModel)) {
+        if (check(TokenKind::KwTarget) || check(TokenKind::KwPrecision) || check(TokenKind::KwModel) ||
+            check(TokenKind::KwDataset) || check(TokenKind::KwTrain)) {
             return;
         }
         advance();
@@ -93,9 +94,16 @@ std::optional<ast::Decl> Parser::parseDeclaration() {
     if (check(TokenKind::KwModel)) {
         return ast::Decl{parseModelDecl()};
     }
+    if (check(TokenKind::KwDataset)) {
+        return ast::Decl{parseDatasetDecl()};
+    }
+    if (check(TokenKind::KwTrain)) {
+        return ast::Decl{parseTrainDecl()};
+    }
 
     throw error(peek().location,
-                "attesa una dichiarazione top-level ('target', 'precision' o 'model'), trovato " +
+                "attesa una dichiarazione top-level ('target', 'precision', 'model', 'dataset' o 'train'), "
+                "trovato " +
                     tokenKindName(peek().kind));
 }
 
@@ -304,6 +312,110 @@ ast::ModelDecl Parser::parseModelDecl() {
 
     expect(TokenKind::RBrace, "atteso '}' per chiudere il blocco 'model'");
     return ast::ModelDecl{nameToken.lexeme, std::move(body), start};
+}
+
+ast::DatasetDecl Parser::parseDatasetDecl() {
+    SourceLocation start = peek().location;
+    expect(TokenKind::KwDataset, "atteso 'dataset'");
+    const Token& nameToken = expect(TokenKind::Identifier, "atteso il nome del dataset dopo 'dataset'");
+    expect(TokenKind::LBrace, "atteso '{' dopo il nome del dataset");
+
+    std::vector<ast::DatasetField> fields;
+    while (!check(TokenKind::RBrace) && !isAtEnd()) {
+        SourceLocation fieldStart = peek().location;
+
+        if (check(TokenKind::KwPath)) {
+            advance();
+            const Token& pathToken = expect(TokenKind::StringLiteral, "atteso il percorso del dataset come stringa");
+            fields.push_back(ast::DatasetField{ast::DatasetPathField{pathToken.lexeme, fieldStart}});
+        } else if (check(TokenKind::KwInput)) {
+            advance();
+            ast::TensorType type = parseTensorType();
+            fields.push_back(ast::DatasetField{ast::DatasetInputField{std::move(type), fieldStart}});
+        } else if (check(TokenKind::KwLabels)) {
+            advance();
+            ast::TensorType type = parseTensorType();
+            fields.push_back(ast::DatasetField{ast::DatasetLabelsField{std::move(type), fieldStart}});
+        } else {
+            throw error(peek().location, "atteso un campo di dataset ('path', 'input' o 'labels'), trovato " +
+                                              tokenKindName(peek().kind));
+        }
+    }
+
+    expect(TokenKind::RBrace, "atteso '}' per chiudere il blocco 'dataset'");
+    return ast::DatasetDecl{nameToken.lexeme, std::move(fields), start};
+}
+
+ast::TrainDecl Parser::parseTrainDecl() {
+    SourceLocation start = peek().location;
+    expect(TokenKind::KwTrain, "atteso 'train'");
+    expect(TokenKind::LBrace, "atteso '{' dopo 'train'");
+
+    std::vector<ast::TrainField> fields;
+    while (!check(TokenKind::RBrace) && !isAtEnd()) {
+        SourceLocation fieldStart = peek().location;
+
+        if (check(TokenKind::KwModel)) {
+            advance();
+            const Token& nameToken = expect(TokenKind::Identifier, "atteso il nome del modello dopo 'model'");
+            fields.push_back(ast::TrainField{ast::TrainModelField{nameToken.lexeme, fieldStart}});
+        } else if (check(TokenKind::KwDataset)) {
+            advance();
+            const Token& nameToken = expect(TokenKind::Identifier, "atteso il nome del dataset dopo 'dataset'");
+            fields.push_back(ast::TrainField{ast::TrainDatasetField{nameToken.lexeme, fieldStart}});
+        } else if (check(TokenKind::KwLoss)) {
+            advance();
+            const Token& nameToken = expect(TokenKind::Identifier, "atteso il nome della loss dopo 'loss'");
+            fields.push_back(ast::TrainField{ast::TrainLossField{nameToken.lexeme, fieldStart}});
+        } else if (check(TokenKind::KwOptimizer)) {
+            advance();
+            const Token& nameToken =
+                expect(TokenKind::Identifier, "atteso il nome dell'optimizer dopo 'optimizer'");
+            fields.push_back(ast::TrainField{ast::TrainOptimizerField{nameToken.lexeme, fieldStart}});
+        } else if (check(TokenKind::KwEpochs)) {
+            advance();
+            const Token& valueToken = expect(TokenKind::IntegerLiteral, "atteso un intero dopo 'epochs'");
+            try {
+                fields.push_back(
+                    ast::TrainField{ast::TrainEpochsField{std::stoll(valueToken.lexeme), fieldStart}});
+            } catch (const std::out_of_range&) {
+                throw error(fieldStart, "valore intero troppo grande per 'epochs': '" + valueToken.lexeme + "'");
+            }
+        } else if (check(TokenKind::KwBatchSize)) {
+            advance();
+            const Token& valueToken = expect(TokenKind::IntegerLiteral, "atteso un intero dopo 'batch_size'");
+            try {
+                fields.push_back(
+                    ast::TrainField{ast::TrainBatchSizeField{std::stoll(valueToken.lexeme), fieldStart}});
+            } catch (const std::out_of_range&) {
+                throw error(fieldStart, "valore intero troppo grande per 'batch_size': '" + valueToken.lexeme + "'");
+            }
+        } else if (check(TokenKind::KwLearningRate)) {
+            advance();
+            double value = 0.0;
+            if (check(TokenKind::FloatLiteral) || check(TokenKind::IntegerLiteral)) {
+                const Token& valueToken = advance();
+                try {
+                    value = std::stod(valueToken.lexeme);
+                } catch (const std::out_of_range&) {
+                    throw error(fieldStart,
+                                "valore troppo grande per 'learning_rate': '" + valueToken.lexeme + "'");
+                }
+            } else {
+                throw error(peek().location,
+                             "atteso un numero dopo 'learning_rate', trovato " + tokenKindName(peek().kind));
+            }
+            fields.push_back(ast::TrainField{ast::TrainLearningRateField{value, fieldStart}});
+        } else {
+            throw error(peek().location,
+                         "atteso un campo di 'train' ('model', 'dataset', 'loss', 'optimizer', 'epochs', "
+                         "'batch_size' o 'learning_rate'), trovato " +
+                             tokenKindName(peek().kind));
+        }
+    }
+
+    expect(TokenKind::RBrace, "atteso '}' per chiudere il blocco 'train'");
+    return ast::TrainDecl{std::move(fields), start};
 }
 
 }  // namespace blackforge
