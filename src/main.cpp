@@ -4,8 +4,10 @@
 #include <string>
 #include <vector>
 
+#include "blackforge/ast/ast.hpp"
 #include "blackforge/diagnostics/diagnostic.hpp"
 #include "blackforge/frontend/lexer.hpp"
+#include "blackforge/frontend/parser.hpp"
 #include "blackforge/frontend/token.hpp"
 
 namespace {
@@ -13,11 +15,12 @@ namespace {
 void printUsage() {
     std::cout << "Uso: blackforge <comando> [opzioni] <file.bf>\n\n"
               << "Comandi:\n"
-              << "  check <file>       Analizza il file e riporta gli errori (lessicali per ora)\n"
+              << "  check <file>       Analizza il file e riporta gli errori (lessicali e sintattici)\n"
               << "  --help, -h         Mostra questo messaggio\n"
               << "  --version, -v      Mostra la versione del compilatore\n\n"
               << "Opzioni:\n"
-              << "  --verbose          Mostra i token riconosciuti\n";
+              << "  --verbose          Mostra i token riconosciuti\n"
+              << "  --print-ast        Mostra l'albero sintattico (AST) prodotto dal parser\n";
 }
 
 void printVersion() { std::cout << "blackforge " << BLACKFORGE_VERSION << "\n"; }
@@ -35,7 +38,7 @@ bool readFile(const std::string& path, std::string& outContent) {
     return true;
 }
 
-int runCheck(const std::string& path, bool verbose) {
+int runCheck(const std::string& path, bool verbose, bool printAst) {
     std::string source;
     if (!readFile(path, source)) {
         std::cerr << "errore: impossibile aprire il file '" << path << "'\n";
@@ -56,17 +59,31 @@ int runCheck(const std::string& path, bool verbose) {
         }
     }
 
-    const auto& diagnostics = lexer.diagnostics();
-    for (const auto& diagnostic : diagnostics.all()) {
-        std::cerr << blackforge::formatDiagnostic(diagnostic) << "\n";
+    blackforge::Parser parser(tokens);
+    blackforge::ast::Program program = parser.parseProgram();
+
+    if (printAst) {
+        std::cout << blackforge::ast::dump(program);
     }
 
-    if (diagnostics.hasErrors()) {
-        std::cerr << path << ": analisi lessicale fallita\n";
+    bool hasErrors = false;
+    for (const auto& diagnostic : lexer.diagnostics().all()) {
+        std::cerr << blackforge::formatDiagnostic(diagnostic) << "\n";
+    }
+    hasErrors = hasErrors || lexer.diagnostics().hasErrors();
+
+    for (const auto& diagnostic : parser.diagnostics().all()) {
+        std::cerr << blackforge::formatDiagnostic(diagnostic) << "\n";
+    }
+    hasErrors = hasErrors || parser.diagnostics().hasErrors();
+
+    if (hasErrors) {
+        std::cerr << path << ": analisi fallita\n";
         return 1;
     }
 
-    std::cout << path << ": nessun errore lessicale (" << tokens.size() << " token)\n";
+    std::cout << path << ": nessun errore (" << tokens.size() << " token, " << program.declarations.size()
+              << " dichiarazioni top-level)\n";
     return 0;
 }
 
@@ -81,12 +98,15 @@ int main(int argc, char** argv) {
     }
 
     bool verbose = false;
+    bool printAst = false;
     std::vector<std::string> positional;
     std::string command = args.front();
 
     for (std::size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--verbose") {
             verbose = true;
+        } else if (args[i] == "--print-ast") {
+            printAst = true;
         } else {
             positional.push_back(args[i]);
         }
@@ -105,7 +125,7 @@ int main(int argc, char** argv) {
             std::cerr << "errore: comando 'check' richiede il percorso di un file .bf\n";
             return 2;
         }
-        return runCheck(positional.front(), verbose);
+        return runCheck(positional.front(), verbose, printAst);
     }
 
     std::cerr << "errore: comando sconosciuto '" << command << "'\n";

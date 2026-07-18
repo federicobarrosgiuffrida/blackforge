@@ -1,8 +1,10 @@
 # Sintassi di BlackForge — stato attuale
 
 Questo documento descrive solo ciò che il compilatore riconosce **oggi**
-(fase lexer). Verrà esteso con parser, semantica ed esecuzione man mano
-che le milestone successive vengono completate.
+(lexer + parser). Verrà esteso con l'analisi semantica e l'esecuzione
+man mano che le milestone successive vengono completate. Non c'è ancora
+alcun controllo di tipi, forme o validità dei target/precisioni: il
+parser costruisce l'AST, non lo valida.
 
 ## Commenti
 
@@ -72,6 +74,41 @@ model TinyModel {
 ```
 
 Il compilatore, tramite `blackforge check esempio.bf --verbose`, mostra
-oggi la sequenza di token riconosciuti con posizione (file:riga:colonna).
-Parsing, controllo dei tipi e delle forme, ed esecuzione arriveranno
-nelle prossime milestone.
+la sequenza di token riconosciuti con posizione (file:riga:colonna);
+tramite `--print-ast` mostra l'albero sintattico. Controllo dei tipi,
+delle forme ed esecuzione arriveranno nelle prossime milestone.
+
+## Grammatica (sottoinsieme attualmente analizzato dal parser)
+
+```
+Program        := Declaration*
+Declaration    := TargetDecl | PrecisionDecl | ModelDecl
+
+TargetDecl     := 'target' DottedName
+
+PrecisionDecl  := 'precision' '{' PrecisionField* '}'
+PrecisionField := PrecisionKw DottedName
+PrecisionKw    := 'storage' | 'compute' | 'accumulate'
+                | 'parameters' | 'forward' | 'backward'
+
+ModelDecl      := 'model' Identifier '{' ModelStatement* '}'
+ModelStatement := InputDecl | PipelineStmt
+
+InputDecl      := 'input' TensorType
+TensorType     := DottedName '[' ShapeDim (',' ShapeDim)* ']'
+ShapeDim       := IntegerLiteral | Identifier
+
+PipelineStmt   := PipelineSource ('|>' PipelineStage)+
+PipelineSource := 'input' | Identifier
+PipelineStage  := Identifier ( '(' (Arg (',' Arg)*)? ')' )?
+Arg            := IntegerLiteral | FloatLiteral | StringLiteral | Identifier
+
+DottedName     := Identifier ('.' Identifier)*
+```
+
+Note sul recupero dagli errori: se una dichiarazione top-level non è
+valida, il parser la salta fino alla prossima parola chiave
+`target`/`precision`/`model`; se un'istruzione dentro un `model` non è
+valida, salta fino alla prossima istruzione valida o a `}`. Questo
+permette a `blackforge check` di riportare più errori sintattici in una
+sola esecuzione, invece di fermarsi al primo.

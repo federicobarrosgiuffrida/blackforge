@@ -104,6 +104,8 @@ set(
     src/diagnostics/diagnostic.cpp
     src/frontend/token.cpp
     src/frontend/lexer.cpp
+    src/frontend/parser.cpp
+    src/ast/ast.cpp
 )
 
 # I sorgenti del backend CUDA (kernels/, src/backend/cuda/) verranno

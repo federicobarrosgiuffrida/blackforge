@@ -35,8 +35,8 @@ del codice in questo repository, non obiettivi futuri.
 | Componente | Stato |
 |---|---|
 | Lexer (tokenizzazione, diagnostica riga/colonna, recupero da errori) | ✅ Completato |
-| CLI `blackforge check <file>` | ✅ Completato (solo analisi lessicale per ora) |
-| Parser / AST | ⏳ Pianificato |
+| CLI `blackforge check <file>` | ✅ Completato (analisi lessicale e sintattica) |
+| Parser / AST (`target`, `precision`, `model`, pipeline `\|>`) | ✅ Completato per il sottoinsieme documentato in [docs/language.md](docs/language.md) |
 | Analisi semantica e controllo tipi numerici | ⏳ Pianificato |
 | Controllo forme tensoriali | ⏳ Pianificato |
 | Rappresentazione interna (IR) | ⏳ Pianificato |
@@ -97,8 +97,9 @@ ctest --test-dir build
 ## Uso della CLI
 
 ```bash
-blackforge check <file.bf>            # analizza il file e riporta gli errori
-blackforge check <file.bf> --verbose  # mostra anche i token riconosciuti
+blackforge check <file.bf>              # analizza il file e riporta gli errori
+blackforge check <file.bf> --verbose    # mostra anche i token riconosciuti
+blackforge check <file.bf> --print-ast  # mostra l'AST prodotto dal parser
 blackforge --version
 blackforge --help
 ```
@@ -111,8 +112,9 @@ saranno pronte.
 ## Esempi
 
 - [`examples/hello.bf`](examples/hello.bf) — sintassi indicativa di un
-  modello minimale. Oggi il compilatore può solo tokenizzarlo (nessun
-  parser/validazione ancora).
+  modello minimale. Il compilatore oggi lo tokenizza e lo analizza
+  sintatticamente (nessuna validazione semantica ancora: tipi, forme e
+  target non sono controllati).
 
 ## Struttura del repository
 
@@ -132,7 +134,7 @@ PolyForm Noncommercial License 1.0.0 — vedi [LICENSE.md](LICENSE.md).
 ## Roadmap
 
 1. ✅ Lexer e CLI `check` di base
-2. Parser e AST
+2. ✅ Parser e AST
 3. Analisi semantica: tipi numerici, precisioni, forme tensoriali
 4. Rappresentazione interna (IR) e pass manager
 5. Backend CPU di riferimento (tensori, operazioni, layer)

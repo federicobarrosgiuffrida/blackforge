@@ -15,6 +15,7 @@ FetchContent_MakeAvailable(googletest)
 set(
     BLACKFORGE_TEST_SOURCES
     frontend/lexer_tests.cpp
+    frontend/parser_tests.cpp
 )
 
 add_executable(
