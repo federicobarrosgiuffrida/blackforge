@@ -112,6 +112,10 @@ set(
     src/ir/operation.cpp
     src/ir/module.cpp
     src/ir/ir_builder.cpp
+    src/runtime/tensor.cpp
+    src/runtime/device.cpp
+    src/backend/cpu/ops.cpp
+    src/backend/cpu/executor.cpp
 )
 
 # I sorgenti del backend CUDA (kernels/, src/backend/cuda/) verranno

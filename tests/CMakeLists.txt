@@ -19,6 +19,9 @@ set(
     sema/dtype_tests.cpp
     sema/semantic_analyzer_tests.cpp
     ir/ir_builder_tests.cpp
+    runtime/tensor_tests.cpp
+    backend/cpu/ops_tests.cpp
+    backend/cpu/executor_tests.cpp
 )
 
 add_executable(

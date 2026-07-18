@@ -164,7 +164,32 @@ dimensioni" che l'analisi semantica locale non può vedere.
 
 Non esiste ancora un pass manager con ottimizzazioni (fusione,
 eliminazione di operazioni morte): con l'attuale insieme minimo di
-operazioni e senza pesi/tensori reali non c'è ancora nulla di genuino
-da ottimizzare. Arriverà con il backend CPU, quando la IR guadagnerà
-la struttura (buffer reali, sequenze più lunghe) necessaria perché
-queste ottimizzazioni abbiano un effetto misurabile.
+operazioni non c'è ancora nulla di genuino da ottimizzare. Arriverà con
+l'autodiff/training, quando la IR guadagnerà la struttura (nodi
+backward, sequenze più lunghe) necessaria perché queste ottimizzazioni
+abbiano un effetto misurabile.
+
+## Backend CPU di riferimento ed esecuzione
+
+`blackforge run <file.bf>` esegue davvero un modello: costruisce la IR,
+genera un tensore di input sintetico (le dimensioni simboliche come
+`batch` sono risolte al valore passato con `--batch`, default 1) e
+attraversa la prima pipeline del primo modello applicando le operazioni
+una a una sul backend CPU (`blackforge::backend::cpu`):
+
+- `linear(n)`: prodotto matriciale `[batch, in] x [in, n]` più bias
+  `[n]`, con pesi generati in modo deterministico (seme fisso, non una
+  strategia di inizializzazione statisticamente valida come
+  Xavier/Kaiming, e non ancora caricabili da checkpoint);
+- `silu`, `relu`, `gelu`: applicate elemento per elemento.
+
+Limitazioni note, esplicite:
+
+- Il backend CPU calcola sempre in **float32**, indipendentemente dal
+  formato numerico dichiarato (`bf16`, `fp8`, ...): serve a verificare
+  la correttezza funzionale, non a riprodurre la precisione reale
+  dell'hardware. L'emulazione dei formati ridotti arriverà con il
+  backend CUDA.
+- I pesi non sono allenabili: non esiste ancora autodiff, loss,
+  optimizer né caricamento di checkpoint.
+- Viene eseguita solo la prima pipeline del primo modello del file.
