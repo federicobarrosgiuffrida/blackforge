@@ -38,8 +38,9 @@ del codice in questo repository, non obiettivi futuri.
 | CLI `blackforge check <file>` | ✅ Completato (analisi lessicale e sintattica) |
 | Parser / AST (`target`, `precision`, `model`, pipeline `\|>`) | ✅ Completato per il sottoinsieme documentato in [docs/language.md](docs/language.md) |
 | Analisi semantica e controllo tipi numerici (dtype, target, operazioni note) | ✅ Completato per il sottoinsieme attuale |
-| Controllo forme tensoriali | 🟡 Parziale (dimensioni valide/positive; l'inferenza della forma lungo la pipeline richiede l'IR) |
-| Rappresentazione interna (IR) | ⏳ Pianificato |
+| Controllo forme tensoriali | ✅ Inferenza reale lungo la pipeline (via IR); vincoli locali via analisi semantica |
+| Rappresentazione interna (IR) | ✅ Completata (Value/Operation/Module, IR builder con inferenza di forma e dtype) |
+| Pass manager / ottimizzazioni (fusione, dead code elimination) | ⏳ Pianificato (rimandato: senza pesi/tensori reali non c'e' ancora nulla di genuino da ottimizzare; arriva con il backend CPU) |
 | Backend CPU di riferimento | ⏳ Pianificato |
 | Autodiff / backward | ⏳ Pianificato |
 | Optimizer (SGD, AdamW) | ⏳ Pianificato |
@@ -100,6 +101,7 @@ ctest --test-dir build
 blackforge check <file.bf>              # analizza il file e riporta gli errori
 blackforge check <file.bf> --verbose    # mostra anche i token riconosciuti
 blackforge check <file.bf> --print-ast  # mostra l'AST prodotto dal parser
+blackforge check <file.bf> --print-ir   # mostra la rappresentazione interna (IR)
 blackforge --version
 blackforge --help
 ```
@@ -136,8 +138,8 @@ PolyForm Noncommercial License 1.0.0 — vedi [LICENSE.md](LICENSE.md).
 1. ✅ Lexer e CLI `check` di base
 2. ✅ Parser e AST
 3. ✅ Analisi semantica: tipi numerici, precisioni, forme tensoriali (base)
-4. Rappresentazione interna (IR) e pass manager
-5. Backend CPU di riferimento (tensori, operazioni, layer)
+4. ✅ Rappresentazione interna (IR): valori, operazioni, inferenza di forma
+5. Backend CPU di riferimento (tensori, operazioni, layer, pass manager)
 6. Autodiff, loss, optimizer, checkpoint
 7. Backend CUDA (kernel, Tensor Core, Blackwell)
 8. Training, fine-tuning, LoRA, forecasting

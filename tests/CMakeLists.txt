@@ -18,6 +18,7 @@ set(
     frontend/parser_tests.cpp
     sema/dtype_tests.cpp
     sema/semantic_analyzer_tests.cpp
+    ir/ir_builder_tests.cpp
 )
 
 add_executable(

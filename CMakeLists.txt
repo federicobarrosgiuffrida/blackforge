@@ -108,6 +108,10 @@ set(
     src/ast/ast.cpp
     src/sema/dtype.cpp
     src/sema/semantic_analyzer.cpp
+    src/ir/value.cpp
+    src/ir/operation.cpp
+    src/ir/module.cpp
+    src/ir/ir_builder.cpp
 )
 
 # I sorgenti del backend CUDA (kernels/, src/backend/cuda/) verranno

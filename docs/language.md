@@ -145,3 +145,26 @@ Dopo il parsing, `blackforge check` valida:
   note — `linear(n)` (un intero positivo), `silu`, `relu`, `gelu`
   (zero argomenti). Questo elenco crescerà quando il backend implementerà
   davvero le operazioni.
+
+## Rappresentazione interna (IR)
+
+Dopo l'analisi semantica, `blackforge check` costruisce la IR
+(`blackforge::ir`, visibile con `--print-ir`): un `Module` per
+programma, con un `ModelIR` per ogni `model`. Ogni `ModelIR` è un
+piccolo grafo di `Value` (formato numerico + forma) collegati da
+`Operation` lungo una `Pipeline`.
+
+A differenza dell'analisi semantica di base, qui la forma **viene
+davvero propagata**: `linear(n)` sostituisce l'ultima dimensione del
+tensore in ingresso con `n` (le altre, incluse quelle simboliche come
+`batch`, sono preservate), mentre `silu`/`relu`/`gelu` non modificano
+forma né formato numerico essendo operazioni elementwise. Questo
+permette di rilevare errori come "linear applicato a un tensore senza
+dimensioni" che l'analisi semantica locale non può vedere.
+
+Non esiste ancora un pass manager con ottimizzazioni (fusione,
+eliminazione di operazioni morte): con l'attuale insieme minimo di
+operazioni e senza pesi/tensori reali non c'è ancora nulla di genuino
+da ottimizzare. Arriverà con il backend CPU, quando la IR guadagnerà
+la struttura (buffer reali, sequenze più lunghe) necessaria perché
+queste ottimizzazioni abbiano un effetto misurabile.

@@ -9,6 +9,8 @@
 #include "blackforge/frontend/lexer.hpp"
 #include "blackforge/frontend/parser.hpp"
 #include "blackforge/frontend/token.hpp"
+#include "blackforge/ir/ir_builder.hpp"
+#include "blackforge/ir/module.hpp"
 #include "blackforge/sema/semantic_analyzer.hpp"
 
 namespace {
@@ -21,7 +23,8 @@ void printUsage() {
               << "  --version, -v      Mostra la versione del compilatore\n\n"
               << "Opzioni:\n"
               << "  --verbose          Mostra i token riconosciuti\n"
-              << "  --print-ast        Mostra l'albero sintattico (AST) prodotto dal parser\n";
+              << "  --print-ast        Mostra l'albero sintattico (AST) prodotto dal parser\n"
+              << "  --print-ir         Mostra la rappresentazione interna (IR) del programma\n";
 }
 
 void printVersion() { std::cout << "blackforge " << BLACKFORGE_VERSION << "\n"; }
@@ -39,7 +42,7 @@ bool readFile(const std::string& path, std::string& outContent) {
     return true;
 }
 
-int runCheck(const std::string& path, bool verbose, bool printAst) {
+int runCheck(const std::string& path, bool verbose, bool printAst, bool printIr) {
     std::string source;
     if (!readFile(path, source)) {
         std::cerr << "errore: impossibile aprire il file '" << path << "'\n";
@@ -86,6 +89,23 @@ int runCheck(const std::string& path, bool verbose, bool printAst) {
     }
     hasErrors = hasErrors || analyzer.diagnostics().hasErrors();
 
+    // La IR viene costruita solo se le fasi precedenti non hanno gia'
+    // trovato errori: su un programma invalido l'albero potrebbe essere
+    // incompleto e la IR risulterebbe fuorviante.
+    if (!hasErrors) {
+        blackforge::ir::IRBuilder irBuilder;
+        blackforge::ir::Module module = irBuilder.build(program);
+
+        if (printIr) {
+            std::cout << blackforge::ir::dump(module);
+        }
+
+        for (const auto& diagnostic : irBuilder.diagnostics().all()) {
+            std::cerr << blackforge::formatDiagnostic(diagnostic) << "\n";
+        }
+        hasErrors = hasErrors || irBuilder.diagnostics().hasErrors();
+    }
+
     if (hasErrors) {
         std::cerr << path << ": analisi fallita\n";
         return 1;
@@ -108,6 +128,7 @@ int main(int argc, char** argv) {
 
     bool verbose = false;
     bool printAst = false;
+    bool printIr = false;
     std::vector<std::string> positional;
     std::string command = args.front();
 
@@ -116,6 +137,8 @@ int main(int argc, char** argv) {
             verbose = true;
         } else if (args[i] == "--print-ast") {
             printAst = true;
+        } else if (args[i] == "--print-ir") {
+            printIr = true;
         } else {
             positional.push_back(args[i]);
         }
@@ -134,7 +157,7 @@ int main(int argc, char** argv) {
             std::cerr << "errore: comando 'check' richiede il percorso di un file .bf\n";
             return 2;
         }
-        return runCheck(positional.front(), verbose, printAst);
+        return runCheck(positional.front(), verbose, printAst, printIr);
     }
 
     std::cerr << "errore: comando sconosciuto '" << command << "'\n";
