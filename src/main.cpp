@@ -1,3 +1,7 @@
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -6,8 +10,10 @@
 #include <vector>
 
 #include "blackforge/ast/ast.hpp"
+#include "blackforge/backend/cpu/benchmark.hpp"
 #include "blackforge/backend/cpu/executor.hpp"
 #include "blackforge/backend/cpu/forecast_runner.hpp"
+#include "blackforge/backend/cpu/model.hpp"
 #include "blackforge/backend/cpu/train_runner.hpp"
 #include "blackforge/diagnostics/diagnostic.hpp"
 #include "blackforge/frontend/lexer.hpp"
@@ -16,6 +22,7 @@
 #include "blackforge/ir/ir_builder.hpp"
 #include "blackforge/ir/module.hpp"
 #include "blackforge/runtime/tensor.hpp"
+#include "blackforge/sema/dtype.hpp"
 #include "blackforge/sema/semantic_analyzer.hpp"
 
 #if BLACKFORGE_HAS_CUDA
@@ -29,9 +36,12 @@ void printUsage() {
     std::cout << "Uso: blackforge <comando> [opzioni] <file.bf>\n\n"
               << "Comandi:\n"
               << "  check <file>       Analizza il file e riporta gli errori (lessicali, sintattici, semantici)\n"
+              << "  build <file>       Compila e costruisce ogni modello (alloca i parametri), senza eseguirlo\n"
               << "  run <file>         Esegue il primo modello del file\n"
               << "  train <file>       Addestra il modello descritto dal blocco 'train' del file (CPU)\n"
               << "  forecast <file>    Genera 'horizon' passi autoregressivi dal blocco 'forecast' del file (CPU)\n"
+              << "  benchmark <file>   Misura tempo/throughput/memoria del primo modello del file\n"
+              << "  inspect <file>     Mostra un riepilogo dei modelli (input, pipeline, numero di parametri)\n"
               << "  devices            Elenca i dispositivi di calcolo disponibili (CPU e GPU CUDA)\n"
               << "  --help, -h         Mostra questo messaggio\n"
               << "  --version, -v      Mostra la versione del compilatore\n\n"
@@ -40,11 +50,13 @@ void printUsage() {
               << "  --print-ast        Mostra l'albero sintattico (AST) prodotto dal parser (solo 'check')\n"
               << "  --print-ir         Mostra la rappresentazione interna (IR) del programma (solo 'check')\n"
               << "  --batch N          Dimensione di batch usata per risolvere le dimensioni simboliche "
-                 "dell'input (solo 'run', default 1)\n"
-              << "  --device cpu|cuda  Dispositivo su cui eseguire (solo 'run', default cpu)\n"
+                 "dell'input (default 1)\n"
+              << "  --device cpu|cuda|cuda:N  Dispositivo su cui eseguire ('run'/'benchmark', default cpu)\n"
               << "  --from-checkpoint <file>  Pesi di partenza: fine-tuning/LoRA per 'train', "
                  "obbligatorio per 'forecast'\n"
-              << "  --save-checkpoint <file>  Dove salvare i pesi al termine dell'addestramento (solo 'train')\n";
+              << "  --save-checkpoint <file>  Dove salvare i pesi al termine dell'addestramento (solo 'train')\n"
+              << "  --warmup N         Iterazioni di riscaldamento scartate (solo 'benchmark', default 5)\n"
+              << "  --iterations N     Iterazioni misurate (solo 'benchmark', default 20)\n";
 }
 
 void printDevices() {
@@ -67,6 +79,38 @@ void printDevices() {
 }
 
 void printVersion() { std::cout << "blackforge " << BLACKFORGE_VERSION << "\n"; }
+
+struct DeviceSpec {
+    bool isCuda = false;
+    int cudaIndex = 0;
+};
+
+// Analizza '--device cpu' | 'cuda' | 'cuda:N'. Restituisce false e
+// riempie 'error' se la stringa non e' un dispositivo valido.
+bool parseDeviceSpec(const std::string& device, DeviceSpec& outSpec, std::string& outError) {
+    if (device == "cpu") {
+        outSpec = DeviceSpec{false, 0};
+        return true;
+    }
+    if (device == "cuda") {
+        outSpec = DeviceSpec{true, 0};
+        return true;
+    }
+    if (device.rfind("cuda:", 0) == 0) {
+        std::string indexPart = device.substr(5);
+        bool allDigits = !indexPart.empty() && std::all_of(indexPart.begin(), indexPart.end(), [](unsigned char c) {
+                              return std::isdigit(c) != 0;
+                          });
+        if (!allDigits) {
+            outError = "indice GPU non valido in '" + device + "'";
+            return false;
+        }
+        outSpec = DeviceSpec{true, std::stoi(indexPart)};
+        return true;
+    }
+    outError = "dispositivo sconosciuto '" + device + "' (valori validi: cpu, cuda, cuda:N)";
+    return false;
+}
 
 // Legge l'intero contenuto di un file in una stringa. Restituisce false
 // se il file non esiste o non e' leggibile.
@@ -179,14 +223,15 @@ int runCheck(const std::string& path, bool verbose, bool printAst, bool printIr)
 }
 
 int runRun(const std::string& path, std::size_t batchSize, const std::string& device) {
-    if (device != "cpu" && device != "cuda") {
-        std::cerr << "errore: dispositivo sconosciuto '" << device << "' (valori validi: cpu, cuda)\n";
+    DeviceSpec spec;
+    std::string deviceError;
+    if (!parseDeviceSpec(device, spec, deviceError)) {
+        std::cerr << "errore: " << deviceError << "\n";
         return 2;
     }
-
-    if (device == "cuda" && !BLACKFORGE_HAS_CUDA) {
-        std::cerr << "errore: '--device cuda' richiesto ma questa build di blackforge e' stata compilata senza "
-                     "supporto CUDA (BLACKFORGE_ENABLE_CUDA=OFF in fase di compilazione)\n";
+    if (spec.isCuda && !BLACKFORGE_HAS_CUDA) {
+        std::cerr << "errore: '--device " << device << "' richiesto ma questa build di blackforge e' stata "
+                     "compilata senza supporto CUDA (BLACKFORGE_ENABLE_CUDA=OFF in fase di compilazione)\n";
         return 1;
     }
 
@@ -206,7 +251,7 @@ int runRun(const std::string& path, std::size_t batchSize, const std::string& de
 
     const blackforge::ir::ModelIR& model = result.module.models.front();
 
-    if (device == "cpu" && result.module.target.has_value() && *result.module.target != "cpu") {
+    if (!spec.isCuda && result.module.target.has_value() && *result.module.target != "cpu") {
         std::cout << "nota: target dichiarato '" << *result.module.target
                    << "'; sto eseguendo su CPU. Usa '--device cuda' per eseguire sulla GPU (se disponibile).\n";
     }
@@ -215,12 +260,13 @@ int runRun(const std::string& path, std::size_t batchSize, const std::string& de
         blackforge::runtime::Tensor input;
         blackforge::runtime::Tensor output;
 
-        if (device == "cpu") {
+        if (!spec.isCuda) {
             blackforge::backend::cpu::Executor executor;
             input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
             output = executor.run(model, input);
         } else {
 #if BLACKFORGE_HAS_CUDA
+            blackforge::backend::cuda::setActiveDevice(spec.cudaIndex);
             blackforge::backend::cuda::Executor executor;
             input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
             output = executor.run(model, input);
@@ -282,6 +328,212 @@ int runForecast(const std::string& path, const std::string& fromCheckpoint, std:
     return 0;
 }
 
+std::string formatShape(const std::vector<std::size_t>& shape) {
+    std::ostringstream out;
+    out << "[";
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) {
+            out << ", ";
+        }
+        out << shape[i];
+    }
+    out << "]";
+    return out.str();
+}
+
+int runBenchmark(const std::string& path, const std::string& device, std::size_t batchSize,
+                  std::size_t warmupIterations, std::size_t measuredIterations) {
+    DeviceSpec spec;
+    std::string deviceError;
+    if (!parseDeviceSpec(device, spec, deviceError)) {
+        std::cerr << "errore: " << deviceError << "\n";
+        return 2;
+    }
+    if (spec.isCuda && !BLACKFORGE_HAS_CUDA) {
+        std::cerr << "errore: '--device " << device << "' richiesto ma questa build di blackforge e' stata "
+                     "compilata senza supporto CUDA (BLACKFORGE_ENABLE_CUDA=OFF in fase di compilazione)\n";
+        return 1;
+    }
+
+    CompileOutput result = compile(path, /*verbose=*/false, /*printAst=*/false, /*printIr=*/false);
+    if (result.status == CompileStatus::FileNotFound) {
+        return 2;
+    }
+    if (result.status == CompileStatus::AnalysisFailed) {
+        std::cerr << path << ": impossibile eseguire il benchmark, l'analisi ha trovato errori\n";
+        return 1;
+    }
+    if (result.module.models.empty()) {
+        std::cerr << "errore: il programma non definisce alcun modello da misurare\n";
+        return 1;
+    }
+
+    const blackforge::ir::ModelIR& model = result.module.models.front();
+    std::string dtypeName = blackforge::sema::dtypeName(model.valueById(model.inputValue).dtype);
+
+    try {
+        blackforge::backend::cpu::BenchmarkResult cpuResult =
+            blackforge::backend::cpu::runBenchmark(model, batchSize, warmupIterations, measuredIterations);
+
+        std::cout << "Benchmark di '" << model.name << "'\n";
+        std::cout << "  hardware:          CPU (backend di riferimento; nome del processore non rilevato)\n";
+        std::cout << "  precisione:        " << dtypeName
+                   << " dichiarata (il backend CPU calcola sempre in float32)\n";
+        std::cout << "  forma input:       " << formatShape(cpuResult.inputShape) << "\n";
+        std::cout << "  warmup:            " << cpuResult.warmupIterations << " iterazioni\n";
+        std::cout << "  iterazioni:        " << cpuResult.measuredIterations << "\n";
+        std::cout << "  tempo medio:       " << cpuResult.meanMilliseconds << " ms\n";
+        std::cout << "  throughput:        " << cpuResult.throughputSamplesPerSecond << " esempi/s\n";
+        std::cout << "  memoria (stimata): " << (static_cast<double>(cpuResult.estimatedMemoryBytes) / 1024.0 / 1024.0)
+                   << " MiB (float32; e' una stima teorica, non memoria di processo misurata)\n";
+
+        if (spec.isCuda) {
+#if BLACKFORGE_HAS_CUDA
+            blackforge::backend::cuda::setActiveDevice(spec.cudaIndex);
+
+            std::string gpuName = "GPU sconosciuta";
+            for (const auto& d : blackforge::backend::cuda::enumerateDevices()) {
+                if (d.index == spec.cudaIndex) {
+                    gpuName = d.name;
+                }
+            }
+
+            blackforge::backend::cuda::Executor cudaExecutor;
+            blackforge::runtime::Tensor cudaInput =
+                cudaExecutor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
+
+            for (std::size_t i = 0; i < warmupIterations; ++i) {
+                blackforge::runtime::Tensor warm = cudaExecutor.run(model, cudaInput);
+                (void)warm;
+            }
+
+            blackforge::runtime::Tensor gpuOutput;
+            auto start = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < measuredIterations; ++i) {
+                gpuOutput = cudaExecutor.run(model, cudaInput);
+            }
+            auto end = std::chrono::steady_clock::now();
+
+            double totalMillis = std::chrono::duration<double, std::milli>(end - start).count();
+            double gpuMeanMillis = totalMillis / static_cast<double>(measuredIterations);
+            double gpuThroughput = gpuMeanMillis > 0.0 ? (static_cast<double>(batchSize) * 1000.0) / gpuMeanMillis
+                                                         : 0.0;
+
+            std::cout << "\n  hardware GPU:      " << gpuName << " (cuda:" << spec.cudaIndex << ")\n";
+            std::cout << "  tempo medio GPU:   " << gpuMeanMillis << " ms\n";
+            std::cout << "  throughput GPU:    " << gpuThroughput << " esempi/s\n";
+            std::cout << "  speedup vs CPU:    " << (cpuResult.meanMilliseconds / gpuMeanMillis) << "x\n";
+
+            // Confronto con la modalita' di riferimento (CPU): stesso
+            // seme, quindi stesso input e stessi pesi iniziali.
+            blackforge::backend::cpu::Executor cpuExecutor;
+            blackforge::runtime::Tensor cpuInput =
+                cpuExecutor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
+            blackforge::runtime::Tensor cpuOutput = cpuExecutor.run(model, cpuInput);
+
+            float maxAbsDiff = 0.0F;
+            for (std::size_t i = 0; i < cpuOutput.elementCount() && i < gpuOutput.elementCount(); ++i) {
+                maxAbsDiff = std::max(maxAbsDiff, std::fabs(cpuOutput.at(i) - gpuOutput.at(i)));
+            }
+            std::cout << "  scarto massimo vs CPU (riferimento): " << maxAbsDiff << "\n";
+#endif
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "errore di benchmark: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
+int runInspect(const std::string& path) {
+    CompileOutput result = compile(path, /*verbose=*/false, /*printAst=*/false, /*printIr=*/false);
+    if (result.status == CompileStatus::FileNotFound) {
+        return 2;
+    }
+    if (result.status == CompileStatus::AnalysisFailed) {
+        std::cerr << path << ": impossibile ispezionare, l'analisi ha trovato errori\n";
+        return 1;
+    }
+
+    std::cout << path << "\n";
+    if (result.module.target.has_value()) {
+        std::cout << "target: " << *result.module.target << "\n";
+    }
+    std::cout << result.module.models.size() << " modello/i\n";
+
+    for (const auto& model : result.module.models) {
+        std::cout << "\nmodello '" << model.name << "'\n";
+        std::cout << "  input: " << blackforge::ir::typeString(model.valueById(model.inputValue)) << "\n";
+
+        try {
+            blackforge::backend::cpu::Model built(model);
+            std::size_t totalParams = 0;
+            for (blackforge::backend::cpu::Parameter* param : built.allParameters()) {
+                totalParams += param->value.elementCount();
+            }
+            std::cout << "  parametri: " << totalParams << " ("
+                       << (static_cast<double>(totalParams * sizeof(float)) / 1024.0 / 1024.0)
+                       << " MiB come float32)\n";
+        } catch (const std::exception& e) {
+            std::cout << "  parametri: non calcolabili (" << e.what() << ")\n";
+        }
+
+        for (const auto& pipeline : model.pipelines) {
+            std::cout << "  pipeline:\n";
+            for (const auto& op : pipeline.operations) {
+                std::cout << "    " << blackforge::ir::opKindName(op.kind);
+                if (op.kind == blackforge::ir::OpKind::Linear) {
+                    std::cout << "(" << op.linearOutFeatures << ")";
+                }
+                std::cout << " -> " << blackforge::ir::typeString(model.valueById(op.output)) << "\n";
+            }
+        }
+    }
+
+    return 0;
+}
+
+int runBuild(const std::string& path) {
+    CompileOutput result = compile(path, /*verbose=*/false, /*printAst=*/false, /*printIr=*/false);
+    if (result.status == CompileStatus::FileNotFound) {
+        return 2;
+    }
+    if (result.status == CompileStatus::AnalysisFailed) {
+        std::cerr << path << ": build fallita, l'analisi ha trovato errori\n";
+        return 1;
+    }
+
+    // A differenza di 'check' (che valida solo AST/IR), 'build' prova
+    // davvero a costruire ogni modello (allocando i suoi parametri):
+    // rileva errori che richiedono la costruzione effettiva, come una
+    // dimensione delle feature ancora simbolica (impossibile allocare
+    // pesi concreti).
+    bool ok = true;
+    for (const auto& model : result.module.models) {
+        try {
+            blackforge::backend::cpu::Model built(model);
+            std::size_t totalParams = 0;
+            for (blackforge::backend::cpu::Parameter* param : built.allParameters()) {
+                totalParams += param->value.elementCount();
+            }
+            std::cout << "  modello '" << model.name << "': OK (" << totalParams << " parametri)\n";
+        } catch (const std::exception& e) {
+            std::cerr << "  modello '" << model.name << "': errore di costruzione: " << e.what() << "\n";
+            ok = false;
+        }
+    }
+
+    if (!ok) {
+        std::cerr << path << ": build fallita\n";
+        return 1;
+    }
+
+    std::cout << path << ": build riuscita (" << result.module.models.size()
+               << " modello/i pronti per l'esecuzione)\n";
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -299,6 +551,8 @@ int main(int argc, char** argv) {
     std::string device = "cpu";
     std::string fromCheckpoint;
     std::string saveCheckpointPath;
+    std::size_t warmupIterations = 5;
+    std::size_t measuredIterations = 20;
     std::vector<std::string> positional;
     std::string command = args.front();
 
@@ -337,6 +591,22 @@ int main(int argc, char** argv) {
                 return 2;
             }
             saveCheckpointPath = args[++i];
+        } else if (args[i] == "--warmup") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--warmup' richiede un valore\n";
+                return 2;
+            }
+            warmupIterations = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--iterations") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--iterations' richiede un valore\n";
+                return 2;
+            }
+            measuredIterations = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+            if (measuredIterations == 0) {
+                std::cerr << "errore: '--iterations' richiede un intero positivo\n";
+                return 2;
+            }
         } else {
             positional.push_back(args[i]);
         }
@@ -356,6 +626,13 @@ int main(int argc, char** argv) {
             return 2;
         }
         return runCheck(positional.front(), verbose, printAst, printIr);
+    }
+    if (command == "build") {
+        if (positional.empty()) {
+            std::cerr << "errore: comando 'build' richiede il percorso di un file .bf\n";
+            return 2;
+        }
+        return runBuild(positional.front());
     }
     if (command == "run") {
         if (positional.empty()) {
@@ -377,6 +654,20 @@ int main(int argc, char** argv) {
             return 2;
         }
         return runForecast(positional.front(), fromCheckpoint, batchSize);
+    }
+    if (command == "benchmark") {
+        if (positional.empty()) {
+            std::cerr << "errore: comando 'benchmark' richiede il percorso di un file .bf\n";
+            return 2;
+        }
+        return runBenchmark(positional.front(), device, batchSize, warmupIterations, measuredIterations);
+    }
+    if (command == "inspect") {
+        if (positional.empty()) {
+            std::cerr << "errore: comando 'inspect' richiede il percorso di un file .bf\n";
+            return 2;
+        }
+        return runInspect(positional.front());
     }
     if (command == "devices") {
         printDevices();

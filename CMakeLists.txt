@@ -126,6 +126,7 @@ set(
     src/backend/cpu/checkpoint.cpp
     src/backend/cpu/train_runner.cpp
     src/backend/cpu/forecast_runner.cpp
+    src/backend/cpu/benchmark.cpp
     src/data/dataset.cpp
 )
 

@@ -1,5 +1,7 @@
 #include "blackforge/backend/cuda/device_query.hpp"
 
+#include <stdexcept>
+
 #include <cuda_runtime.h>
 
 namespace blackforge::backend::cuda {
@@ -27,6 +29,14 @@ std::vector<CudaDeviceInfo> enumerateDevices() {
     }
 
     return devices;
+}
+
+void setActiveDevice(int index) {
+    cudaError_t result = cudaSetDevice(index);
+    if (result != cudaSuccess) {
+        throw std::runtime_error("dispositivo CUDA non valido 'cuda:" + std::to_string(index) +
+                                  "': " + cudaGetErrorString(result));
+    }
 }
 
 }  // namespace blackforge::backend::cuda

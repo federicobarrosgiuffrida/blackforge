@@ -469,3 +469,65 @@ Come per `train`, `--from-checkpoint` è obbligatorio.
 - Nessun learning rate scheduler, nessuna validazione/early stopping.
 - Il forecasting usa un input sintetico iniziale (nessun modo ancora di
   fornire una sequenza "seed" reale da cui partire).
+
+## CLI: comandi completi
+
+```
+blackforge check <file>      Analizza (lessico, sintassi, semantica); --verbose, --print-ast, --print-ir
+blackforge build <file>      Compila e costruisce ogni modello (alloca i parametri) senza eseguirlo
+blackforge run <file>        Esegue il primo modello; --batch N, --device cpu|cuda|cuda:N
+blackforge train <file>      Addestra (CPU); --from-checkpoint, --save-checkpoint
+blackforge forecast <file>   Rollout autoregressivo (CPU); --from-checkpoint (obbligatorio), --batch N
+blackforge benchmark <file>  Tempo/throughput/memoria; --device, --batch, --warmup, --iterations
+blackforge inspect <file>    Riepilogo: input, pipeline, numero di parametri per ogni modello
+blackforge devices           Elenca i dispositivi disponibili (CPU e GPU CUDA rilevate)
+```
+
+Tutti i comandi restituiscono un codice di uscita coerente: `0` se
+l'operazione riesce, `1` per un errore rilevato durante l'analisi o
+l'esecuzione, `2` per un uso scorretto della CLI (argomenti mancanti o
+invalidi, comando sconosciuto) — prima ancora di provare a leggere il
+file.
+
+### `blackforge build` vs `blackforge check`
+
+`check` valida solo l'AST e la IR (nessuna allocazione). `build` fa un
+passo in più: costruisce davvero un `backend::cpu::Model` per ogni
+modello del programma, cioè alloca i suoi parametri. Questo intercetta
+errori che `check` non può vedere — per esempio una dimensione delle
+feature ancora simbolica in ingresso a un `linear` (serve un numero
+concreto per allocare la matrice dei pesi) — e stampa il numero di
+parametri di ogni modello.
+
+### `blackforge inspect`
+
+Mostra, per ogni modello del programma: la forma/dtype dell'input, il
+numero totale di parametri allenabili (e la loro dimensione stimata in
+MiB come float32), e l'intera pipeline con la forma prodotta da ogni
+operazione. Utile come `model.summary()` di altri framework, per capire
+rapidamente la forma di un modello senza eseguirlo.
+
+### `blackforge benchmark`
+
+Misura la prima pipeline del primo modello: `--warmup N` iterazioni
+scartate (default 5, per escludere costi una tantum come le prime
+allocazioni) seguite da `--iterations N` iterazioni misurate (default
+20) con `std::chrono::steady_clock`. Riporta hardware (per la CPU: solo
+"backend di riferimento", nessun rilevamento del modello di processore;
+per la GPU: nome e indice via il driver CUDA), la precisione dichiarata
+nel modello (il calcolo avviene comunque sempre in float32), la forma
+dell'input, tempo medio, throughput (campioni/secondo) e una stima
+della memoria (elementi di input + attivazioni intermedie + parametri,
+× 4 byte — una stima teorica, non memoria di processo misurata).
+
+Con `--device cuda`, dopo la misura CPU esegue la stessa misura sulla
+GPU e stampa anche lo speedup (`tempoCPU / tempoGPU`) e lo scarto
+assoluto massimo tra l'output GPU e l'output calcolato dalla CPU con lo
+stesso seme (la "modalità di riferimento" richiesta per un benchmark
+credibile): un valore vicino a zero (tipicamente `1e-5`–`1e-6` per la
+somma di molti prodotti in float32) conferma che GPU e CPU calcolano lo
+stesso risultato, non solo che sono ugualmente veloci.
+
+**Limitazione**: nessun profiling per singola operazione (solo il
+tempo totale di una `forward()` completa); nessuna deduplicazione o
+analisi statistica oltre alla media.

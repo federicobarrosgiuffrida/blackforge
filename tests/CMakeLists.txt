@@ -29,6 +29,7 @@ set(
     backend/cpu/checkpoint_tests.cpp
     backend/cpu/train_runner_tests.cpp
     backend/cpu/forecast_runner_tests.cpp
+    backend/cpu/benchmark_tests.cpp
     data/dataset_tests.cpp
 )
 
