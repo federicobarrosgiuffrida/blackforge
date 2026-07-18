@@ -106,6 +106,8 @@ set(
     src/frontend/lexer.cpp
     src/frontend/parser.cpp
     src/ast/ast.cpp
+    src/sema/dtype.cpp
+    src/sema/semantic_analyzer.cpp
 )
 
 # I sorgenti del backend CUDA (kernels/, src/backend/cuda/) verranno

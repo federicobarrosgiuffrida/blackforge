@@ -37,8 +37,8 @@ del codice in questo repository, non obiettivi futuri.
 | Lexer (tokenizzazione, diagnostica riga/colonna, recupero da errori) | ✅ Completato |
 | CLI `blackforge check <file>` | ✅ Completato (analisi lessicale e sintattica) |
 | Parser / AST (`target`, `precision`, `model`, pipeline `\|>`) | ✅ Completato per il sottoinsieme documentato in [docs/language.md](docs/language.md) |
-| Analisi semantica e controllo tipi numerici | ⏳ Pianificato |
-| Controllo forme tensoriali | ⏳ Pianificato |
+| Analisi semantica e controllo tipi numerici (dtype, target, operazioni note) | ✅ Completato per il sottoinsieme attuale |
+| Controllo forme tensoriali | 🟡 Parziale (dimensioni valide/positive; l'inferenza della forma lungo la pipeline richiede l'IR) |
 | Rappresentazione interna (IR) | ⏳ Pianificato |
 | Backend CPU di riferimento | ⏳ Pianificato |
 | Autodiff / backward | ⏳ Pianificato |
@@ -46,7 +46,7 @@ del codice in questo repository, non obiettivi futuri.
 | Checkpoint (salvataggio/caricamento pesi) | ⏳ Pianificato |
 | Backend CUDA | ⏳ Pianificato |
 | Supporto Blackwell / Tensor Core | ⏳ Pianificato |
-| Precisioni FP8 (e4m3/e5m2), FP16, BF16, TF32, FP32 | ⏳ Pianificato (riconosciute solo come identificatori dal lexer) |
+| Precisioni FP8 (e4m3/e5m2), FP16, BF16, TF32, FP32 | ✅ Riconosciute e validate nell'analisi semantica (nessuna esecuzione ancora) |
 | Pretraining / fine-tuning / LoRA | ⏳ Pianificato |
 | Forecasting | ⏳ Pianificato |
 | Benchmark / profiling | ⏳ Pianificato |
@@ -112,9 +112,9 @@ saranno pronte.
 ## Esempi
 
 - [`examples/hello.bf`](examples/hello.bf) — sintassi indicativa di un
-  modello minimale. Il compilatore oggi lo tokenizza e lo analizza
-  sintatticamente (nessuna validazione semantica ancora: tipi, forme e
-  target non sono controllati).
+  modello minimale. Il compilatore oggi lo tokenizza, lo analizza
+  sintatticamente e ne valida la semantica (target, precisioni, forme,
+  operazioni di pipeline). Non genera ancora codice ne' lo esegue.
 
 ## Struttura del repository
 
@@ -135,7 +135,7 @@ PolyForm Noncommercial License 1.0.0 — vedi [LICENSE.md](LICENSE.md).
 
 1. ✅ Lexer e CLI `check` di base
 2. ✅ Parser e AST
-3. Analisi semantica: tipi numerici, precisioni, forme tensoriali
+3. ✅ Analisi semantica: tipi numerici, precisioni, forme tensoriali (base)
 4. Rappresentazione interna (IR) e pass manager
 5. Backend CPU di riferimento (tensori, operazioni, layer)
 6. Autodiff, loss, optimizer, checkpoint

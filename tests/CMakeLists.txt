@@ -16,6 +16,8 @@ set(
     BLACKFORGE_TEST_SOURCES
     frontend/lexer_tests.cpp
     frontend/parser_tests.cpp
+    sema/dtype_tests.cpp
+    sema/semantic_analyzer_tests.cpp
 )
 
 add_executable(

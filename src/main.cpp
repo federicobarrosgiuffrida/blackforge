@@ -9,13 +9,14 @@
 #include "blackforge/frontend/lexer.hpp"
 #include "blackforge/frontend/parser.hpp"
 #include "blackforge/frontend/token.hpp"
+#include "blackforge/sema/semantic_analyzer.hpp"
 
 namespace {
 
 void printUsage() {
     std::cout << "Uso: blackforge <comando> [opzioni] <file.bf>\n\n"
               << "Comandi:\n"
-              << "  check <file>       Analizza il file e riporta gli errori (lessicali e sintattici)\n"
+              << "  check <file>       Analizza il file e riporta gli errori (lessicali, sintattici, semantici)\n"
               << "  --help, -h         Mostra questo messaggio\n"
               << "  --version, -v      Mostra la versione del compilatore\n\n"
               << "Opzioni:\n"
@@ -66,6 +67,9 @@ int runCheck(const std::string& path, bool verbose, bool printAst) {
         std::cout << blackforge::ast::dump(program);
     }
 
+    blackforge::sema::SemanticAnalyzer analyzer;
+    analyzer.analyze(program);
+
     bool hasErrors = false;
     for (const auto& diagnostic : lexer.diagnostics().all()) {
         std::cerr << blackforge::formatDiagnostic(diagnostic) << "\n";
@@ -76,6 +80,11 @@ int runCheck(const std::string& path, bool verbose, bool printAst) {
         std::cerr << blackforge::formatDiagnostic(diagnostic) << "\n";
     }
     hasErrors = hasErrors || parser.diagnostics().hasErrors();
+
+    for (const auto& diagnostic : analyzer.diagnostics().all()) {
+        std::cerr << blackforge::formatDiagnostic(diagnostic) << "\n";
+    }
+    hasErrors = hasErrors || analyzer.diagnostics().hasErrors();
 
     if (hasErrors) {
         std::cerr << path << ": analisi fallita\n";

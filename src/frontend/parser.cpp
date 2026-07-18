@@ -1,5 +1,7 @@
 #include "blackforge/frontend/parser.hpp"
 
+#include <stdexcept>
+
 namespace blackforge {
 
 Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
@@ -157,7 +159,11 @@ ast::ShapeDim Parser::parseShapeDim() {
 
     if (check(TokenKind::IntegerLiteral)) {
         const Token& token = advance();
-        return ast::ShapeDim{false, "", std::stoll(token.lexeme), start};
+        try {
+            return ast::ShapeDim{false, "", std::stoll(token.lexeme), start};
+        } catch (const std::out_of_range&) {
+            throw error(start, "valore intero troppo grande per una dimensione: '" + token.lexeme + "'");
+        }
     }
     if (check(TokenKind::Identifier)) {
         const Token& token = advance();

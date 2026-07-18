@@ -1,10 +1,11 @@
 # Sintassi di BlackForge — stato attuale
 
 Questo documento descrive solo ciò che il compilatore riconosce **oggi**
-(lexer + parser). Verrà esteso con l'analisi semantica e l'esecuzione
-man mano che le milestone successive vengono completate. Non c'è ancora
-alcun controllo di tipi, forme o validità dei target/precisioni: il
-parser costruisce l'AST, non lo valida.
+(lexer + parser + analisi semantica di base). Verrà esteso con la
+rappresentazione interna (IR) e l'esecuzione man mano che le milestone
+successive vengono completate. Non c'è ancora generazione di codice o
+esecuzione: il compilatore sa solo dire se un programma è lessicalmente,
+sintatticamente e semanticamente valido.
 
 ## Commenti
 
@@ -30,7 +31,7 @@ forecast benchmark
 Nomi di formati numerici (`bf16`, `fp8`, `fp16`, `fp32`, `tf32`, `e4m3`,
 `e5m2`) e di operazioni (`linear`, `silu`, ...) **non** sono parole
 chiave: sono identificatori ordinari, risolti in fase di analisi
-semantica (non ancora implementata).
+semantica.
 
 ## Letterali
 
@@ -112,3 +113,35 @@ valida, il parser la salta fino alla prossima parola chiave
 valida, salta fino alla prossima istruzione valida o a `}`. Questo
 permette a `blackforge check` di riportare più errori sintattici in una
 sola esecuzione, invece di fermarsi al primo.
+
+## Analisi semantica (stato attuale)
+
+Dopo il parsing, `blackforge check` valida:
+
+- **Target**: deve essere uno tra `nvidia.blackwell`, `nvidia.hopper`,
+  `nvidia.ampere`, `nvidia.ada`, `cpu`. Al massimo una dichiarazione
+  `target` per programma.
+- **Formati numerici**: ogni valore in `precision { ... }` e ogni dtype
+  di un tensore deve essere uno tra `fp8.e4m3`, `fp8.e5m2`, `fp16`,
+  `bf16`, `tf32`, `fp32`. `tf32` è rifiutato nei campi `storage` e
+  `parameters` (è solo una modalità di calcolo, non un formato di
+  memorizzazione). Nessun campo duplicato nello stesso blocco
+  `precision`.
+- **Forme tensoriali**: almeno una dimensione; le dimensioni letterali
+  devono essere intere positive. Le dimensioni simboliche (es. `batch`)
+  sono accettate senza ulteriori vincoli per ora — la loro risoluzione
+  a runtime arriverà con l'esecuzione. *(L'inferenza della forma
+  attraverso una pipeline, es. calcolare che `linear(4096)` produce
+  effettivamente `[batch, 4096]`, richiede l'IR e non è ancora
+  implementata: qui si controllano solo le forme dichiarate
+  esplicitamente.)*
+- **Modelli**: nome univoco nel programma; esattamente un `input`
+  dichiarato.
+- **Pipeline**: la sorgente deve essere `input` (con un `input`
+  effettivamente dichiarato nel modello). Il linguaggio non supporta
+  ancora binding con nome per risultati intermedi, quindi qualunque
+  altro identificatore come sorgente è un errore di "non definito".
+- **Operazioni**: le fasi di pipeline devono essere tra le operazioni
+  note — `linear(n)` (un intero positivo), `silu`, `relu`, `gelu`
+  (zero argomenti). Questo elenco crescerà quando il backend implementerà
+  davvero le operazioni.
