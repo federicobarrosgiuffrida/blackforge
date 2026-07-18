@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "blackforge/backend/cuda/cuda_check.hpp"
+#include "blackforge/backend/cuda/ops.hpp"
 
 namespace blackforge::backend::cuda {
 
@@ -145,6 +146,46 @@ __global__ void rmsnormBackwardKernel(float* out, const float* input, const floa
     }
 }
 
+// Un blocco per riga: dx_j = y_j * (gOut_j - S), S = sum_i(gOut_i*y_i).
+// 'y' e' l'uscita di softmax(input), gia' calcolata da un kernel
+// separato (softmaxKernel in ops_elementwise.cu) prima di questo.
+__global__ void softmaxBackwardKernel(float* out, const float* y, const float* gradOutput, std::size_t batch,
+                                       std::size_t features) {
+    extern __shared__ float shared[];
+
+    std::size_t row = blockIdx.x;
+    if (row >= batch) {
+        return;
+    }
+    const float* rowY = y + row * features;
+    const float* rowGrad = gradOutput + row * features;
+    float* rowOut = out + row * features;
+
+    float localWeightedSum = 0.0F;
+    for (std::size_t col = threadIdx.x; col < features; col += blockDim.x) {
+        localWeightedSum += rowGrad[col] * rowY[col];
+    }
+    shared[threadIdx.x] = localWeightedSum;
+    __syncthreads();
+
+    for (std::size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    __shared__ float weightedSum;
+    if (threadIdx.x == 0) {
+        weightedSum = shared[0];
+    }
+    __syncthreads();
+
+    for (std::size_t col = threadIdx.x; col < features; col += blockDim.x) {
+        rowOut[col] = rowY[col] * (rowGrad[col] - weightedSum);
+    }
+}
+
 }  // namespace
 
 MatmulGrad matmulBackward(const DeviceTensor& a, const DeviceTensor& b, const DeviceTensor& gradOutput) {
@@ -257,6 +298,27 @@ DeviceTensor rmsnormBackward(const DeviceTensor& input, const DeviceTensor& grad
         std::size_t sharedBytes = 2 * kBlockSize * sizeof(float);
         rmsnormBackwardKernel<<<static_cast<int>(batch), kBlockSize, sharedBytes>>>(
             result.data(), input.data(), gradOutput.data(), batch, features);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+DeviceTensor softmaxBackward(const DeviceTensor& input, const DeviceTensor& gradOutput) {
+    if (input.shape() != gradOutput.shape()) {
+        throw std::invalid_argument("softmaxBackward: forme incompatibili sul device");
+    }
+    if (input.rank() != 2) {
+        throw std::invalid_argument("softmaxBackward: richiede un tensore a rango 2 [batch, classi] sul device");
+    }
+
+    DeviceTensor y = softmax(input);
+    DeviceTensor result(input.shape());
+    std::size_t batch = input.dim(0);
+    std::size_t features = input.dim(1);
+    if (batch > 0 && features > 0) {
+        std::size_t sharedBytes = kBlockSize * sizeof(float);
+        softmaxBackwardKernel<<<static_cast<int>(batch), kBlockSize, sharedBytes>>>(
+            result.data(), y.data(), gradOutput.data(), batch, features);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }
     return result;

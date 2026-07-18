@@ -153,6 +153,49 @@ TEST(ModelTest, BackwardConRmsnormCorrispondeAllaDerivataNumericaDelLoss) {
     }
 }
 
+TEST(ModelTest, BackwardConSoftmaxCorrispondeAllaDerivataNumericaDelLoss) {
+    // softmax non ha parametri propri: come per rmsnorm, questo test
+    // verifica indirettamente che softmaxBackward propaghi
+    // correttamente il gradiente al layer linear precedente.
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 3]\n"
+        "    input |> linear(4) |> softmax\n"
+        "}\n");
+
+    backend::cpu::Model model(module.models.front());
+    runtime::Tensor input({2, 3}, {0.2F, -0.1F, 0.4F, -0.3F, 0.5F, 0.1F});
+    runtime::Tensor target({2, 4}, {0.25F, 0.25F, 0.25F, 0.25F, 1.0F, 0.0F, 0.0F, 0.0F});
+
+    model.zeroGrad();
+    runtime::Tensor output = model.forward(input);
+    backend::cpu::LossResult loss = backend::cpu::meanSquaredError(output, target);
+    model.backward(loss.grad);
+
+    auto lossOf = [&]() {
+        runtime::Tensor out = model.forward(input);
+        return backend::cpu::meanSquaredError(out, target).value;
+    };
+
+    auto params = model.parameters();
+    ASSERT_FALSE(params.empty());
+
+    backend::cpu::Parameter* param = params.front();
+    float eps = 1e-3F;
+    for (std::size_t i = 0; i < std::min<std::size_t>(5, param->value.elementCount()); ++i) {
+        float original = param->value.at(i);
+
+        param->value.at(i) = original + eps;
+        float plus = lossOf();
+        param->value.at(i) = original - eps;
+        float minus = lossOf();
+        param->value.at(i) = original;
+
+        float numeric = (plus - minus) / (2.0F * eps);
+        EXPECT_NEAR(param->grad.at(i), numeric, 1e-2F) << "parametro " << param->name << " indice " << i;
+    }
+}
+
 namespace {
 
 // Piccolo problema di regressione risolvibile esattamente da un solo

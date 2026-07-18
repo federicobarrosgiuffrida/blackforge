@@ -53,12 +53,11 @@ void printUsage() {
               << "  --batch N          Dimensione di batch usata per risolvere le dimensioni simboliche "
                  "dell'input (default 1)\n"
               << "  --device cpu|cuda|cuda:N  Dispositivo su cui eseguire ('run'/'train'/'benchmark', default "
-                 "cpu). Su 'train', il backend CUDA supporta solo loss 'mse', nessun 'lora' e nessun "
-                 "--from-checkpoint/--save-checkpoint per ora (errore esplicito se richiesti)\n"
-              << "  --from-checkpoint <file>  Pesi di partenza: fine-tuning/LoRA per 'train' (solo CPU), "
-                 "obbligatorio per 'forecast'\n"
-              << "  --save-checkpoint <file>  Dove salvare i pesi al termine dell'addestramento (solo 'train', "
-                 "solo CPU)\n"
+                 "cpu). Su 'train', il backend CUDA supporta solo loss 'mse' e nessun 'lora' per ora (errore "
+                 "esplicito se richiesti); checkpoint supportati su entrambi i device, stesso formato\n"
+              << "  --from-checkpoint <file>  Pesi di partenza: fine-tuning/LoRA per 'train' (LoRA solo CPU), "
+                 "obbligatorio per 'forecast' (solo CPU)\n"
+              << "  --save-checkpoint <file>  Dove salvare i pesi al termine dell'addestramento (solo 'train')\n"
               << "  --warmup N         Iterazioni di riscaldamento scartate (solo 'benchmark', default 5)\n"
               << "  --iterations N     Iterazioni misurate (solo 'benchmark', default 20)\n";
 }

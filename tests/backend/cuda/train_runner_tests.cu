@@ -5,12 +5,19 @@
 
 #include <gtest/gtest.h>
 
+#include "blackforge/backend/cpu/checkpoint.hpp"
+#include "blackforge/backend/cpu/model.hpp"
+#include "blackforge/backend/cuda/checkpoint.hpp"
+#include "blackforge/backend/cuda/device_tensor.hpp"
+#include "blackforge/backend/cuda/model.hpp"
 #include "blackforge/data/dataset.hpp"
 #include "blackforge/frontend/lexer.hpp"
 #include "blackforge/frontend/parser.hpp"
 #include "blackforge/ir/ir_builder.hpp"
 
 using namespace blackforge;
+using blackforge::runtime::Tensor;
+namespace cuda = blackforge::backend::cuda;
 
 namespace {
 
@@ -143,20 +150,56 @@ TEST(CudaTrainRunnerTest, LanciaSeLaLossNonEMse) {
     EXPECT_THROW((void)backend::cuda::runTraining(compiled.program, compiled.module, "", ""), std::runtime_error);
 }
 
-TEST(CudaTrainRunnerTest, LanciaSeFromCheckpointENonVuoto) {
+TEST(CudaTrainRunnerTest, SalvaERicaricaUnCheckpointPerIlFineTuning) {
     TempFile datasetFile("blackforge_cuda_test_train_dataset_ckpt.bfdata");
     writeToyDataset(datasetFile.path);
+    TempFile checkpointFile("blackforge_cuda_test_train_checkpoint.bfckpt");
 
-    Compiled compiled = compile(toyProgram(datasetFile.path, 1, "sgd"));
-    EXPECT_THROW((void)backend::cuda::runTraining(compiled.program, compiled.module, "qualsiasi.bfckpt", ""),
-                 std::runtime_error);
+    Compiled compiled = compile(toyProgram(datasetFile.path, /*epochs=*/30, "adamw"));
+
+    backend::cuda::TrainRunResult first =
+        backend::cuda::runTraining(compiled.program, compiled.module, "", checkpointFile.path);
+    ASSERT_TRUE(std::filesystem::exists(checkpointFile.path));
+
+    // Seconda sessione ("fine-tuning"): riparte dal checkpoint salvato,
+    // la loss della prima epoca deve partire gia' bassa (vicina a dove
+    // si era fermato il primo addestramento), non da zero come un
+    // modello con pesi casuali.
+    backend::cuda::TrainRunResult second =
+        backend::cuda::runTraining(compiled.program, compiled.module, checkpointFile.path, "");
+
+    ASSERT_FALSE(second.epochLosses.empty());
+    EXPECT_LT(second.epochLosses.front(), first.epochLosses.front());
 }
 
-TEST(CudaTrainRunnerTest, LanciaSeSaveCheckpointENonVuoto) {
-    TempFile datasetFile("blackforge_cuda_test_train_dataset_ckpt2.bfdata");
+TEST(CudaTrainRunnerTest, UnCheckpointSalvatoDaCudaECaricabileDaCpuEViceversa) {
+    // Il formato binario e' identico tra i due backend (vedi
+    // backend::cuda::checkpoint.hpp): questo test verifica che
+    // l'interoperabilita' dichiarata sia vera, non solo teorica.
+    TempFile datasetFile("blackforge_cuda_test_train_dataset_interop.bfdata");
     writeToyDataset(datasetFile.path);
+    TempFile checkpointFile("blackforge_cuda_test_train_checkpoint_interop.bfckpt");
 
-    Compiled compiled = compile(toyProgram(datasetFile.path, 1, "sgd"));
-    EXPECT_THROW((void)backend::cuda::runTraining(compiled.program, compiled.module, "", "qualsiasi.bfckpt"),
-                 std::runtime_error);
+    Compiled compiled = compile(toyProgram(datasetFile.path, /*epochs=*/20, "adamw"));
+    backend::cuda::runTraining(compiled.program, compiled.module, "", checkpointFile.path);
+
+    backend::cpu::Model cpuModel(compiled.module.models.front());
+    backend::cpu::loadCheckpoint(cpuModel, checkpointFile.path);
+
+    backend::cuda::Model cudaModel(compiled.module.models.front());
+    backend::cuda::loadCheckpoint(cudaModel, checkpointFile.path);
+
+    Tensor input({4, 4}, {
+                             1.0F, 0.0F, 0.0F, 0.0F,
+                             0.0F, 1.0F, 0.0F, 0.0F,
+                             0.0F, 0.0F, 1.0F, 0.0F,
+                             0.0F, 0.0F, 0.0F, 1.0F,
+                         });
+    Tensor cpuOutput = cpuModel.forward(input);
+    Tensor cudaOutput = cudaModel.forward(cuda::DeviceTensor::fromHost(input)).toHost();
+
+    ASSERT_EQ(cpuOutput.elementCount(), cudaOutput.elementCount());
+    for (std::size_t i = 0; i < cpuOutput.elementCount(); ++i) {
+        EXPECT_NEAR(cpuOutput.at(i), cudaOutput.at(i), 1e-4F) << "indice " << i;
+    }
 }

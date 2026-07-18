@@ -13,6 +13,7 @@ const std::unordered_map<std::string, OpKind>& opKindTable() {
         {"relu", OpKind::Relu},
         {"gelu", OpKind::Gelu},
         {"rmsnorm", OpKind::RmsNorm},
+        {"softmax", OpKind::Softmax},
     };
     return table;
 }
@@ -34,6 +35,7 @@ std::string opKindName(OpKind kind) {
         case OpKind::Relu: return "relu";
         case OpKind::Gelu: return "gelu";
         case OpKind::RmsNorm: return "rmsnorm";
+        case OpKind::Softmax: return "softmax";
     }
     return "?";
 }

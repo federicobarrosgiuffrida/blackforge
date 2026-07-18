@@ -117,6 +117,25 @@ TEST(IRBuilderTest, RmsnormNonAlteraFormaNeFormato) {
     EXPECT_EQ(afterRmsnorm.dtype, sema::DType::BF16);
 }
 
+TEST(IRBuilderTest, SoftmaxNonAlteraFormaNeFormato) {
+    BuildResult result = buildIR(
+        "model TinyModel {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(3) |> softmax\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    const ir::ModelIR& model = result.module.models[0];
+    const ir::Pipeline& pipeline = model.pipelines[0];
+    ASSERT_EQ(pipeline.operations.size(), 2u);
+
+    const ir::Value& afterSoftmax = model.valueById(pipeline.operations[1].output);
+    EXPECT_EQ(pipeline.operations[1].kind, ir::OpKind::Softmax);
+    ASSERT_EQ(afterSoftmax.shape.size(), 2u);
+    EXPECT_EQ(afterSoftmax.shape[1].literalValue, 3);
+    EXPECT_EQ(afterSoftmax.dtype, sema::DType::BF16);
+}
+
 TEST(IRBuilderTest, PipelineSenzaOperazioniHaOutputUgualeAllInput) {
     BuildResult result = buildIR(
         "model M {\n"

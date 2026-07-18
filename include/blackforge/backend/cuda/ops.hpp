@@ -25,6 +25,12 @@ DeviceTensor gelu(const DeviceTensor& input);
 // permettere il confronto diretto CPU/GPU nei test.
 DeviceTensor rmsnorm(const DeviceTensor& input);
 
+// Softmax riga per riga su un tensore [batch, classi] (vedi
+// backend::cpu::softmax per i dettagli, stessa semantica). eps non
+// applicabile qui: la stabilita' numerica viene dalla sottrazione del
+// massimo per riga, non da un epsilon additivo.
+DeviceTensor softmax(const DeviceTensor& input);
+
 // Layer lineare: input [batch, inFeatures], weight [inFeatures, outFeatures],
 // bias [outFeatures] -> output [batch, outFeatures].
 DeviceTensor linear(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias);

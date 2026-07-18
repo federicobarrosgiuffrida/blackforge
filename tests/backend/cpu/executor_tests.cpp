@@ -111,6 +111,28 @@ TEST(CpuExecutorTest, EseguePipelineConRmsnorm) {
     EXPECT_EQ(output.shape(), (std::vector<std::size_t>{3, 4}));
 }
 
+TEST(CpuExecutorTest, EseguePipelineConSoftmaxEProduceProbabilita) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> linear(4) |> softmax\n"
+        "}\n");
+
+    const ir::ModelIR& model = module.models.front();
+    backend::cpu::Executor executor;
+    runtime::Tensor input = executor.makeSyntheticInput(model.valueById(model.inputValue), 3);
+
+    runtime::Tensor output = executor.run(model, input);
+    ASSERT_EQ(output.shape(), (std::vector<std::size_t>{3, 4}));
+    for (std::size_t row = 0; row < 3; ++row) {
+        float sum = 0.0F;
+        for (std::size_t col = 0; col < 4; ++col) {
+            sum += output.at(row * 4 + col);
+        }
+        EXPECT_NEAR(sum, 1.0F, 1e-4F) << "riga " << row;
+    }
+}
+
 TEST(CpuExecutorTest, LanciaSeIlModelloNonHaPipeline) {
     ir::Module module = buildModule(
         "model M {\n"

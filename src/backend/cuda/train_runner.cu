@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <variant>
 
+#include "blackforge/backend/cuda/checkpoint.hpp"
 #include "blackforge/backend/cuda/device_tensor.hpp"
 #include "blackforge/backend/cuda/loss.hpp"
 #include "blackforge/backend/cuda/model.hpp"
@@ -50,12 +51,6 @@ const ast::DatasetDecl* findDatasetDecl(const ast::Program& program, const std::
 TrainRunResult runTraining(const ast::Program& program, const ir::Module& module,
                             const std::string& fromCheckpointPath, const std::string& saveCheckpointPath,
                             std::ostream* progressOutput) {
-    if (!fromCheckpointPath.empty() || !saveCheckpointPath.empty()) {
-        throw std::runtime_error("'blackforge train --device cuda' non supporta ancora --from-checkpoint/"
-                                  "--save-checkpoint: il formato di checkpoint non e' ancora collegato a "
-                                  "cuda::Model. Usa '--device cpu' se serve salvare/caricare pesi.");
-    }
-
     const ast::TrainDecl* trainDecl = nullptr;
     for (const auto& decl : program.declarations) {
         if (std::holds_alternative<ast::TrainDecl>(decl)) {
@@ -110,6 +105,13 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
 
     Model model(*modelIR);
 
+    if (!fromCheckpointPath.empty()) {
+        loadCheckpoint(model, fromCheckpointPath);
+        if (progressOutput != nullptr) {
+            *progressOutput << "Pesi caricati da '" << fromCheckpointPath << "' (fine-tuning)\n";
+        }
+    }
+
     double learningRate = (learningRateField != nullptr) ? learningRateField->value : 1e-3;
     std::unique_ptr<Optimizer> optimizer;
     if (optimizerField->name == "sgd") {
@@ -159,6 +161,13 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
 
         if (progressOutput != nullptr) {
             *progressOutput << "  epoca " << epoch << "/" << epochs << "  loss=" << avgLoss << "\n";
+        }
+    }
+
+    if (!saveCheckpointPath.empty()) {
+        saveCheckpoint(model, saveCheckpointPath);
+        if (progressOutput != nullptr) {
+            *progressOutput << "Pesi salvati in '" << saveCheckpointPath << "'\n";
         }
     }
 

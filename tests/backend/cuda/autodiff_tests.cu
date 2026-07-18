@@ -145,6 +145,37 @@ TEST(CudaAutodiffTest, GeluBackwardCorrispondeAllaVersioneCpu) {
     }
 }
 
+TEST(CudaAutodiffTest, SoftmaxBackwardCorrispondeAllaVersioneCpu) {
+    Tensor input({2, 3}, {0.5F, -1.2F, 0.3F, 2.0F, 0.1F, -0.5F});
+    Tensor gradOutput({2, 3}, {1.0F, -0.5F, 2.0F, 0.3F, -1.0F, 0.7F});
+
+    Tensor cpuGrad = cpu::softmaxBackward(input, gradOutput);
+    Tensor gpuGrad =
+        cuda::softmaxBackward(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(gradOutput))
+            .toHost();
+
+    for (std::size_t i = 0; i < cpuGrad.elementCount(); ++i) {
+        EXPECT_NEAR(gpuGrad.at(i), cpuGrad.at(i), 1e-4F) << "indice " << i;
+    }
+}
+
+TEST(CudaAutodiffTest, SoftmaxBackwardCorrispondeAllaDerivataNumerica) {
+    Tensor input({2, 3}, {0.5F, -1.2F, 0.3F, 2.0F, 0.1F, -0.5F});
+    Tensor gradOutput({2, 3}, {1.0F, -0.5F, 2.0F, 0.3F, -1.0F, 0.7F});
+
+    Tensor gpuGrad =
+        cuda::softmaxBackward(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(gradOutput))
+            .toHost();
+
+    auto f = [&](const Tensor& x) {
+        Tensor out = cuda::softmax(cuda::DeviceTensor::fromHost(x)).toHost();
+        return dot(out, gradOutput);
+    };
+    for (std::size_t i = 0; i < input.elementCount(); ++i) {
+        EXPECT_NEAR(gpuGrad.at(i), numericalDerivative(f, input, i), 1e-2F) << "indice " << i;
+    }
+}
+
 TEST(CudaAutodiffTest, RmsnormBackwardCorrispondeAllaVersioneCpu) {
     Tensor input({2, 3}, {0.5F, -1.2F, 0.3F, 2.0F, 0.1F, -0.5F});
     Tensor gradOutput({2, 3}, {1.0F, -0.5F, 2.0F, 0.3F, -1.0F, 0.7F});

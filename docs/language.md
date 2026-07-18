@@ -164,8 +164,8 @@ Dopo il parsing, `blackforge check` valida:
   altro identificatore come sorgente è un errore di "non definito".
 - **Operazioni**: le fasi di pipeline devono essere tra le operazioni
   note — `linear(n)` (un intero positivo), `silu`, `relu`, `gelu`,
-  `rmsnorm` (zero argomenti). Questo elenco crescerà quando il backend
-  implementerà davvero le operazioni.
+  `rmsnorm`, `softmax` (zero argomenti). Questo elenco crescerà quando
+  il backend implementerà davvero le operazioni.
 - **Dataset**: nome univoco nel programma; esattamente un campo `path`,
   un `input` e un `labels`, entrambi tensori validi (stesse regole di
   forma/dtype di un `model`).
@@ -196,11 +196,11 @@ piccolo grafo di `Value` (formato numerico + forma) collegati da
 A differenza dell'analisi semantica di base, qui la forma **viene
 davvero propagata**: `linear(n)` sostituisce l'ultima dimensione del
 tensore in ingresso con `n` (le altre, incluse quelle simboliche come
-`batch`, sono preservate), mentre `silu`/`relu`/`gelu`/`rmsnorm` non
-modificano forma né formato numerico (elementwise, o comunque riga per
-riga nel caso di `rmsnorm`). Questo permette di rilevare errori come
-"linear applicato a un tensore senza dimensioni" che l'analisi
-semantica locale non può vedere.
+`batch`, sono preservate), mentre `silu`/`relu`/`gelu`/`rmsnorm`/
+`softmax` non modificano forma né formato numerico (elementwise, o
+comunque riga per riga nel caso di `rmsnorm`/`softmax`). Questo
+permette di rilevare errori come "linear applicato a un tensore senza
+dimensioni" che l'analisi semantica locale non può vedere.
 
 Non esiste ancora un pass manager con ottimizzazioni (fusione,
 eliminazione di operazioni morte): con l'attuale insieme minimo di
@@ -227,6 +227,15 @@ una a una sul backend CPU (`blackforge::backend::cpu`):
   deliberata per non dover estendere ancora il formato dei checkpoint e
   l'interazione con LoRA per un singolo layer. Backward verificato con
   gradient checking numerico (vedi `tests/backend/cpu/autodiff_tests.cpp`).
+- `softmax`: softmax riga per riga su un tensore `[batch, classi]`,
+  `y_j = exp(x_j - max) / sum_k exp(x_k - max)` (sottrazione del
+  massimo per stabilità numerica). Operazione di pipeline a sé stante
+  (utile per ottenere probabilità esplicite in uscita da un modello,
+  es. per l'inferenza), distinta dalla softmax applicata internamente
+  da `loss cross_entropy` (che usa una formula combinata
+  softmax+cross-entropy più efficiente per l'addestramento — le due
+  implementazioni non sono collegate). Backward verificato con
+  gradient checking numerico.
 
 Se il programma dichiara un blocco `precision { storage ... compute ...
 accumulate ... }` (vedi `include/blackforge/backend/cpu/quantize.hpp`),
@@ -312,10 +321,12 @@ RTX 5060, Blackwell/sm_120):
   prodotto matriciale, usare una libreria NVIDIA ufficiale è più
   affidabile e performante di reinventarla, come indicato negli
   obiettivi del progetto. `linear = addBias(matmul(...))`, come su CPU.
-  `rmsnorm` è un kernel scritto a mano con un blocco per riga del batch
-  e una riduzione in shared memory per la somma dei quadrati (verificato
-  anche con `features` maggiore del numero di thread per blocco, per
-  esercitare davvero il ciclo grid-stride dentro il kernel).
+  `rmsnorm`/`softmax` sono kernel scritti a mano con un blocco per riga
+  del batch e una riduzione in shared memory (somma dei quadrati per
+  `rmsnorm`; massimo poi somma degli esponenziali per `softmax`,
+  numericamente stabile), verificati anche con `features` maggiore del
+  numero di thread per blocco, per esercitare davvero il ciclo
+  grid-stride dentro il kernel.
 - **`Executor`** (in `blackforge::backend::cuda`, da non confondere con
   `blackforge::backend::cpu::Executor`): stessa interfaccia della
   controparte CPU, stessa inizializzazione dei pesi a parità di seme —
@@ -355,9 +366,6 @@ dei valori visibilmente sbagliati).
   Core. Il linguaggio riconosce e valida questi formati, ma
   l'esecuzione GPU non li sfrutta ancora — è il prossimo passo naturale
   per un backend Blackwell.
-- Un nuovo handle cuBLAS viene creato e distrutto ad ogni chiamata a
-  `matmul`: corretto ma non ottimale; il riuso di un handle persistente
-  è un'ottimizzazione futura a basso rischio.
 - Nessun supporto multi-GPU, stream CUDA o esecuzione asincrona ancora.
 - Testato solo per l'architettura configurata in
   `BLACKFORGE_CUDA_ARCHITECTURES` (120, Blackwell consumer); altre
@@ -515,9 +523,10 @@ Come per `train`, `--from-checkpoint` è obbligatorio.
 completo (autodiff, loss, optimizer), interamente su device: forward,
 loss, backward e l'aggiornamento dei pesi non lasciano mai la GPU
 tranne per lo scalare finale della loss (necessario solo per stamparlo
-a schermo). Ogni kernel di backward — `matmul`, `addBias`,
-`silu`/`relu`/`gelu`, `rmsnorm` — è un kernel CUDA scritto a mano, non
-un wrapper attorno al backend CPU: correttezza-prima-che-prestazioni,
+a schermo) e per l'I/O di checkpoint (che deve comunque avvenire
+sull'host). Ogni kernel di backward — `matmul`, `addBias`,
+`silu`/`relu`/`gelu`, `rmsnorm`, `softmax` — è un kernel CUDA scritto a
+mano, non un wrapper attorno al backend CPU: correttezza-prima-che-prestazioni,
 quindi `matmulBackward` usa un kernel "ingenuo" (un thread per elemento
 di output, loop di riduzione interno) invece di cuBLAS con
 trasposizioni, la stessa struttura a triplo loop del backend CPU già
@@ -539,9 +548,15 @@ risultato quietamente sbagliato):
 - Solo `loss mse`: `cross_entropy` su GPU è lavoro futuro.
 - Nessun blocco `lora`: nessun adapter a basso rango implementato su
   `cuda::Model`.
-- Nessun `--from-checkpoint`/`--save-checkpoint`: il formato di
-  checkpoint (`blackforge::backend::cpu::checkpoint`) non è ancora
-  collegato a `cuda::Model`.
+
+`--from-checkpoint`/`--save-checkpoint` **sono** supportati su
+`--device cuda`, con lo stesso formato binario del backend CPU
+(`blackforge::backend::cuda::checkpoint`, magic `BFCKPT1` identico):
+un checkpoint salvato da un training CUDA è caricabile da un `Model`
+CPU e viceversa (verificato in
+`CudaTrainRunnerTest.UnCheckpointSalvatoDaCudaECaricabileDaCpuEViceversa`),
+quindi si può allenare su GPU e continuare il fine-tuning su CPU (o
+viceversa) senza conversioni.
 - L'inizializzazione dei pesi usa lo stesso generatore deterministico
   del backend CPU (non Xavier/Kaiming), come per `Executor`/`Model`
   CPU.

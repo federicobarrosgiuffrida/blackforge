@@ -142,6 +142,7 @@ if(BLACKFORGE_ENABLE_CUDA)
         src/backend/cuda/autodiff.cu
         src/backend/cuda/loss.cu
         src/backend/cuda/model.cu
+        src/backend/cuda/checkpoint.cu
         src/backend/cuda/optimizer.cu
         src/backend/cuda/train_runner.cu
     )

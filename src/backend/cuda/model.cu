@@ -90,6 +90,7 @@ DeviceTensor Model::forward(const DeviceTensor& input) {
             case ir::OpKind::Relu: current = relu(current); break;
             case ir::OpKind::Gelu: current = gelu(current); break;
             case ir::OpKind::RmsNorm: current = rmsnorm(current); break;
+            case ir::OpKind::Softmax: current = softmax(current); break;
         }
     }
 
@@ -117,6 +118,7 @@ void Model::backward(const DeviceTensor& outputGrad) {
             case ir::OpKind::Relu: gradCurrent = reluBackward(layer.cachedInput, gradCurrent); break;
             case ir::OpKind::Gelu: gradCurrent = geluBackward(layer.cachedInput, gradCurrent); break;
             case ir::OpKind::RmsNorm: gradCurrent = rmsnormBackward(layer.cachedInput, gradCurrent); break;
+            case ir::OpKind::Softmax: gradCurrent = softmaxBackward(layer.cachedInput, gradCurrent); break;
         }
     }
 }

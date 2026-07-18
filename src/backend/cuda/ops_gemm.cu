@@ -7,6 +7,26 @@
 
 namespace blackforge::backend::cuda {
 
+namespace {
+
+// Un handle cuBLAS per processo, creato alla prima chiamata e mai
+// distrutto esplicitamente (il runtime CUDA lo libera all'uscita del
+// processo): crearne e distruggerne uno ad ogni singola matmul() e'
+// corretto ma non ottimale, un handle e' pensato per essere riusato.
+// Assunzione esplicita: nessun accesso concorrente da piu' thread
+// (l'intero progetto, CLI compresa, e' a singolo thread quando esegue
+// codice CUDA — nessun lock qui, ne servirebbe uno se cambiasse).
+cublasHandle_t sharedHandle() {
+    static cublasHandle_t handle = [] {
+        cublasHandle_t h;
+        BLACKFORGE_CUBLAS_CHECK(cublasCreate(&h));
+        return h;
+    }();
+    return handle;
+}
+
+}  // namespace
+
 DeviceTensor matmul(const DeviceTensor& a, const DeviceTensor& b) {
     if (a.rank() != 2 || b.rank() != 2 || a.dim(1) != b.dim(0)) {
         throw std::invalid_argument("matmul: forme incompatibili sul device");
@@ -18,8 +38,7 @@ DeviceTensor matmul(const DeviceTensor& a, const DeviceTensor& b) {
 
     DeviceTensor result({m, n});
 
-    cublasHandle_t handle;
-    BLACKFORGE_CUBLAS_CHECK(cublasCreate(&handle));
+    cublasHandle_t handle = sharedHandle();
 
     // I nostri tensori sono memorizzati row-major (come ogni buffer C
     // "normale"), ma cuBLAS lavora in column-major. Un buffer row-major
@@ -36,7 +55,6 @@ DeviceTensor matmul(const DeviceTensor& a, const DeviceTensor& b) {
                                          static_cast<int>(k), &alpha, b.data(), static_cast<int>(n), a.data(),
                                          static_cast<int>(k), &beta, result.data(), static_cast<int>(n)));
 
-    cublasDestroy(handle);
     return result;
 }
 

@@ -8,7 +8,7 @@ namespace blackforge::ir {
 
 // Operazioni tensoriali riconosciute dalla IR. L'insieme cresce insieme
 // al backend che le implementa davvero (milestone CPU/CUDA).
-enum class OpKind { Linear, Silu, Relu, Gelu, RmsNorm };
+enum class OpKind { Linear, Silu, Relu, Gelu, RmsNorm, Softmax };
 
 // Risolve il nome testuale di una fase di pipeline (gia' validato
 // dall'analisi semantica) nel corrispondente OpKind della IR.

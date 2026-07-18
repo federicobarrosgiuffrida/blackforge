@@ -161,6 +161,38 @@ TEST(CudaOpsTest, RmsnormLanciaSeNonERango2) {
     EXPECT_THROW((void)cuda::rmsnorm(cuda::DeviceTensor::fromHost(input)), std::invalid_argument);
 }
 
+TEST(CudaOpsTest, SoftmaxCorrispondeAllaVersioneCpu) {
+    Tensor input({2, 4}, {1.0F, 2.0F, 3.0F, 0.5F, -1.0F, 0.0F, 2.5F, 1.5F});
+
+    Tensor cpuResult = cpu::softmax(input);
+    Tensor gpuResult = cuda::softmax(cuda::DeviceTensor::fromHost(input)).toHost();
+
+    ASSERT_EQ(gpuResult.shape(), cpuResult.shape());
+    for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
+        EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-5F) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, SoftmaxConFeatureMaggioriDelBlockSizeCorrispondeAllaVersioneCpu) {
+    std::vector<float> values(300);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        values[i] = static_cast<float>(i % 13) - 6.0F;
+    }
+    Tensor input({1, 300}, values);
+
+    Tensor cpuResult = cpu::softmax(input);
+    Tensor gpuResult = cuda::softmax(cuda::DeviceTensor::fromHost(input)).toHost();
+
+    for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
+        EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-5F) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, SoftmaxLanciaSeNonERango2) {
+    Tensor input({4}, {1.0F, 2.0F, 3.0F, 4.0F});
+    EXPECT_THROW((void)cuda::softmax(cuda::DeviceTensor::fromHost(input)), std::invalid_argument);
+}
+
 TEST(CudaOpsTest, AddLanciaSuFormeIncompatibili) {
     Tensor a({2}, {1.0F, 2.0F});
     Tensor b({3}, {1.0F, 2.0F, 3.0F});

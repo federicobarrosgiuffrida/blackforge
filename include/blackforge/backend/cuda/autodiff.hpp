@@ -35,4 +35,9 @@ DeviceTensor geluBackward(const DeviceTensor& input, const DeviceTensor& gradOut
 // rmsnorm: y = x / sqrt(mean(x^2) + eps), riga per riga.
 DeviceTensor rmsnormBackward(const DeviceTensor& input, const DeviceTensor& gradOutput);
 
+// softmax: ricalcola y = softmax(input) internamente (la formula del
+// gradiente ha bisogno dell'uscita, non dell'ingresso grezzo), stessa
+// scelta della controparte CPU (vedi backend::cpu::softmaxBackward).
+DeviceTensor softmaxBackward(const DeviceTensor& input, const DeviceTensor& gradOutput);
+
 }  // namespace blackforge::backend::cuda

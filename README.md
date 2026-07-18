@@ -33,7 +33,7 @@ Il compilatore copre l'intera catena lettura→validazione→esecuzione,
 incluso l'addestramento (pretraining, fine-tuning, LoRA) e il
 forecasting, sia su CPU sia (per l'inferenza) su GPU CUDA. È comunque
 un progetto giovane: il sottoinsieme del linguaggio è volutamente
-piccolo (un solo tipo di layer, cinque operazioni), non generazione di
+piccolo (un solo tipo di layer, sei operazioni), non generazione di
 codice nativo, non ottimizzazioni del grafo. La tabella seguente
 riflette lo stato **reale** del codice in questo repository, non
 obiettivi futuri.
@@ -46,14 +46,14 @@ obiettivi futuri.
 | Analisi semantica e controllo tipi numerici (dtype, target, operazioni note) | ✅ Completato per il sottoinsieme attuale |
 | Controllo forme tensoriali | ✅ Inferenza reale lungo la pipeline (via IR); vincoli locali via analisi semantica |
 | Rappresentazione interna (IR) | ✅ Completata (Value/Operation/Module, IR builder con inferenza di forma e dtype) |
-| Backend CPU di riferimento (tensori, elementwise, matmul, linear, attivazioni, rmsnorm) | ✅ Completato per le operazioni attualmente nel linguaggio |
+| Backend CPU di riferimento (tensori, elementwise, matmul, linear, attivazioni, rmsnorm, softmax) | ✅ Completato per le operazioni attualmente nel linguaggio |
 | Esecuzione (`blackforge run`) | ✅ Esegue un modello con input sintetico e pesi deterministici |
-| Autodiff / backward | ✅ Formule analitiche per linear/matmul/addBias/silu/relu/gelu/rmsnorm, verificate con gradient checking numerico |
+| Autodiff / backward | ✅ Formule analitiche per linear/matmul/addBias/silu/relu/gelu/rmsnorm/softmax, verificate con gradient checking numerico |
 | Loss | ✅ Errore quadratico medio (MSE, per la regressione/forecasting) e cross-entropy con softmax interna (per la classificazione multiclasse, `loss cross_entropy`), entrambe verificate con gradient checking numerico |
 | Optimizer (SGD, AdamW) | ✅ Entrambi implementati e testati (incl. weight decay disaccoppiato di AdamW) |
 | Checkpoint (salvataggio/caricamento pesi) | ✅ Formato binario proprietario BlackForge, con round-trip testato |
 | Pass manager / ottimizzazioni (fusione, dead code elimination) | ⏳ Pianificato (ancora rimandato: nessuna ottimizzazione genuina applicabile con l'attuale insieme di operazioni) |
-| Backend CUDA (tensori device, add/addBias/matmul via cuBLAS/silu/relu/gelu/rmsnorm, esecuzione) | ✅ Implementato e testato su GPU reale (RTX 5060, sm_120) per le operazioni attualmente nel linguaggio |
+| Backend CUDA (tensori device, add/addBias/matmul via cuBLAS/silu/relu/gelu/rmsnorm/softmax, esecuzione) | ✅ Implementato e testato su GPU reale (RTX 5060, sm_120) per le operazioni attualmente nel linguaggio |
 | Rilevamento GPU (`blackforge devices`) | ✅ Elenca le GPU NVIDIA visibili tramite il driver CUDA |
 | Selezione dispositivo (`blackforge run --device cpu\|cuda`) | ✅ Implementata |
 | Tensor Core / precisioni FP8/BF16/TF32 reali su GPU | ⏳ Pianificato — il backend CUDA oggi calcola in float32 (SGEMM), come il backend CPU: nessun uso di Tensor Core o dei formati ridotti come precisione di calcolo reale ancora |
@@ -65,8 +65,9 @@ obiettivi futuri.
 | Fine-tuning (`blackforge train --from-checkpoint`) | ✅ Riprende l'addestramento da un checkpoint esistente |
 | LoRA (`train { lora { rank alpha } }`) | ✅ Adapter a basso rango su ogni layer `linear`, pesi di base congelati; verificato con gradient checking e con un test che conferma che i pesi di base restano invariati dopo l'addestramento |
 | Forecasting (`forecast { model horizon }`, `blackforge forecast`) | ✅ Rollout autoregressivo (l'output di un passo diventa l'input del successivo); richiede che l'ultima dimensione di input e output del modello coincidano e un checkpoint pre-allenato |
-| Autodiff su GPU (`blackforge train --device cuda`) | ✅ Kernel CUDA scritti a mano per ogni backward (matmul, addBias, silu/relu/gelu, rmsnorm), loss MSE e optimizer (SGD, AdamW) interamente su device; ogni kernel confrontato numericamente contro la controparte CPU, incluso un test di parità sull'intero training loop (stessa loss finale, stessi pesi finali, CPU vs GPU). Percorso minimo: solo `loss mse`, nessun LoRA, nessun `--from-checkpoint`/`--save-checkpoint` — errore esplicito (non fallback silenzioso) se richiesti |
-| Training/fine-tuning/LoRA su GPU (oltre il percorso minimo sopra) | ⏳ Pianificato: cross-entropy su GPU, LoRA su GPU, checkpoint su GPU |
+| Autodiff su GPU (`blackforge train --device cuda`) | ✅ Kernel CUDA scritti a mano per ogni backward (matmul, addBias, silu/relu/gelu, rmsnorm, softmax), loss MSE e optimizer (SGD, AdamW) interamente su device; ogni kernel confrontato numericamente contro la controparte CPU, incluso un test di parità sull'intero training loop (stessa loss finale, stessi pesi finali, CPU vs GPU) |
+| Checkpoint su GPU (`--from-checkpoint`/`--save-checkpoint` con `--device cuda`) | ✅ Stesso formato binario del backend CPU (magic `BFCKPT1` identico): un checkpoint salvato da CUDA è caricabile da CPU e viceversa, verificato con un test di interoperabilità dedicato |
+| Training/fine-tuning/LoRA su GPU (oltre il percorso minimo sopra) | ⏳ Pianificato: cross-entropy su GPU, LoRA su GPU |
 | CLI completa (`check`, `build`, `run`, `train`, `forecast`, `benchmark`, `inspect`, `devices`) | ✅ Tutti e 6 i comandi della visione originale implementati, più `forecast`/`devices` |
 | Benchmark (`blackforge benchmark`) | ✅ Hardware rilevato, precisione dichiarata (e realmente applicata sul backend CPU, vedi riga sopra), forma, tempo medio, throughput, memoria stimata, iterazioni/warmup configurabili; con `--device cuda` confronta automaticamente con la CPU (speedup e scarto massimo) |
 | Profiling | 🟡 Solo timing aggregato per iterazione (dentro `benchmark`); nessun breakdown per singola operazione |
@@ -163,8 +164,8 @@ blackforge run <file.bf>                # esegue il primo modello su CPU (batch=
 blackforge run <file.bf> --batch 8      # come sopra, con batch size esplicito
 blackforge run <file.bf> --device cuda:0  # esegue sulla GPU 0 (richiede una build con CUDA)
 blackforge train <file.bf>              # addestra il modello del blocco 'train' (CPU)
-blackforge train <file.bf> --from-checkpoint pesi.bfckpt  # fine-tuning (o base per LoRA, solo CPU)
-blackforge train <file.bf> --save-checkpoint pesi.bfckpt  # salva i pesi finali (solo CPU)
+blackforge train <file.bf> --from-checkpoint pesi.bfckpt  # fine-tuning (CPU o CUDA; base per LoRA solo CPU)
+blackforge train <file.bf> --save-checkpoint pesi.bfckpt  # salva i pesi finali (CPU o CUDA)
 blackforge train <file.bf> --device cuda  # addestra sulla GPU (solo loss 'mse', niente lora/checkpoint per ora)
 blackforge forecast <file.bf> --from-checkpoint pesi.bfckpt --batch 1  # rollout autoregressivo
 blackforge benchmark <file.bf> --batch 8 --warmup 5 --iterations 20  # tempo/throughput/memoria
@@ -211,16 +212,18 @@ non ha senso allenare un adapter su pesi casuali).
 
 Con `--device cuda`, l'intero ciclo di addestramento (forward, loss,
 backward, aggiornamento dei pesi) avviene su device: ogni kernel di
-backward (matmul, addBias, silu/relu/gelu, rmsnorm) e ogni optimizer
-(SGD, AdamW) sono implementazioni CUDA scritte a mano, verificate contro
-la controparte CPU sia kernel per kernel sia sull'intero training loop
-(vedi `tests/backend/cuda/`). E' un **percorso minimo, non ancora alla
-pari con la CPU**: supporta solo `loss mse` (non `cross_entropy`),
-nessun blocco `lora`, e nessun `--from-checkpoint`/`--save-checkpoint`
-(il formato di checkpoint non è ancora collegato al `Model` CUDA). Se
-il programma richiede una di queste funzionalità con `--device cuda`,
-il comando fallisce con un errore esplicito — non esegue un fallback
-silenzioso sulla CPU né ignora la richiesta.
+backward (matmul, addBias, silu/relu/gelu, rmsnorm, softmax) e ogni
+optimizer (SGD, AdamW) sono implementazioni CUDA scritte a mano,
+verificate contro la controparte CPU sia kernel per kernel sia
+sull'intero training loop (vedi `tests/backend/cuda/`).
+`--from-checkpoint`/`--save-checkpoint` funzionano anche su GPU, con lo
+stesso formato binario del backend CPU (un checkpoint CUDA è caricabile
+da CPU e viceversa). E' comunque un **percorso minimo, non ancora alla
+pari con la CPU**: supporta solo `loss mse` (non `cross_entropy`) e
+nessun blocco `lora`. Se il programma richiede una di queste
+funzionalità con `--device cuda`, il comando fallisce con un errore
+esplicito — non esegue un fallback silenzioso sulla CPU né ignora la
+richiesta.
 
 `blackforge forecast` esegue il modello referenziato dal primo blocco
 `forecast` ripetutamente per `horizon` passi, usando l'output di ogni

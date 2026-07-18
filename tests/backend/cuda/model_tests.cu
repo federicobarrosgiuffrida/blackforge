@@ -129,6 +129,56 @@ TEST(CudaModelTest, BackwardCorrispondeAllaDerivataNumericaDelLoss) {
     }
 }
 
+TEST(CudaModelTest, BackwardConSoftmaxCorrispondeAllaDerivataNumericaDelLoss) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 3]\n"
+        "    input |> linear(4) |> softmax\n"
+        "}\n");
+
+    cuda::Model model(module.models.front());
+    Tensor input({2, 3}, {0.2F, -0.1F, 0.4F, -0.3F, 0.5F, 0.1F});
+    Tensor target({2, 4}, {0.25F, 0.25F, 0.25F, 0.25F, 1.0F, 0.0F, 0.0F, 0.0F});
+    cuda::DeviceTensor inputDevice = cuda::DeviceTensor::fromHost(input);
+    cuda::DeviceTensor targetDevice = cuda::DeviceTensor::fromHost(target);
+
+    model.zeroGrad();
+    cuda::DeviceTensor output = model.forward(inputDevice);
+    cuda::LossResult loss = cuda::meanSquaredError(output, targetDevice);
+    model.backward(loss.grad);
+
+    auto lossOf = [&]() {
+        cuda::DeviceTensor out = model.forward(inputDevice);
+        return cuda::meanSquaredError(out, targetDevice).value;
+    };
+
+    auto params = model.parameters();
+    ASSERT_FALSE(params.empty());
+
+    cuda::Parameter* param = params.front();
+    Tensor hostValue = param->value.toHost();
+    Tensor hostGrad = param->grad.toHost();
+
+    float eps = 1e-3F;
+    for (std::size_t i = 0; i < std::min<std::size_t>(5, hostValue.elementCount()); ++i) {
+        float original = hostValue.at(i);
+
+        hostValue.at(i) = original + eps;
+        param->value = cuda::DeviceTensor::fromHost(hostValue);
+        float plus = lossOf();
+
+        hostValue.at(i) = original - eps;
+        param->value = cuda::DeviceTensor::fromHost(hostValue);
+        float minus = lossOf();
+
+        hostValue.at(i) = original;
+        param->value = cuda::DeviceTensor::fromHost(hostValue);
+
+        float numeric = (plus - minus) / (2.0F * eps);
+        EXPECT_NEAR(hostGrad.at(i), numeric, 1e-2F) << "parametro " << param->name << " indice " << i;
+    }
+}
+
 TEST(CudaModelTest, TrainingLoopRiduceLaLossConSgd) {
     ir::Module module = buildModule(
         "model M {\n"

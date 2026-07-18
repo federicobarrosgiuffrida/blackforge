@@ -170,6 +170,63 @@ DeviceTensor gelu(const DeviceTensor& input) {
     return result;
 }
 
+// Un blocco per riga: prima riduzione per il massimo (stabilita'
+// numerica), poi riduzione per la somma degli esponenziali, infine
+// normalizzazione. Tre passaggi sincronizzati con __syncthreads() tra
+// blocco e blocco, stessa struttura del kernel rmsnorm sopra.
+__global__ void softmaxKernel(float* out, const float* input, std::size_t batch, std::size_t features) {
+    extern __shared__ float shared[];
+
+    std::size_t row = blockIdx.x;
+    if (row >= batch) {
+        return;
+    }
+    const float* rowIn = input + row * features;
+    float* rowOut = out + row * features;
+
+    float localMax = -INFINITY;
+    for (std::size_t col = threadIdx.x; col < features; col += blockDim.x) {
+        localMax = fmaxf(localMax, rowIn[col]);
+    }
+    shared[threadIdx.x] = localMax;
+    __syncthreads();
+    for (std::size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    __shared__ float rowMax;
+    if (threadIdx.x == 0) {
+        rowMax = shared[0];
+    }
+    __syncthreads();
+
+    float localSum = 0.0F;
+    for (std::size_t col = threadIdx.x; col < features; col += blockDim.x) {
+        float e = expf(rowIn[col] - rowMax);
+        rowOut[col] = e;
+        localSum += e;
+    }
+    shared[threadIdx.x] = localSum;
+    __syncthreads();
+    for (std::size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    __shared__ float rowSum;
+    if (threadIdx.x == 0) {
+        rowSum = shared[0];
+    }
+    __syncthreads();
+
+    for (std::size_t col = threadIdx.x; col < features; col += blockDim.x) {
+        rowOut[col] /= rowSum;
+    }
+}
+
 DeviceTensor rmsnorm(const DeviceTensor& input) {
     if (input.rank() != 2) {
         throw std::invalid_argument("rmsnorm: richiede un tensore a rango 2 [batch, features] sul device");
@@ -180,6 +237,22 @@ DeviceTensor rmsnorm(const DeviceTensor& input) {
     std::size_t features = input.dim(1);
     if (batch > 0 && features > 0) {
         rmsnormKernel<<<static_cast<int>(batch), kBlockSize, kBlockSize * sizeof(float)>>>(
+            result.data(), input.data(), batch, features);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+DeviceTensor softmax(const DeviceTensor& input) {
+    if (input.rank() != 2) {
+        throw std::invalid_argument("softmax: richiede un tensore a rango 2 [batch, classi] sul device");
+    }
+
+    DeviceTensor result(input.shape());
+    std::size_t batch = input.dim(0);
+    std::size_t features = input.dim(1);
+    if (batch > 0 && features > 0) {
+        softmaxKernel<<<static_cast<int>(batch), kBlockSize, kBlockSize * sizeof(float)>>>(
             result.data(), input.data(), batch, features);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }

@@ -1,5 +1,6 @@
 #include "blackforge/backend/cpu/ops.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -130,6 +131,39 @@ Tensor rmsnorm(const Tensor& input) {
 
         for (std::size_t col = 0; col < features; ++col) {
             result[rowOffset + col] = input.at(rowOffset + col) / rms;
+        }
+    }
+
+    return Tensor(input.shape(), std::move(result));
+}
+
+Tensor softmax(const Tensor& input) {
+    if (input.rank() != 2) {
+        throw std::invalid_argument("softmax: richiede un tensore a rango 2 [batch, classi], trovato " +
+                                     input.shapeToString());
+    }
+
+    std::size_t batch = input.dim(0);
+    std::size_t features = input.dim(1);
+    std::vector<float> result(input.elementCount());
+
+    for (std::size_t row = 0; row < batch; ++row) {
+        std::size_t rowOffset = row * features;
+
+        float maxVal = input.at(rowOffset);
+        for (std::size_t col = 1; col < features; ++col) {
+            maxVal = std::max(maxVal, input.at(rowOffset + col));
+        }
+
+        double sumExp = 0.0;
+        for (std::size_t col = 0; col < features; ++col) {
+            double e = std::exp(static_cast<double>(input.at(rowOffset + col) - maxVal));
+            result[rowOffset + col] = static_cast<float>(e);
+            sumExp += e;
+        }
+
+        for (std::size_t col = 0; col < features; ++col) {
+            result[rowOffset + col] = static_cast<float>(static_cast<double>(result[rowOffset + col]) / sumExp);
         }
     }
 

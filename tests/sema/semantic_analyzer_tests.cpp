@@ -107,7 +107,7 @@ TEST(SemanticAnalyzerTest, RifiutaOperazioneSconosciuta) {
     auto analyzer = analyze(
         "model M {\n"
         "    input bf16[4096]\n"
-        "    input |> softmax\n"
+        "    input |> attention\n"
         "}\n");
     EXPECT_TRUE(analyzer.diagnostics().hasErrors());
 }
@@ -144,6 +144,24 @@ TEST(SemanticAnalyzerTest, RifiutaRmsnormConArgomenti) {
         "model M {\n"
         "    input bf16[4096]\n"
         "    input |> rmsnorm(4096)\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, AccettaSoftmax) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 4096]\n"
+        "    input |> linear(10) |> softmax\n"
+        "}\n");
+    EXPECT_FALSE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaSoftmaxConArgomenti) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[4096]\n"
+        "    input |> softmax(10)\n"
         "}\n");
     EXPECT_TRUE(analyzer.diagnostics().hasErrors());
 }

@@ -27,6 +27,7 @@ const std::unordered_map<std::string, int>& knownOperations() {
         {"relu", 0},
         {"gelu", 0},
         {"rmsnorm", 0},
+        {"softmax", 0},
     };
     return operations;
 }
@@ -162,8 +163,9 @@ void SemanticAnalyzer::analyzeTensorType(const ast::TensorType& type) {
 void SemanticAnalyzer::analyzeStage(const ast::PipelineStage& stage) {
     auto it = knownOperations().find(stage.name);
     if (it == knownOperations().end()) {
-        diagnostics_.addError(stage.location, "operazione sconosciuta '" + stage.name +
-                                                   "'. Operazioni supportate: linear, silu, relu, gelu, rmsnorm");
+        diagnostics_.addError(stage.location,
+                               "operazione sconosciuta '" + stage.name +
+                                   "'. Operazioni supportate: linear, silu, relu, gelu, rmsnorm, softmax");
         return;
     }
 

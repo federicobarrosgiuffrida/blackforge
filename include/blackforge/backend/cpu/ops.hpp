@@ -32,6 +32,18 @@ Tensor gelu(const Tensor& input);
 // std::invalid_argument se il tensore non e' a rango 2.
 Tensor rmsnorm(const Tensor& input);
 
+// Softmax riga per riga su un tensore [batch, classi]: y_j =
+// exp(x_j - max) / sum_k exp(x_k - max) (sottrazione del massimo per
+// stabilita' numerica). A differenza di softmaxCrossEntropy in
+// loss.hpp (che applica softmax internamente in una formula combinata
+// con la cross-entropy, piu' efficiente e stabile per l'addestramento),
+// questa e' softmax come operazione di pipeline a se stante: serve a
+// ottenere probabilita' esplicite in uscita da un modello (es. per
+// l'inferenza), non e' pensata per essere seguita da cross-entropy
+// nello stesso grafo (in quel caso conviene la loss combinata). Lancia
+// std::invalid_argument se il tensore non e' a rango 2.
+Tensor softmax(const Tensor& input);
+
 // Layer lineare: input [batch, inFeatures], weight [inFeatures, outFeatures],
 // bias [outFeatures] -> output [batch, outFeatures].
 Tensor linear(const Tensor& input, const Tensor& weight, const Tensor& bias);

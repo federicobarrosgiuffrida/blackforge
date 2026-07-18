@@ -39,4 +39,12 @@ Tensor geluBackward(const Tensor& input, const Tensor& gradOutput);
 // std::invalid_argument se le forme non coincidono o non sono a rango 2.
 Tensor rmsnormBackward(const Tensor& input, const Tensor& gradOutput);
 
+// softmax: ricalcola y = softmax(input) internamente (la formula del
+// gradiente, dx_j = y_j * (gOut_j - sum_i(gOut_i * y_i)), ha bisogno
+// dell'uscita y, non dell'ingresso grezzo) invece di richiedere al
+// chiamante di cachare l'uscita anziche' l'ingresso: un ricalcolo in
+// piu' trascurabile, per restare coerenti con la firma (input,
+// gradOutput) di tutte le altre funzioni di questo file.
+Tensor softmaxBackward(const Tensor& input, const Tensor& gradOutput);
+
 }  // namespace blackforge::backend::cpu

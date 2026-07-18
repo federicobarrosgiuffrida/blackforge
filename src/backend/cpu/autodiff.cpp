@@ -3,6 +3,8 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "blackforge/backend/cpu/ops.hpp"
+
 namespace blackforge::backend::cpu {
 
 namespace {
@@ -136,6 +138,41 @@ Tensor rmsnormBackward(const Tensor& input, const Tensor& gradOutput) {
             double gOut = static_cast<double>(gradOutput.at(rowOffset + col));
             double grad = gOut / r - x * weightedSum / (static_cast<double>(features) * r * r * r);
             result[rowOffset + col] = static_cast<float>(grad);
+        }
+    }
+
+    return Tensor(input.shape(), std::move(result));
+}
+
+Tensor softmaxBackward(const Tensor& input, const Tensor& gradOutput) {
+    if (input.shape() != gradOutput.shape()) {
+        throw std::invalid_argument("softmaxBackward: forme incompatibili " + input.shapeToString() + " e " +
+                                     gradOutput.shapeToString());
+    }
+    if (input.rank() != 2) {
+        throw std::invalid_argument("softmaxBackward: richiede un tensore a rango 2 [batch, classi], trovato " +
+                                     input.shapeToString());
+    }
+
+    Tensor y = softmax(input);
+    std::size_t batch = input.dim(0);
+    std::size_t features = input.dim(1);
+    std::vector<float> result(input.elementCount());
+
+    // dx_j = y_j * (gOut_j - S), S = sum_i(gOut_i * y_i): la forma
+    // chiusa standard dello Jacobiano di softmax.
+    for (std::size_t row = 0; row < batch; ++row) {
+        std::size_t rowOffset = row * features;
+
+        double weightedSum = 0.0;
+        for (std::size_t col = 0; col < features; ++col) {
+            weightedSum += static_cast<double>(gradOutput.at(rowOffset + col)) * static_cast<double>(y.at(rowOffset + col));
+        }
+
+        for (std::size_t col = 0; col < features; ++col) {
+            double yVal = static_cast<double>(y.at(rowOffset + col));
+            double gOut = static_cast<double>(gradOutput.at(rowOffset + col));
+            result[rowOffset + col] = static_cast<float>(yVal * (gOut - weightedSum));
         }
     }
 

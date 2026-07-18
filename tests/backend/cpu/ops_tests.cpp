@@ -122,3 +122,48 @@ TEST(CpuOpsTest, RmsnormLanciaSeNonERango2) {
     Tensor input({4}, {1.0F, 2.0F, 3.0F, 4.0F});
     EXPECT_THROW((void)cpu::rmsnorm(input), std::invalid_argument);
 }
+
+TEST(CpuOpsTest, SoftmaxOgniRigaSommaAUno) {
+    Tensor input({2, 3}, {1.0F, 2.0F, 3.0F, -1.0F, 0.0F, 1.0F});
+    Tensor result = cpu::softmax(input);
+
+    for (std::size_t row = 0; row < 2; ++row) {
+        float sum = result.at(row * 3) + result.at(row * 3 + 1) + result.at(row * 3 + 2);
+        EXPECT_NEAR(sum, 1.0F, 1e-5F) << "riga " << row;
+    }
+}
+
+TEST(CpuOpsTest, SoftmaxTuttiIValoriSonoPositivi) {
+    // Valori abbastanza vicini da non far sottostimare exp() a zero per
+    // underflow (softmax(-100 rispetto a un massimo di 50) sarebbe
+    // legittimamente 0.0f in float32, non un bug: qui si verifica la
+    // proprieta' "tutti positivi" in un caso dove ha senso attenderla).
+    Tensor input({1, 4}, {-10.0F, 0.0F, 5.0F, 3.0F});
+    Tensor result = cpu::softmax(input);
+    for (std::size_t i = 0; i < result.elementCount(); ++i) {
+        EXPECT_GT(result.at(i), 0.0F) << "indice " << i;
+    }
+}
+
+TEST(CpuOpsTest, SoftmaxSuLogitUniformiDaProbabilitaUniformi) {
+    Tensor input({1, 4}, {2.0F, 2.0F, 2.0F, 2.0F});
+    Tensor result = cpu::softmax(input);
+    for (std::size_t i = 0; i < result.elementCount(); ++i) {
+        EXPECT_NEAR(result.at(i), 0.25F, 1e-5F) << "indice " << i;
+    }
+}
+
+TEST(CpuOpsTest, SoftmaxERobustoALogitGrandi) {
+    // Senza sottrazione del massimo, exp(1000) andrebbe in overflow
+    // (inf) e il risultato sarebbe NaN: verifica la stabilita' numerica.
+    Tensor input({1, 3}, {1000.0F, 1000.0F, 1000.0F});
+    Tensor result = cpu::softmax(input);
+    for (std::size_t i = 0; i < result.elementCount(); ++i) {
+        EXPECT_NEAR(result.at(i), 1.0F / 3.0F, 1e-4F) << "indice " << i;
+    }
+}
+
+TEST(CpuOpsTest, SoftmaxLanciaSeNonERango2) {
+    Tensor input({4}, {1.0F, 2.0F, 3.0F, 4.0F});
+    EXPECT_THROW((void)cpu::softmax(input), std::invalid_argument);
+}
