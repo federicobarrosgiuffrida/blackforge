@@ -18,6 +18,10 @@ class Optimizer {
 public:
     virtual ~Optimizer() = default;
     virtual void step(const std::vector<Parameter*>& parameters) = 0;
+
+    // Cambia il learning rate usato dagli step successivi, senza
+    // toccare altro stato (vedi backend::cpu::Optimizer::setLearningRate).
+    virtual void setLearningRate(float learningRate) = 0;
 };
 
 // Discesa del gradiente stocastica, senza momento: param -= lr * grad.
@@ -26,6 +30,7 @@ public:
     explicit SGD(float learningRate) : learningRate_(learningRate) {}
 
     void step(const std::vector<Parameter*>& parameters) override;
+    void setLearningRate(float learningRate) override { learningRate_ = learningRate; }
 
 private:
     float learningRate_;
@@ -40,6 +45,7 @@ public:
                     float weightDecay = 0.01F);
 
     void step(const std::vector<Parameter*>& parameters) override;
+    void setLearningRate(float learningRate) override { learningRate_ = learningRate; }
 
 private:
     struct MomentState {

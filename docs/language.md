@@ -173,12 +173,13 @@ Dopo il parsing, `blackforge check` valida:
   dichiarato nel programma), un `dataset` (idem), una `loss` (`mse` o
   `cross_entropy`), un `optimizer` (`sgd` o `adamw`), `epochs` e
   `batch_size` (interi positivi); `learning_rate` è opzionale (default
-  `0.001` se omesso) e deve essere positivo se presente. I riferimenti
-  a `model`/`dataset` sono risolti per nome in tutto il programma,
-  indipendentemente dall'ordine delle dichiarazioni. Il blocco `lora`
-  opzionale richiede `rank` (intero positivo); `alpha` è opzionale
-  (default `rank`, cioè fattore di scala 1) e deve essere positivo se
-  presente.
+  `0.001` se omesso) e deve essere positivo se presente. `lr_schedule`
+  è opzionale (unico valore supportato: `cosine`); se assente il
+  learning rate resta costante. I riferimenti a `model`/`dataset` sono
+  risolti per nome in tutto il programma, indipendentemente
+  dall'ordine delle dichiarazioni. Il blocco `lora` opzionale richiede
+  `rank` (intero positivo); `alpha` è opzionale (default `rank`, cioè
+  fattore di scala 1) e deve essere positivo se presente.
 - **Forecast**: esattamente un `model` (deve esistere) e un `horizon`
   (intero positivo). La compatibilità tra forma di input e di output
   del modello (necessaria per il rollout autoregressivo) non è
@@ -561,12 +562,51 @@ viceversa) senza conversioni.
   del backend CPU (non Xavier/Kaiming), come per `Executor`/`Model`
   CPU.
 
+### Shuffling e learning rate scheduler
+
+Ad ogni epoca, `blackforge train` rimescola l'ordine degli esempi del
+dataset (`data::Dataset::shuffle`, Fisher-Yates seminato con il numero
+di epoca: riproducibile, ma diverso epoca per epoca) prima di costruire
+i batch — comportamento identico su CPU e CUDA (stesso seme per
+epoca), verificato producendo la stessa identica traiettoria di loss
+sui due backend. Con un solo batch per epoca (`batch_size ==
+numEsempi`, il caso più comune negli esempi di questo repository) lo
+shuffling non ha alcun effetto osservabile (l'ordine dentro un batch
+completo non cambia il risultato); con più batch per epoca cambia
+davvero quali esempi finiscono in quale batch da un'epoca all'altra.
+
+Il campo opzionale `lr_schedule cosine` dentro `train` attiva il
+cosine annealing (Loshchilov & Hutter, "SGDR", 2016): il learning rate
+decade da `learning_rate` (prima epoca) a 0 (ultima epoca) seguendo
+mezza onda di coseno, invece di restare costante. Implementato una sola
+volta (`blackforge::backend::cosineAnnealingLearningRate`, condivisa
+tra i train runner CPU e CUDA per evitare che le due implementazioni
+divergano) e applicato tramite `Optimizer::setLearningRate()`, che
+cambia il learning rate senza toccare altro stato dell'optimizer (per
+AdamW, i momenti accumulati e il contatore di step restano invariati).
+Senza `lr_schedule`, il comportamento resta quello originale: learning
+rate costante per l'intero addestramento.
+
+```blackforge
+train {
+    model TinyRegression
+    dataset ToyData
+    loss mse
+    optimizer adamw
+    epochs 100
+    batch_size 8
+    learning_rate 0.1
+    lr_schedule cosine
+}
+```
+
 ### Limitazioni esplicite (comuni a CPU e GPU)
 
 - Solo il primo blocco `train`/`forecast` del file viene eseguito.
-- Nessuno shuffle dei dati tra le epoche; nessun batch parziale (un
-  dataset con `numEsempi % batch_size != 0` scarta gli esempi in eccesso).
-- Nessun learning rate scheduler, nessuna validazione/early stopping.
+- Nessun batch parziale (un dataset con `numEsempi % batch_size != 0`
+  scarta gli esempi in eccesso).
+- Nessuna validazione/early stopping; l'unico scheduler disponibile è
+  `lr_schedule cosine` (vedi sopra).
 - Il forecasting usa un input sintetico iniziale (nessun modo ancora di
   fornire una sequenza "seed" reale da cui partire), ed esiste solo sul
   backend CPU per ora.

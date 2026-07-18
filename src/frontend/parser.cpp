@@ -409,12 +409,16 @@ ast::TrainDecl Parser::parseTrainDecl() {
                              "atteso un numero dopo 'learning_rate', trovato " + tokenKindName(peek().kind));
             }
             fields.push_back(ast::TrainField{ast::TrainLearningRateField{value, fieldStart}});
+        } else if (check(TokenKind::KwLrSchedule)) {
+            advance();
+            const Token& nameToken = expect(TokenKind::Identifier, "atteso il nome dello schedule dopo 'lr_schedule'");
+            fields.push_back(ast::TrainField{ast::TrainLrScheduleField{nameToken.lexeme, fieldStart}});
         } else if (check(TokenKind::KwLora)) {
             fields.push_back(ast::TrainField{parseTrainLoraField()});
         } else {
             throw error(peek().location,
                          "atteso un campo di 'train' ('model', 'dataset', 'loss', 'optimizer', 'epochs', "
-                         "'batch_size', 'learning_rate' o 'lora'), trovato " +
+                         "'batch_size', 'learning_rate', 'lr_schedule' o 'lora'), trovato " +
                              tokenKindName(peek().kind));
         }
     }

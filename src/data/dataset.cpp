@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <fstream>
 #include <numeric>
+#include <random>
 #include <stdexcept>
 
 namespace blackforge::data {
@@ -96,6 +97,37 @@ Dataset::Batch Dataset::batch(std::size_t startIndex, std::size_t batchSize) con
 
     return Batch{runtime::Tensor(std::move(inputBatchShape), std::move(inputData)),
                  runtime::Tensor(std::move(targetBatchShape), std::move(targetData))};
+}
+
+void Dataset::shuffle(unsigned int seed) {
+    if (numExamples_ <= 1) {
+        return;
+    }
+
+    std::vector<std::size_t> order(numExamples_);
+    std::iota(order.begin(), order.end(), 0);
+
+    std::mt19937 rng(seed);
+    for (std::size_t i = numExamples_ - 1; i > 0; --i) {
+        std::uniform_int_distribution<std::size_t> dist(0, i);
+        std::swap(order[i], order[dist(rng)]);
+    }
+
+    std::size_t inputExampleSize = product(inputShape_);
+    std::size_t targetExampleSize = product(targetShape_);
+
+    std::vector<float> newInputs(inputs_.size());
+    std::vector<float> newTargets(targets_.size());
+    for (std::size_t i = 0; i < numExamples_; ++i) {
+        std::size_t srcIndex = order[i];
+        std::copy_n(inputs_.begin() + static_cast<std::ptrdiff_t>(srcIndex * inputExampleSize), inputExampleSize,
+                    newInputs.begin() + static_cast<std::ptrdiff_t>(i * inputExampleSize));
+        std::copy_n(targets_.begin() + static_cast<std::ptrdiff_t>(srcIndex * targetExampleSize), targetExampleSize,
+                    newTargets.begin() + static_cast<std::ptrdiff_t>(i * targetExampleSize));
+    }
+
+    inputs_ = std::move(newInputs);
+    targets_ = std::move(newTargets);
 }
 
 void saveDataset(const std::string& path, const std::vector<std::size_t>& inputExampleShape,

@@ -305,6 +305,30 @@ TEST(SemanticAnalyzerTest, AccettaLossCrossEntropy) {
     EXPECT_FALSE(analyzer.diagnostics().hasErrors());
 }
 
+TEST(SemanticAnalyzerTest, AccettaLrScheduleCosine) {
+    std::string source = kValidTrainProgram;
+    auto pos = source.find("optimizer adamw");
+    source.insert(pos + std::string("optimizer adamw").size(), "\n    lr_schedule cosine");
+    auto analyzer = analyze(source);
+    EXPECT_FALSE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaLrScheduleSconosciuto) {
+    std::string source = kValidTrainProgram;
+    auto pos = source.find("optimizer adamw");
+    source.insert(pos + std::string("optimizer adamw").size(), "\n    lr_schedule step");
+    auto analyzer = analyze(source);
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaLrScheduleDuplicato) {
+    std::string source = kValidTrainProgram;
+    auto pos = source.find("optimizer adamw");
+    source.insert(pos + std::string("optimizer adamw").size(), "\n    lr_schedule cosine\n    lr_schedule cosine");
+    auto analyzer = analyze(source);
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
 TEST(SemanticAnalyzerTest, RifiutaOptimizerSconosciuto) {
     std::string source = kValidTrainProgram;
     auto pos = source.find("optimizer adamw");

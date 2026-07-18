@@ -165,6 +165,16 @@ struct TrainLearningRateField {
     SourceLocation location;
 };
 
+// 'lr_schedule cosine': fa decadere il learning_rate lungo le epoche
+// secondo la formula standard di cosine annealing (Loshchilov & Hutter,
+// "SGDR", 2016), invece di restare costante. Opzionale: se assente, il
+// learning rate resta costante per l'intero addestramento (comportamento
+// invariato rispetto a prima).
+struct TrainLrScheduleField {
+    std::string name;  // es. "cosine"
+    SourceLocation location;
+};
+
 // 'lora { rank N [alpha F] }' dentro un blocco 'train': quando presente,
 // invece di allenare i pesi originali del modello, addestra un adapter
 // a basso rango (matrici A/B) applicato a ogni layer 'linear', con i
@@ -178,7 +188,8 @@ struct TrainLoraField {
 };
 
 using TrainField = std::variant<TrainModelField, TrainDatasetField, TrainLossField, TrainOptimizerField,
-                                 TrainEpochsField, TrainBatchSizeField, TrainLearningRateField, TrainLoraField>;
+                                 TrainEpochsField, TrainBatchSizeField, TrainLearningRateField,
+                                 TrainLrScheduleField, TrainLoraField>;
 
 struct TrainDecl {
     std::vector<TrainField> fields;

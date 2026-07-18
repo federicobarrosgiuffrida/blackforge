@@ -22,6 +22,7 @@ const std::unordered_map<std::string, TokenKind>& keywordTable() {
         {"path", TokenKind::KwPath},               {"labels", TokenKind::KwLabels},
         {"epochs", TokenKind::KwEpochs},           {"batch_size", TokenKind::KwBatchSize},
         {"learning_rate", TokenKind::KwLearningRate},
+        {"lr_schedule", TokenKind::KwLrSchedule},
         {"rank", TokenKind::KwRank},               {"alpha", TokenKind::KwAlpha},
         {"horizon", TokenKind::KwHorizon},
     };

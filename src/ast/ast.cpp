@@ -172,6 +172,8 @@ void dumpTrainField(std::ostringstream& out, int depth, const TrainField& field)
                 out << "batch_size = " << node.value << "\n";
             } else if constexpr (std::is_same_v<T, TrainLearningRateField>) {
                 out << "learning_rate = " << node.value << "\n";
+            } else if constexpr (std::is_same_v<T, TrainLrScheduleField>) {
+                out << "lr_schedule = " << node.name << "\n";
             } else if constexpr (std::is_same_v<T, TrainLoraField>) {
                 out << "lora rank=" << node.rank << " alpha=" << node.alpha << "\n";
             }

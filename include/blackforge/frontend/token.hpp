@@ -50,6 +50,7 @@ enum class TokenKind {
     KwEpochs,
     KwBatchSize,
     KwLearningRate,
+    KwLrSchedule,
 
     // Parole chiave di 'lora { ... }' (dentro 'train') e 'forecast { ... }'
     KwRank,

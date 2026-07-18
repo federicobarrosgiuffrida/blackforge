@@ -141,6 +141,32 @@ std::string toyProgramCrossEntropy(const std::string& datasetPath, int epochs) {
            "}\n";
 }
 
+std::string toyProgramWithLrSchedule(const std::string& datasetPath, int epochs) {
+    return "model M {\n"
+           "    input bf16[batch, 4]\n"
+           "    input |> linear(2)\n"
+           "}\n"
+           "dataset D {\n"
+           "    path \"" +
+           toForwardSlashes(datasetPath) +
+           "\"\n"
+           "    input bf16[batch, 4]\n"
+           "    labels bf16[batch, 2]\n"
+           "}\n"
+           "train {\n"
+           "    model M\n"
+           "    dataset D\n"
+           "    loss mse\n"
+           "    optimizer adamw\n"
+           "    epochs " +
+           std::to_string(epochs) +
+           "\n"
+           "    batch_size 4\n"
+           "    learning_rate 0.3\n"
+           "    lr_schedule cosine\n"
+           "}\n";
+}
+
 std::string toyProgramWithLora(const std::string& datasetPath, int epochs, long long rank) {
     return "model M {\n"
            "    input bf16[batch, 4]\n"
@@ -207,6 +233,40 @@ TEST(TrainRunnerTest, RiduceLaLossConCrossEntropy) {
 
     ASSERT_EQ(result.epochLosses.size(), 50u);
     EXPECT_LT(result.epochLosses.back(), result.epochLosses.front() * 0.1);
+}
+
+TEST(TrainRunnerTest, RiduceLaLossConLrScheduleCosine) {
+    TempFile datasetFile("blackforge_test_train_dataset_lrsched.bfdata");
+    writeToyDataset(datasetFile.path);
+
+    Compiled compiled = compile(toyProgramWithLrSchedule(datasetFile.path, /*epochs=*/50));
+    backend::cpu::TrainRunResult result = backend::cpu::runTraining(compiled.program, compiled.module, "", "");
+
+    ASSERT_EQ(result.epochLosses.size(), 50u);
+    EXPECT_LT(result.epochLosses.back(), result.epochLosses.front());
+}
+
+TEST(TrainRunnerTest, ConvergeAncheConPiuDiUnBatchPerEpocaEShufflingAttivo) {
+    // writeToyDataset ha 4 esempi: con batch_size=2 ci sono 2 batch per
+    // epoca, quindi lo shuffling (che riordina gli esempi prima di
+    // costruire i batch) cambia davvero quali esempi finiscono in quale
+    // batch da un'epoca all'altra (a differenza degli altri test di
+    // questo file, che usano batch_size=numEsempi: un solo batch per
+    // epoca, dove l'ordine non ha alcun effetto). Verifica che la
+    // riduzione della loss non sia stata rotta dallo shuffling.
+    TempFile datasetFile("blackforge_test_train_dataset_multibatch.bfdata");
+    writeToyDataset(datasetFile.path);
+
+    std::string program = toyProgram(datasetFile.path, /*epochs=*/50, "adamw");
+    auto pos = program.find("batch_size 4");
+    ASSERT_NE(pos, std::string::npos);
+    program.replace(pos, std::string("batch_size 4").size(), "batch_size 2");
+
+    Compiled compiled = compile(program);
+    backend::cpu::TrainRunResult result = backend::cpu::runTraining(compiled.program, compiled.module, "", "");
+
+    ASSERT_EQ(result.epochLosses.size(), 50u);
+    EXPECT_LT(result.epochLosses.back(), result.epochLosses.front() * 0.5);
 }
 
 TEST(TrainRunnerTest, LanciaSeIlProgrammaNonHaBloccoTrain) {

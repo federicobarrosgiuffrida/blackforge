@@ -63,6 +63,14 @@ const std::unordered_set<std::string>& knownOptimizerNames() {
     return names;
 }
 
+// Schedule del learning rate riconosciuti. 'cosine' e' cosine
+// annealing (Loshchilov & Hutter, "SGDR", 2016): decade da
+// learning_rate a 0 seguendo mezza onda di coseno lungo le epoche.
+const std::unordered_set<std::string>& knownLrScheduleNames() {
+    static const std::unordered_set<std::string> names = {"cosine"};
+    return names;
+}
+
 }  // namespace
 
 void SemanticAnalyzer::analyze(const ast::Program& program) {
@@ -306,6 +314,7 @@ void SemanticAnalyzer::analyzeTrain(const ast::TrainDecl& decl) {
     int epochsCount = 0;
     int batchSizeCount = 0;
     int learningRateCount = 0;
+    int lrScheduleCount = 0;
     int loraCount = 0;
 
     for (const auto& field : decl.fields) {
@@ -373,6 +382,15 @@ void SemanticAnalyzer::analyzeTrain(const ast::TrainDecl& decl) {
                     }
                     if (node.value <= 0.0) {
                         diagnostics_.addError(node.location, "'learning_rate' deve essere positivo");
+                    }
+                } else if constexpr (std::is_same_v<T, ast::TrainLrScheduleField>) {
+                    ++lrScheduleCount;
+                    if (lrScheduleCount > 1) {
+                        diagnostics_.addError(node.location, "campo 'lr_schedule' duplicato nel blocco 'train'");
+                    }
+                    if (knownLrScheduleNames().find(node.name) == knownLrScheduleNames().end()) {
+                        diagnostics_.addError(node.location, "schedule sconosciuto '" + node.name +
+                                                                   "'. Schedule supportati: cosine");
                     }
                 } else if constexpr (std::is_same_v<T, ast::TrainLoraField>) {
                     ++loraCount;

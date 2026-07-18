@@ -37,6 +37,16 @@ public:
     // gestire manualmente i confini del dataset.
     [[nodiscard]] Batch batch(std::size_t startIndex, std::size_t batchSize) const;
 
+    // Rimescola l'ordine degli esempi in-place (Fisher-Yates, seminato
+    // con 'seed': stesso seme => stesso rimescolamento, riproducibile).
+    // Va chiamata all'inizio di ogni epoca con un seme diverso (es.
+    // derivato dal numero di epoca) per evitare che ogni epoca veda gli
+    // esempi sempre nello stesso ordine — importante per SGD/AdamW, che
+    // altrimenti vedrebbero sempre gli stessi batch nello stesso
+    // ordine, con lo stesso bias di conseguenza. Non fa nulla se il
+    // dataset ha 0 o 1 esempi.
+    void shuffle(unsigned int seed);
+
 private:
     std::vector<std::size_t> inputShape_;  // forma di un singolo esempio (senza dimensione di batch)
     std::vector<std::size_t> targetShape_;

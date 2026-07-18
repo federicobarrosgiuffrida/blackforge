@@ -10,6 +10,7 @@
 #include "blackforge/backend/cpu/loss.hpp"
 #include "blackforge/backend/cpu/model.hpp"
 #include "blackforge/backend/cpu/optimizer.hpp"
+#include "blackforge/backend/lr_schedule.hpp"
 #include "blackforge/data/dataset.hpp"
 
 namespace blackforge::backend::cpu {
@@ -74,6 +75,7 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
     const auto* epochsField = findField<ast::TrainEpochsField>(trainDecl->fields);
     const auto* batchSizeField = findField<ast::TrainBatchSizeField>(trainDecl->fields);
     const auto* learningRateField = findField<ast::TrainLearningRateField>(trainDecl->fields);
+    const auto* lrScheduleField = findField<ast::TrainLrScheduleField>(trainDecl->fields);
     const auto* loraField = findField<ast::TrainLoraField>(trainDecl->fields);
 
     if (modelField == nullptr || datasetField == nullptr || lossField == nullptr || optimizerField == nullptr ||
@@ -151,13 +153,26 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
         *progressOutput << "Addestramento di '" << modelIR->name << "' su " << dataset.numExamples() << " esempi ("
                          << batchesPerEpoch << " batch/epoca, batch_size=" << batchSize
                          << ", loss=" << lossField->name << ", optimizer=" << optimizerField->name
-                         << ", learning_rate=" << learningRate << ")\n";
+                         << ", learning_rate=" << learningRate
+                         << (lrScheduleField != nullptr ? " (schedule: " + lrScheduleField->name + ")" : "")
+                         << ")\n";
     }
 
     TrainRunResult result;
     result.modelName = modelIR->name;
 
     for (long long epoch = 1; epoch <= epochs; ++epoch) {
+        // Rimescola l'ordine degli esempi ad ogni epoca (seme derivato
+        // dal numero di epoca: riproducibile, ma diverso epoca per
+        // epoca) cosi' che SGD/AdamW non vedano sempre gli stessi batch
+        // nello stesso ordine.
+        dataset.shuffle(static_cast<unsigned int>(epoch));
+
+        if (lrScheduleField != nullptr) {
+            float scheduledLr = cosineAnnealingLearningRate(epoch, epochs, static_cast<float>(learningRate));
+            optimizer->setLearningRate(scheduledLr);
+        }
+
         double epochLossSum = 0.0;
         for (std::size_t b = 0; b < batchesPerEpoch; ++b) {
             data::Dataset::Batch batch = dataset.batch(b * batchSize, batchSize);

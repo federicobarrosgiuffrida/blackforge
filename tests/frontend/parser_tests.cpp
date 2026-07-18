@@ -212,6 +212,25 @@ TEST(ParserTest, ParsaTrainDeclCompleto) {
     EXPECT_DOUBLE_EQ(std::get<ast::TrainLearningRateField>(train.fields[6]).value, 0.001);
 }
 
+TEST(ParserTest, ParsaTrainDeclConLrSchedule) {
+    ParseResult result = parse(
+        "train {\n"
+        "    model TinyModel\n"
+        "    dataset MyData\n"
+        "    loss mse\n"
+        "    optimizer adamw\n"
+        "    epochs 10\n"
+        "    batch_size 32\n"
+        "    learning_rate 0.001\n"
+        "    lr_schedule cosine\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    const auto& train = std::get<ast::TrainDecl>(result.program.declarations[0]);
+    ASSERT_EQ(train.fields.size(), 8u);
+    EXPECT_EQ(std::get<ast::TrainLrScheduleField>(train.fields[7]).name, "cosine");
+}
+
 TEST(ParserTest, SegnalaErroreSuCampoDatasetSconosciuto) {
     ParseResult result = parse(
         "dataset MyData {\n"

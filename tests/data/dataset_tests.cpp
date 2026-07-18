@@ -55,6 +55,60 @@ TEST(DatasetTest, BatchAvvolgeQuandoSuperaNumExamples) {
     EXPECT_FLOAT_EQ(batch.input.at(1), 1.0F);  // esempio 0 (avvolto)
 }
 
+TEST(DatasetTest, ShuffleRiordinaGliEsempiPreservandoInputETarget) {
+    // 5 esempi, ogni input[i] == target[i] (a meno di scala): dopo lo
+    // shuffle, la corrispondenza deve restare intatta (l'esempio che
+    // finisce in una data posizione deve avere sia l'input sia il
+    // target dello STESSO esempio originale, non mescolati tra loro).
+    data::Dataset dataset({1}, {1}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F}, {10.0F, 20.0F, 30.0F, 40.0F, 50.0F}, 5);
+    dataset.shuffle(/*seed=*/42);
+
+    data::Dataset::Batch batch = dataset.batch(0, 5);
+    for (std::size_t i = 0; i < 5; ++i) {
+        EXPECT_FLOAT_EQ(batch.target.at(i), batch.input.at(i) * 10.0F) << "indice " << i;
+    }
+}
+
+TEST(DatasetTest, ShuffleCambiaDavveroLOrdine) {
+    std::vector<float> original{1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F};
+    data::Dataset dataset({1}, {1}, original, original, 8);
+    dataset.shuffle(/*seed=*/7);
+
+    data::Dataset::Batch batch = dataset.batch(0, 8);
+    bool anyDifferent = false;
+    for (std::size_t i = 0; i < 8; ++i) {
+        if (batch.input.at(i) != original[i]) {
+            anyDifferent = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(anyDifferent) << "un rimescolamento di 8 esempi con seme fisso non dovrebbe restituire "
+                                 "l'ordine originale (probabilita' trascurabile se il codice e' corretto)";
+}
+
+TEST(DatasetTest, ShuffleEDeterministaAParitaDiSeme) {
+    std::vector<float> original{1.0F, 2.0F, 3.0F, 4.0F, 5.0F};
+    data::Dataset a({1}, {1}, original, original, 5);
+    data::Dataset b({1}, {1}, original, original, 5);
+
+    a.shuffle(99);
+    b.shuffle(99);
+
+    data::Dataset::Batch batchA = a.batch(0, 5);
+    data::Dataset::Batch batchB = b.batch(0, 5);
+    for (std::size_t i = 0; i < 5; ++i) {
+        EXPECT_FLOAT_EQ(batchA.input.at(i), batchB.input.at(i)) << "indice " << i;
+    }
+}
+
+TEST(DatasetTest, ShuffleNonVaInCrashConZeroOUnEsempio) {
+    data::Dataset empty({1}, {1}, {}, {}, 0);
+    EXPECT_NO_THROW(empty.shuffle(1));
+
+    data::Dataset single({1}, {1}, {1.0F}, {10.0F}, 1);
+    EXPECT_NO_THROW(single.shuffle(1));
+}
+
 TEST(DatasetTest, SalvaERicaricaCorrettamente) {
     TempFile file("blackforge_test_dataset_roundtrip.bfdata");
 

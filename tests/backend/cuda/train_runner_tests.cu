@@ -116,6 +116,56 @@ TEST(CudaTrainRunnerTest, RiduceLaLossAttraversoLeEpoche) {
     EXPECT_LT(result.epochLosses.back(), result.epochLosses.front() * 0.1);
 }
 
+TEST(CudaTrainRunnerTest, RiduceLaLossConLrScheduleCosine) {
+    TempFile datasetFile("blackforge_cuda_test_train_dataset_lrsched.bfdata");
+    writeToyDataset(datasetFile.path);
+
+    std::string program =
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(2)\n"
+        "}\n"
+        "dataset D {\n"
+        "    path \"" +
+        toForwardSlashes(datasetFile.path) +
+        "\"\n"
+        "    input bf16[batch, 4]\n"
+        "    labels bf16[batch, 2]\n"
+        "}\n"
+        "train {\n"
+        "    model M\n"
+        "    dataset D\n"
+        "    loss mse\n"
+        "    optimizer adamw\n"
+        "    epochs 50\n"
+        "    batch_size 4\n"
+        "    learning_rate 0.3\n"
+        "    lr_schedule cosine\n"
+        "}\n";
+
+    Compiled compiled = compile(program);
+    backend::cuda::TrainRunResult result = backend::cuda::runTraining(compiled.program, compiled.module, "", "");
+
+    ASSERT_EQ(result.epochLosses.size(), 50u);
+    EXPECT_LT(result.epochLosses.back(), result.epochLosses.front());
+}
+
+TEST(CudaTrainRunnerTest, ConvergeAncheConPiuDiUnBatchPerEpocaEShufflingAttivo) {
+    TempFile datasetFile("blackforge_cuda_test_train_dataset_multibatch.bfdata");
+    writeToyDataset(datasetFile.path);
+
+    std::string program = toyProgram(datasetFile.path, /*epochs=*/50, "adamw");
+    auto pos = program.find("batch_size 4");
+    ASSERT_NE(pos, std::string::npos);
+    program.replace(pos, std::string("batch_size 4").size(), "batch_size 2");
+
+    Compiled compiled = compile(program);
+    backend::cuda::TrainRunResult result = backend::cuda::runTraining(compiled.program, compiled.module, "", "");
+
+    ASSERT_EQ(result.epochLosses.size(), 50u);
+    EXPECT_LT(result.epochLosses.back(), result.epochLosses.front() * 0.5);
+}
+
 TEST(CudaTrainRunnerTest, FunzionaAncheConSgd) {
     TempFile datasetFile("blackforge_cuda_test_train_dataset_sgd.bfdata");
     writeToyDataset(datasetFile.path);

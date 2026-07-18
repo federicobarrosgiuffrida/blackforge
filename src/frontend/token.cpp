@@ -33,6 +33,7 @@ std::string tokenKindName(TokenKind kind) {
         case TokenKind::KwEpochs: return "'epochs'";
         case TokenKind::KwBatchSize: return "'batch_size'";
         case TokenKind::KwLearningRate: return "'learning_rate'";
+        case TokenKind::KwLrSchedule: return "'lr_schedule'";
         case TokenKind::KwRank: return "'rank'";
         case TokenKind::KwAlpha: return "'alpha'";
         case TokenKind::KwHorizon: return "'horizon'";
