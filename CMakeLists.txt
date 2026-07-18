@@ -84,6 +84,8 @@ if(BLACKFORGE_ENABLE_CUDA)
             STATUS
             "CUDA architectures: ${BLACKFORGE_CUDA_ARCHITECTURES}"
         )
+
+        find_package(CUDAToolkit REQUIRED)
     else()
         message(
             WARNING
@@ -124,8 +126,16 @@ set(
     src/backend/cpu/checkpoint.cpp
 )
 
-# I sorgenti del backend CUDA (kernels/, src/backend/cuda/) verranno
-# aggiunti a questa lista nella milestone dedicata al backend CUDA.
+if(BLACKFORGE_ENABLE_CUDA)
+    list(
+        APPEND BLACKFORGE_CORE_SOURCES
+        src/backend/cuda/device_tensor.cu
+        src/backend/cuda/ops_elementwise.cu
+        src/backend/cuda/ops_gemm.cu
+        src/backend/cuda/executor.cu
+        src/backend/cuda/device_query.cu
+    )
+endif()
 
 add_library(
     blackforge_core
@@ -160,6 +170,13 @@ if(BLACKFORGE_ENABLE_CUDA)
         blackforge_core
         PUBLIC
             BLACKFORGE_HAS_CUDA=1
+    )
+
+    target_link_libraries(
+        blackforge_core
+        PUBLIC
+            CUDA::cudart
+            CUDA::cublas
     )
 else()
     target_compile_definitions(

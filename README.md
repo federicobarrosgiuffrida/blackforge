@@ -47,9 +47,12 @@ del codice in questo repository, non obiettivi futuri.
 | Optimizer (SGD, AdamW) | ✅ Entrambi implementati e testati (incl. weight decay disaccoppiato di AdamW) |
 | Checkpoint (salvataggio/caricamento pesi) | ✅ Formato binario proprietario BlackForge, con round-trip testato |
 | Pass manager / ottimizzazioni (fusione, dead code elimination) | ⏳ Pianificato (ancora rimandato: nessuna ottimizzazione genuina applicabile con l'attuale insieme di operazioni) |
-| Backend CUDA | ⏳ Pianificato |
-| Supporto Blackwell / Tensor Core | ⏳ Pianificato |
-| Precisioni FP8 (e4m3/e5m2), FP16, BF16, TF32, FP32 | 🟡 Riconosciute e validate; il backend CPU calcola sempre in fp32 come riferimento (nessuna emulazione di precisione ridotta ancora) |
+| Backend CUDA (tensori device, add/addBias/matmul via cuBLAS/silu/relu/gelu, esecuzione) | ✅ Implementato e testato su GPU reale (RTX 5060, sm_120) per le operazioni attualmente nel linguaggio |
+| Rilevamento GPU (`blackforge devices`) | ✅ Elenca le GPU NVIDIA visibili tramite il driver CUDA |
+| Selezione dispositivo (`blackforge run --device cpu\|cuda`) | ✅ Implementata |
+| Tensor Core / precisioni FP8/BF16/TF32 reali su GPU | ⏳ Pianificato — il backend CUDA oggi calcola in float32 (SGEMM), come il backend CPU: nessun uso di Tensor Core o dei formati ridotti come precisione di calcolo reale ancora |
+| Supporto multi-architettura CUDA oltre Blackwell (sm_120) | ⏳ Non testato: il progetto compila solo per l'architettura configurata in `BLACKFORGE_CUDA_ARCHITECTURES` |
+| Precisioni FP8 (e4m3/e5m2), FP16, BF16, TF32, FP32 | 🟡 Riconosciute e validate nel linguaggio; sia il backend CPU sia quello CUDA calcolano sempre in float32 come riferimento (nessuna emulazione/uso reale dei formati ridotti ancora) |
 | Pretraining / fine-tuning / LoRA | ⏳ Pianificato |
 | Forecasting | ⏳ Pianificato |
 | Benchmark / profiling | ⏳ Pianificato |
@@ -60,20 +63,48 @@ Legenda: ✅ completato · 🟡 parzialmente implementato · ⏳ pianificato.
 ## Dipendenze
 
 - CMake >= 3.24
-- Compilatore C++23 (testato con GCC 15 / MinGW su Windows)
+- Un compilatore C++23: testato con **GCC 15 / MinGW** (build CPU-only)
+  e con **MSVC** (build con CUDA — richiesto da `nvcc` su Windows, vedi
+  nota sotto)
 - Git
-- Facoltativo: CUDA Toolkit (per il futuro backend GPU). Il progetto è
-  progettato per compilare anche senza CUDA installato.
+- Facoltativo: CUDA Toolkit + una GPU NVIDIA, per il backend CUDA. Il
+  progetto compila ed è pienamente funzionante anche senza CUDA
+  installato (backend CPU di riferimento).
 - I test usano [GoogleTest](https://github.com/google/googletest),
   scaricato automaticamente da CMake (`FetchContent`) quando i test sono
   abilitati.
 
 ## Compilazione
 
+### Build CPU-only (nessuna GPU richiesta)
+
+Qualsiasi compilatore C++23 va bene (es. GCC/MinGW):
+
 ```bash
-cmake -S . -B build -DBLACKFORGE_BUILD_TESTS=ON
+cmake -S . -B build -DBLACKFORGE_BUILD_TESTS=ON -DBLACKFORGE_ENABLE_CUDA=OFF
 cmake --build build
 ```
+
+### Build con backend CUDA (richiede MSVC + nvcc, testata su Windows)
+
+> **Nota Windows/CUDA**: su Windows `nvcc` richiede **MSVC** (`cl.exe`)
+> come host compiler — un toolchain MinGW/GCC non basta, e va usato per
+> *l'intero* progetto quando CUDA è abilitato (non si possono linkare
+> insieme oggetti compilati da MinGW e da MSVC/nvcc: hanno ABI C++
+> incompatibili). Se hai installato Visual Studio (anche solo i Build
+> Tools) con il carico di lavoro "Sviluppo Desktop in C++", apri un
+> **Developer Command Prompt for VS** (o esegui `vcvarsall.bat x64`) e
+> compila da lì con un generatore che usa `cl.exe`, ad esempio:
+>
+> ```bat
+> "C:\Program Files\Microsoft Visual Studio\<versione>\<edizione>\VC\Auxiliary\Build\vcvarsall.bat" x64
+> cmake -S . -B build_cuda -G "NMake Makefiles" -DBLACKFORGE_BUILD_TESTS=ON -DBLACKFORGE_ENABLE_CUDA=ON
+> cmake --build build_cuda
+> ```
+>
+> Il backend CUDA di questo repository è stato compilato **e testato su
+> GPU reale** (NVIDIA GeForce RTX 5060, architettura Blackwell/sm_120)
+> con questa esatta procedura.
 
 Opzioni CMake principali:
 
@@ -83,11 +114,6 @@ Opzioni CMake principali:
 | `BLACKFORGE_BUILD_TESTS` | `OFF` | Compila la suite di test (GoogleTest) |
 | `BLACKFORGE_ENABLE_WARNINGS` | `ON` | Abilita warning stretti del compilatore |
 | `BLACKFORGE_CUDA_ARCHITECTURES` | `120` | Architetture CUDA target (120 = Blackwell consumer, es. RTX 50xx) |
-
-> **Nota Windows/CUDA**: su Windows `nvcc` richiede MSVC (`cl.exe`) come
-> host compiler. Se è installato solo un toolchain MinGW/GCC, il backend
-> CUDA non compilerà finché non viene installato Visual Studio Build
-> Tools con i componenti C++.
 
 > **Nota Windows/Controlled Folder Access**: se il repository si trova
 > dentro una cartella protetta da Windows (es. `Documents`, con la
@@ -116,8 +142,10 @@ blackforge check <file.bf>              # analizza il file e riporta gli errori
 blackforge check <file.bf> --verbose    # mostra anche i token riconosciuti
 blackforge check <file.bf> --print-ast  # mostra l'AST prodotto dal parser
 blackforge check <file.bf> --print-ir   # mostra la rappresentazione interna (IR)
-blackforge run <file.bf>                # esegue il primo modello sul backend CPU (batch=1)
+blackforge run <file.bf>                # esegue il primo modello su CPU (batch=1)
 blackforge run <file.bf> --batch 8      # come sopra, con batch size esplicito
+blackforge run <file.bf> --device cuda  # esegue sulla GPU (richiede una build con CUDA)
+blackforge devices                      # elenca i dispositivi disponibili (CPU e GPU CUDA rilevate)
 blackforge --version
 blackforge --help
 ```
@@ -127,10 +155,12 @@ input sintetico (deterministico, non un dataset reale) e pesi generati
 in modo deterministico ma statisticamente arbitrario (non Xavier/Kaiming,
 non caricati da checkpoint): serve a dimostrare che l'intera catena
 letto→validato→compilato→eseguito funziona, non a produrre un modello
-utile. I comandi `build`, `train`, `benchmark`, `inspect` descritti
-nella visione del progetto non sono ancora implementati e verranno
-aggiunti man mano che le fasi corrispondenti (autodiff, training,
-backend CUDA) saranno pronte.
+utile. A parità di seme, `--device cpu` e `--device cuda` usano
+esattamente gli stessi pesi iniziali e producono lo stesso risultato
+(verificato nei test di parità CPU/GPU). I comandi `build`, `train`,
+`benchmark`, `inspect` descritti nella visione del progetto non sono
+ancora implementati e verranno aggiunti man mano che le fasi
+corrispondenti (training, benchmark) saranno pronte.
 
 ## Esempi
 
@@ -143,11 +173,12 @@ backend CUDA) saranno pronte.
 
 ```
 include/blackforge/   Header pubblici (namespace blackforge)
-src/                   Implementazione del compilatore e del runtime
-tests/                 Test automatici (GoogleTest)
+  backend/cpu/          Backend CPU di riferimento (tensori, ops, autodiff, optimizer, checkpoint)
+  backend/cuda/          Backend CUDA (compilato solo con BLACKFORGE_ENABLE_CUDA=ON)
+src/                   Implementazione del compilatore e del runtime (stessa struttura di include/)
+tests/                 Test automatici (GoogleTest; tests/backend/cuda/ solo con CUDA abilitato)
 examples/              Programmi .bf di esempio
 docs/                  Documentazione del linguaggio
-kernels/               Kernel CUDA (verranno aggiunti con il backend GPU)
 ```
 
 ## Licenza
@@ -162,7 +193,7 @@ PolyForm Noncommercial License 1.0.0 — vedi [LICENSE.md](LICENSE.md).
 4. ✅ Rappresentazione interna (IR): valori, operazioni, inferenza di forma
 5. ✅ Backend CPU di riferimento: tensori, elementwise, matmul, layer lineari, attivazioni, esecuzione (`blackforge run`)
 6. ✅ Autodiff, loss (MSE), optimizer (SGD, AdamW), checkpoint su CPU
-7. Backend CUDA (kernel, Tensor Core, Blackwell)
+7. ✅ Backend CUDA: tensori device, add/addBias/matmul (cuBLAS)/silu/relu/gelu, esecuzione (`blackforge run --device cuda`), rilevamento GPU (`blackforge devices`) — testato su GPU reale. Tensor Core e precisioni ridotte reali (fp8/bf16/tf32) restano lavoro futuro.
 8. Training, fine-tuning, LoRA, forecasting
 9. Benchmark, profiling, CLI completa, documentazione finale
 

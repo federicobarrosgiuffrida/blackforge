@@ -13,6 +13,19 @@ namespace {
 
 constexpr char kMagic[8] = {'B', 'F', 'C', 'K', 'P', 'T', '1', '\0'};
 
+// Wrapper portabile su strerror: MSVC considera 'strerror' deprecata a
+// favore di 'strerror_s' (thread-safe), GCC/Clang non hanno
+// 'strerror_s' in modo standard.
+std::string describeErrno(int code) {
+#if defined(_MSC_VER)
+    char buffer[256];
+    strerror_s(buffer, sizeof(buffer), code);
+    return buffer;
+#else
+    return std::strerror(code);
+#endif
+}
+
 void writeU32(std::ostream& out, std::uint32_t value) { out.write(reinterpret_cast<const char*>(&value), sizeof(value)); }
 
 void writeU64(std::ostream& out, std::uint64_t value) { out.write(reinterpret_cast<const char*>(&value), sizeof(value)); }
@@ -49,7 +62,7 @@ void saveCheckpoint(Model& model, const std::string& path) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) {
         throw std::runtime_error("saveCheckpoint: impossibile scrivere il file '" + path +
-                                  "' (errno=" + std::to_string(errno) + " " + std::strerror(errno) + ")");
+                                  "' (errno=" + std::to_string(errno) + " " + describeErrno(errno) + ")");
     }
 
     out.write(kMagic, sizeof(kMagic));

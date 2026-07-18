@@ -16,13 +16,19 @@
 #include "blackforge/runtime/tensor.hpp"
 #include "blackforge/sema/semantic_analyzer.hpp"
 
+#if BLACKFORGE_HAS_CUDA
+#include "blackforge/backend/cuda/device_query.hpp"
+#include "blackforge/backend/cuda/executor.hpp"
+#endif
+
 namespace {
 
 void printUsage() {
     std::cout << "Uso: blackforge <comando> [opzioni] <file.bf>\n\n"
               << "Comandi:\n"
               << "  check <file>       Analizza il file e riporta gli errori (lessicali, sintattici, semantici)\n"
-              << "  run <file>         Esegue il primo modello del file sul backend CPU di riferimento\n"
+              << "  run <file>         Esegue il primo modello del file\n"
+              << "  devices            Elenca i dispositivi di calcolo disponibili (CPU e GPU CUDA)\n"
               << "  --help, -h         Mostra questo messaggio\n"
               << "  --version, -v      Mostra la versione del compilatore\n\n"
               << "Opzioni:\n"
@@ -30,7 +36,27 @@ void printUsage() {
               << "  --print-ast        Mostra l'albero sintattico (AST) prodotto dal parser (solo 'check')\n"
               << "  --print-ir         Mostra la rappresentazione interna (IR) del programma (solo 'check')\n"
               << "  --batch N          Dimensione di batch usata per risolvere le dimensioni simboliche "
-                 "dell'input (solo 'run', default 1)\n";
+                 "dell'input (solo 'run', default 1)\n"
+              << "  --device cpu|cuda  Dispositivo su cui eseguire (solo 'run', default cpu)\n";
+}
+
+void printDevices() {
+    std::cout << "cpu: sempre disponibile (backend di riferimento)\n";
+
+#if BLACKFORGE_HAS_CUDA
+    auto devices = blackforge::backend::cuda::enumerateDevices();
+    if (devices.empty()) {
+        std::cout << "cuda: nessuna GPU NVIDIA rilevata (compilato con supporto CUDA, ma nessun dispositivo "
+                     "visibile al driver)\n";
+    }
+    for (const auto& device : devices) {
+        std::cout << "cuda:" << device.index << ": " << device.name << " (compute capability "
+                   << device.computeCapabilityMajor << "." << device.computeCapabilityMinor << ", "
+                   << (device.totalMemoryBytes / (1024ULL * 1024ULL)) << " MiB)\n";
+    }
+#else
+    std::cout << "cuda: non disponibile (questa build e' stata compilata senza supporto CUDA)\n";
+#endif
 }
 
 void printVersion() { std::cout << "blackforge " << BLACKFORGE_VERSION << "\n"; }
@@ -145,7 +171,18 @@ int runCheck(const std::string& path, bool verbose, bool printAst, bool printIr)
     return 1;
 }
 
-int runRun(const std::string& path, std::size_t batchSize) {
+int runRun(const std::string& path, std::size_t batchSize, const std::string& device) {
+    if (device != "cpu" && device != "cuda") {
+        std::cerr << "errore: dispositivo sconosciuto '" << device << "' (valori validi: cpu, cuda)\n";
+        return 2;
+    }
+
+    if (device == "cuda" && !BLACKFORGE_HAS_CUDA) {
+        std::cerr << "errore: '--device cuda' richiesto ma questa build di blackforge e' stata compilata senza "
+                     "supporto CUDA (BLACKFORGE_ENABLE_CUDA=OFF in fase di compilazione)\n";
+        return 1;
+    }
+
     CompileOutput result = compile(path, /*verbose=*/false, /*printAst=*/false, /*printIr=*/false);
 
     if (result.status == CompileStatus::FileNotFound) {
@@ -162,18 +199,28 @@ int runRun(const std::string& path, std::size_t batchSize) {
 
     const blackforge::ir::ModelIR& model = result.module.models.front();
 
-    if (result.module.target.has_value() && *result.module.target != "cpu") {
+    if (device == "cpu" && result.module.target.has_value() && *result.module.target != "cpu") {
         std::cout << "nota: target dichiarato '" << *result.module.target
-                   << "', ma il backend CUDA non e' ancora implementato: eseguo sul backend CPU di riferimento\n";
+                   << "'; sto eseguendo su CPU. Usa '--device cuda' per eseguire sulla GPU (se disponibile).\n";
     }
 
     try {
-        blackforge::backend::cpu::Executor executor;
-        blackforge::runtime::Tensor input =
-            executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
-        blackforge::runtime::Tensor output = executor.run(model, input);
+        blackforge::runtime::Tensor input;
+        blackforge::runtime::Tensor output;
 
-        std::cout << "Eseguito modello '" << model.name << "' sul backend CPU di riferimento\n";
+        if (device == "cpu") {
+            blackforge::backend::cpu::Executor executor;
+            input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
+            output = executor.run(model, input);
+        } else {
+#if BLACKFORGE_HAS_CUDA
+            blackforge::backend::cuda::Executor executor;
+            input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
+            output = executor.run(model, input);
+#endif
+        }
+
+        std::cout << "Eseguito modello '" << model.name << "' sul backend " << device << "\n";
         std::cout << "  input:  " << input.shapeToString() << "\n";
         std::cout << "  output: " << output.shapeToString() << "  min=" << output.min() << " max=" << output.max()
                    << " mean=" << output.mean() << "\n";
@@ -199,6 +246,7 @@ int main(int argc, char** argv) {
     bool printAst = false;
     bool printIr = false;
     std::size_t batchSize = 1;
+    std::string device = "cpu";
     std::vector<std::string> positional;
     std::string command = args.front();
 
@@ -219,6 +267,12 @@ int main(int argc, char** argv) {
                 std::cerr << "errore: '--batch' richiede un intero positivo\n";
                 return 2;
             }
+        } else if (args[i] == "--device") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--device' richiede un valore (cpu o cuda)\n";
+                return 2;
+            }
+            device = args[++i];
         } else {
             positional.push_back(args[i]);
         }
@@ -244,7 +298,11 @@ int main(int argc, char** argv) {
             std::cerr << "errore: comando 'run' richiede il percorso di un file .bf\n";
             return 2;
         }
-        return runRun(positional.front(), batchSize);
+        return runRun(positional.front(), batchSize, device);
+    }
+    if (command == "devices") {
+        printDevices();
+        return 0;
     }
 
     std::cerr << "errore: comando sconosciuto '" << command << "'\n";

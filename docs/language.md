@@ -227,3 +227,68 @@ Limitazione esplicita: l'inizializzazione dei pesi resta deterministica
 ma non statisticamente valida (niente Xavier/Kaiming). Una strategia di
 inizializzazione seria è lavoro futuro, cosi' come il caricamento di
 pesi pre-allenati esterni.
+
+## Backend CUDA
+
+`blackforge::backend::cuda` implementa, sulla GPU, le stesse operazioni
+del backend CPU di riferimento — compilato solo quando
+`BLACKFORGE_ENABLE_CUDA=ON` e testato su hardware reale (NVIDIA GeForce
+RTX 5060, Blackwell/sm_120):
+
+- **`DeviceTensor`**: tensore RAII in memoria device (`cudaMalloc`/
+  `cudaFree`), con `fromHost`/`toHost` per il trasferimento da/verso
+  `runtime::Tensor`. Non copiabile (evita doppie `cudaFree`),
+  spostabile.
+- **Operazioni** (`blackforge/backend/cuda/ops.hpp`): `add`, `addBias`,
+  `silu`, `relu`, `gelu` come kernel CUDA scritti a mano (un thread per
+  elemento); `matmul` tramite **cuBLAS** (`cublasSgemm`), non un kernel
+  scritto a mano — per un'operazione critica per le prestazioni come il
+  prodotto matriciale, usare una libreria NVIDIA ufficiale è più
+  affidabile e performante di reinventarla, come indicato negli
+  obiettivi del progetto. `linear = addBias(matmul(...))`, come su CPU.
+- **`Executor`** (in `blackforge::backend::cuda`, da non confondere con
+  `blackforge::backend::cpu::Executor`): stessa interfaccia della
+  controparte CPU, stessa inizializzazione dei pesi a parità di seme —
+  cosa che permette di verificare la correttezza del backend GPU
+  confrontandolo direttamente con quello CPU (vedi i test di parità in
+  `tests/backend/cuda/executor_tests.cu`).
+- **`enumerateDevices()`**: elenca le GPU NVIDIA visibili al driver
+  (nome, compute capability, memoria totale), usato da
+  `blackforge devices`. Restituisce un elenco vuoto (non lancia
+  eccezioni) se non ci sono GPU: l'assenza di hardware CUDA è un esito
+  normale del rilevamento, non un errore.
+
+### Uso dalla CLI
+
+```bash
+blackforge devices                      # elenca CPU e le eventuali GPU CUDA rilevate
+blackforge run modello.bf --device cuda # esegue sulla GPU invece che sulla CPU
+```
+
+### Nota sulla trasposizione per cuBLAS
+
+cuBLAS lavora in column-major, mentre i tensori di BlackForge sono
+memorizzati row-major. Il codice sfrutta il fatto che un buffer
+row-major `[r, c]` è, byte per byte, identico alla sua trasposta
+column-major `[c, r]`: per calcolare `C = A @ B` (row-major) si chiede
+a cuBLAS di calcolare `C^T = B^T @ A^T` (column-major) sugli stessi
+buffer, scambiando l'ordine degli operandi e le dimensioni `m`/`n`. È
+la tecnica standard per usare cuBLAS con dati row-major; è verificata
+nei test confrontando il risultato con il backend CPU su matrici non
+quadrate (dove uno scambio errato di `m`/`n` produrrebbe una forma o
+dei valori visibilmente sbagliati).
+
+### Limitazioni esplicite
+
+- Come il backend CPU, calcola sempre in **float32**: nessun uso reale
+  di FP8/BF16/TF32 come precisione di calcolo, nessun uso dei Tensor
+  Core. Il linguaggio riconosce e valida questi formati, ma
+  l'esecuzione GPU non li sfrutta ancora — è il prossimo passo naturale
+  per un backend Blackwell.
+- Un nuovo handle cuBLAS viene creato e distrutto ad ogni chiamata a
+  `matmul`: corretto ma non ottimale; il riuso di un handle persistente
+  è un'ottimizzazione futura a basso rischio.
+- Nessun supporto multi-GPU, stream CUDA o esecuzione asincrona ancora.
+- Testato solo per l'architettura configurata in
+  `BLACKFORGE_CUDA_ARCHITECTURES` (120, Blackwell consumer); altre
+  architetture non sono state verificate.

@@ -29,6 +29,15 @@ set(
     backend/cpu/checkpoint_tests.cpp
 )
 
+if(BLACKFORGE_ENABLE_CUDA)
+    list(
+        APPEND BLACKFORGE_TEST_SOURCES
+        backend/cuda/ops_tests.cu
+        backend/cuda/executor_tests.cu
+        backend/cuda/device_query_tests.cu
+    )
+endif()
+
 add_executable(
     blackforge_tests
     ${BLACKFORGE_TEST_SOURCES}
