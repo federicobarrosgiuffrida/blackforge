@@ -3,6 +3,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "blackforge/backend/cuda/attention_batched.hpp"
 #include "blackforge/backend/cuda/cuda_check.hpp"
 #include "blackforge/backend/cuda/ops.hpp"
 
@@ -220,96 +221,6 @@ __global__ void softmaxBackwardKernel(float* out, const float* y, const float* g
     for (std::size_t col = threadIdx.x; col < features; col += blockDim.x) {
         rowOut[col] = rowY[col] * (rowGrad[col] - weightedSum);
     }
-}
-
-// Duplicati deliberatamente da ops_transformer.cu (namespace anonimo
-// li' come qui, quindi non condivisibili tra le due unita' di
-// traduzione senza un header): helper interni piccoli, stessa scelta
-// gia' fatta per la controparte CPU (src/backend/cpu/autodiff.cpp).
-__global__ void extractHeadKernel(float* out, const float* full, std::size_t b, std::size_t h, std::size_t seq,
-                                   std::size_t dim, std::size_t headDim) {
-    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    std::size_t total = seq * headDim;
-    if (idx >= total) {
-        return;
-    }
-    std::size_t s = idx / headDim;
-    std::size_t d = idx % headDim;
-    out[idx] = full[(b * seq + s) * dim + h * headDim + d];
-}
-
-__global__ void scatterHeadKernel(float* full, const float* headSlice, std::size_t b, std::size_t h,
-                                   std::size_t seq, std::size_t dim, std::size_t headDim) {
-    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    std::size_t total = seq * headDim;
-    if (idx >= total) {
-        return;
-    }
-    std::size_t s = idx / headDim;
-    std::size_t d = idx % headDim;
-    full[(b * seq + s) * dim + h * headDim + d] = headSlice[idx];
-}
-
-__global__ void applyCausalMaskKernel(float* scores, std::size_t seq) {
-    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    std::size_t total = seq * seq;
-    if (idx >= total) {
-        return;
-    }
-    std::size_t i = idx / seq;
-    std::size_t j = idx % seq;
-    if (j > i) {
-        scores[idx] = -INFINITY;
-    }
-}
-
-DeviceTensor extractHead(const DeviceTensor& full, std::size_t b, std::size_t h, std::size_t seq, std::size_t dim,
-                          std::size_t headDim) {
-    DeviceTensor result({seq, headDim});
-    std::size_t total = seq * headDim;
-    if (total > 0) {
-        extractHeadKernel<<<gridSizeFor(total), kBlockSize>>>(result.data(), full.data(), b, h, seq, dim, headDim);
-        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
-    }
-    return result;
-}
-
-void scatterHead(DeviceTensor& full, const DeviceTensor& headSlice, std::size_t b, std::size_t h, std::size_t seq,
-                  std::size_t dim, std::size_t headDim) {
-    std::size_t total = seq * headDim;
-    if (total > 0) {
-        scatterHeadKernel<<<gridSizeFor(total), kBlockSize>>>(full.data(), headSlice.data(), b, h, seq, dim,
-                                                               headDim);
-        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
-    }
-}
-
-DeviceTensor applyCausalMask(const DeviceTensor& scores) {
-    DeviceTensor result = scores.clone();
-    std::size_t seq = result.dim(0);
-    std::size_t total = seq * seq;
-    if (total > 0) {
-        applyCausalMaskKernel<<<gridSizeFor(total), kBlockSize>>>(result.data(), seq);
-        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
-    }
-    return result;
-}
-
-__global__ void scaleKernel(float* out, const float* input, float factor, std::size_t n) {
-    std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = input[i] * factor;
-    }
-}
-
-DeviceTensor scale(const DeviceTensor& input, float factor) {
-    DeviceTensor result(input.shape());
-    std::size_t n = input.elementCount();
-    if (n > 0) {
-        scaleKernel<<<gridSizeFor(n), kBlockSize>>>(result.data(), input.data(), factor, n);
-        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
-    }
-    return result;
 }
 
 // Appiattisce un tensore device a rango >= 2 a [rows, features] (stesso
@@ -640,81 +551,48 @@ SelfAttentionGrad selfAttentionBackward(const DeviceTensor& input, const DeviceT
     std::size_t headDim = dim / numHeads;
     float scaleFactor = 1.0F / std::sqrt(static_cast<float>(headDim));
 
-    // Ricalcola lo stesso forward di ops_transformer.cu/selfAttention
-    // (normed, Q/K/V, score mascherati per ogni testa, concatenazione):
-    // serve per ricostruire tutti gli stati intermedi di cui il
-    // backward ha bisogno. normedFlat e' riusato (const&, ne'
+    // Ricalcola lo stesso forward BATCHIZZATO di ops_transformer.cu/
+    // selfAttention (vedi attention_batched.hpp per il perche': un
+    // singolo kernel per Q@K^T/maschera/probs@V su TUTTE le
+    // combinazioni (batch,testa), non un loop host-side con un lancio
+    // di kernel per combinazione). normedFlat e' riusato (const&, ne'
     // matmul() ne' matmulBackward() lo consumano) sia qui sia nel
-    // backward delle proiezioni Q/K/V piu' sotto: una sola clone()
-    // invece di sei.
+    // backward delle proiezioni Q/K/V piu' sotto.
     DeviceTensor normed = rmsnorm(input);
     DeviceTensor normedFlat = flatten2D(normed);
     DeviceTensor q = matmul(normedFlat, wq).reshaped({batch, seq, dim});
     DeviceTensor k = matmul(normedFlat, wk).reshaped({batch, seq, dim});
     DeviceTensor v = matmul(normedFlat, wv).reshaped({batch, seq, dim});
 
-    DeviceTensor concatenated = DeviceTensor::zeros({batch, seq, dim});
-    // Cachati per il backward: per ogni (b,h), gli score mascherati
-    // (pre-softmax) e Q/K/V della testa.
-    std::vector<DeviceTensor> maskedScoresPerHead(batch * numHeads);
-    std::vector<DeviceTensor> qHeadPerHead(batch * numHeads);
-    std::vector<DeviceTensor> kHeadPerHead(batch * numHeads);
-    std::vector<DeviceTensor> vHeadPerHead(batch * numHeads);
-
-    for (std::size_t b = 0; b < batch; ++b) {
-        for (std::size_t h = 0; h < numHeads; ++h) {
-            std::size_t idx = b * numHeads + h;
-            DeviceTensor qHead = extractHead(q, b, h, seq, dim, headDim);
-            DeviceTensor kHead = extractHead(k, b, h, seq, dim, headDim);
-            DeviceTensor vHead = extractHead(v, b, h, seq, dim, headDim);
-
-            DeviceTensor scores = scale(matmulTransposeB(qHead, kHead), scaleFactor);
-            DeviceTensor maskedScores = applyCausalMask(scores);
-            DeviceTensor probs = softmax(maskedScores);
-            DeviceTensor headOut = matmul(probs, vHead);
-
-            scatterHead(concatenated, headOut, b, h, seq, dim, headDim);
-
-            maskedScoresPerHead[idx] = std::move(maskedScores);
-            qHeadPerHead[idx] = std::move(qHead);
-            kHeadPerHead[idx] = std::move(kHead);
-            vHeadPerHead[idx] = std::move(vHead);
-        }
-    }
+    DeviceTensor scores = batchedQK(q, k, numHeads, scaleFactor);
+    DeviceTensor maskedScores = batchedMask(scores, /*oldLen=*/0);
+    DeviceTensor probs = softmax(maskedScores);
+    DeviceTensor concatenated = batchedPV(probs, v, numHeads);
 
     // --- backward attraverso la proiezione Wout ---
     MatmulGrad woutGrad = matmulBackward(flatten2D(concatenated), wout, flatten2D(gradOutput));
     DeviceTensor dConcatenated = std::move(woutGrad.dA).reshaped({batch, seq, dim});
 
-    // --- backward per ogni testa, accumulando dQ/dK/dV su tutto il tensore ---
-    DeviceTensor dQ = DeviceTensor::zeros({batch, seq, dim});
-    DeviceTensor dK = DeviceTensor::zeros({batch, seq, dim});
-    DeviceTensor dV = DeviceTensor::zeros({batch, seq, dim});
+    // --- backward attraverso probs@V (batchizzato) ---
+    BatchedPVGrad pvGrad = batchedPVBackward(dConcatenated, probs, v, numHeads);
+    // pvGrad.dProbs, pvGrad.dV
 
-    for (std::size_t b = 0; b < batch; ++b) {
-        for (std::size_t h = 0; h < numHeads; ++h) {
-            std::size_t idx = b * numHeads + h;
-            DeviceTensor dHeadOut = extractHead(dConcatenated, b, h, seq, dim, headDim);
+    // --- backward attraverso softmax ---
+    DeviceTensor dMaskedScores = softmaxBackward(maskedScores, pvGrad.dProbs);
+    // La maschera causale non richiede un passaggio di backward
+    // dedicato: le posizioni mascherate hanno probs == 0, quindi la
+    // formula di softmaxBackward da' loro gradiente esattamente zero
+    // (coerente con il non aver partecipato al forward).
 
-            DeviceTensor probs = softmax(maskedScoresPerHead[idx]);
-            MatmulGrad pvGrad = matmulBackward(probs, vHeadPerHead[idx], dHeadOut);
-            // pvGrad.dA = dProbs, pvGrad.dB = dVHead
+    // --- backward attraverso Q@K^T (batchizzato): il fattore di scala
+    // e' gia' applicato dentro batchedQKBackward (coerente con
+    // batchedQK, che lo applica nello stesso kernel del prodotto,
+    // invece di un passaggio scale() separato) ---
+    BatchedQKGrad qkGrad = batchedQKBackward(dMaskedScores, q, k, numHeads, scaleFactor);
 
-            DeviceTensor dMaskedScores = softmaxBackward(maskedScoresPerHead[idx], pvGrad.dA);
-            // La maschera causale non richiede un passaggio di backward
-            // dedicato: le posizioni mascherate hanno probs == 0, quindi
-            // la formula di softmaxBackward da' loro gradiente
-            // esattamente zero (coerente con il non aver partecipato al
-            // forward).
-            DeviceTensor dScores = scale(dMaskedScores, scaleFactor);
-
-            MatmulTransposeBGrad qkGrad = matmulTransposeBBackward(qHeadPerHead[idx], kHeadPerHead[idx], dScores);
-
-            scatterHead(dQ, qkGrad.dA, b, h, seq, dim, headDim);
-            scatterHead(dK, qkGrad.dB, b, h, seq, dim, headDim);
-            scatterHead(dV, pvGrad.dB, b, h, seq, dim, headDim);
-        }
-    }
+    DeviceTensor dQ = std::move(qkGrad.dQ);
+    DeviceTensor dK = std::move(qkGrad.dK);
+    DeviceTensor dV = std::move(pvGrad.dV);
 
     // --- backward attraverso le proiezioni Q/K/V ---
     MatmulGrad qBackward = matmulBackward(normedFlat, wq, flatten2D(dQ));
