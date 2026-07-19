@@ -528,8 +528,10 @@ Allenare un modello reale (~23M parametri, `TinyStories`, `batch_size
 ma mai ottimizzata per throughput — risultava stimato in **ore** per
 un addestramento completo. Tre interventi mirati, ciascuno verificato
 con l'intera suite di test prima di passare al successivo, hanno
-ridotto il tempo per step di **circa 7-8 volte** (misurato: 150 step a
-`batch_size 8` da 73,9s a 9,5s):
+ridotto il tempo per step di **circa 8-9 volte** (misurato su un
+benchmark a regime, 1000 step a `batch_size 8`: ~45ms/step iniziali
+stimati oltre 400ms/step, scesi a ~45ms/step dopo tutti e quattro gli
+interventi):
 
 1. **Pool di memoria device per-device** (`device_pool.hpp`/`.cu`):
    quasi ogni operazione allocava un `DeviceTensor` intermedio con
@@ -541,28 +543,64 @@ ridotto il tempo per step di **circa 7-8 volte** (misurato: 150 step a
    richiesta della stessa dimensione sullo stesso device, invece di
    tornare al driver. Guadagno modesto da solo (~20%): non era il collo
    di bottiglia dominante.
-2. **Attention batchizzata** (`attention_batched.hpp`/`.cu`):
+2. **Attention batchizzata** (superata dal punto 4, vedi sotto):
    `selfAttention`/`selfAttentionIncremental`/`selfAttentionBackward`
    calcolavano Q@K^T/maschera/softmax/probs@V con un doppio loop
    host-side `for batch: for testa:`, lanciando ~9 kernel separati per
    OGNI combinazione (batch,testa) — con `batch_size=8` e 8 teste, 64
-   iterazioni per singolo layer. Sostituito con `batchedQK`/
-   `batchedMask`/`batchedPV` (e le loro controparti di backward), un
-   kernel ciascuno per TUTTE le combinazioni, indicizzazione strided
-   diretta sul layout `[batch,seq,dim]`. Guadagno reale ma anch'esso
-   modesto (~20-25%): misurato che il collo di bottiglia dominante non
-   era il numero di lanci di kernel.
+   iterazioni per singolo layer. Sostituito temporaneamente con
+   `batchedQK`/`batchedMask`/`batchedPV`, un kernel ciascuno per TUTTE
+   le combinazioni. Guadagno reale ma modesto (~20-25%): misurato che
+   il collo di bottiglia dominante non era il numero di lanci di
+   kernel — comunque materializzava l'intera matrice di score
+   `[batch,numHeads,seq,seq]` in memoria globale, poi sostituito dal
+   nucleo fuso del punto 4.
 3. **Tensor Core BF16 esteso ad attention/feedforward** (vedi sopra):
    le proiezioni Q/K/V/Out/W1/W2 giravano ancora in FP32 su cuBLAS
    classico. Estendere `matmulBf16` anche lì (non solo a `linear`) ha
-   dato il guadagno decisivo — conferma che il collo di bottiglia
-   dominante era il calcolo stesso, non l'allocazione né il numero di
-   lanci di kernel.
+   dato un guadagno molto piu' significativo dei primi due — conferma
+   che il collo di bottiglia dominante era il calcolo stesso, non
+   l'allocazione né il numero di lanci di kernel.
+4. **Attention fusa a online softmax** (`fused_attention.hpp`/`.cu`,
+   stile FlashAttention): un confronto diretto contro un modello
+   PyTorch identico (stessi 23.152.640 parametri, stesso hardware,
+   `torch.nn.functional.scaled_dot_product_attention` con autocast
+   BF16) ha mostrato BlackForge ancora ~4 volte più lento nonostante i
+   tre interventi sopra — la causa: `batchedQK`/`batchedMask`/
+   `softmax`/`batchedPV` materializzavano comunque l'intera matrice di
+   score in memoria globale con 4 lanci di kernel separati, mentre
+   `scaled_dot_product_attention` usa un kernel fuso a tiling che non
+   la materializza mai. Sostituito con un kernel unico a "softmax
+   online" (Milakov & Gimelshein 2018, lo stesso principio numerico di
+   FlashAttention): un blocco CUDA per ogni combinazione
+   (batch,testa,riga di query), che scorre le posizioni chiave fino al
+   limite causale mantenendo massimo e somma correnti, senza mai
+   scrivere la matrice di score in memoria globale — le posizioni oltre
+   il limite causale non vengono nemmeno visitate. Il backward
+   ricalcola gli score invece di salvarli, usando l'identità
+   `D = dot(output, dOutput)` per il termine di correzione della
+   softmax-backward (lo stesso trucco di FlashAttention per evitare di
+   materializzare le probabilità); `dK`/`dV` sono accumulati con
+   `atomicAdd` (più righe di query contribuiscono alla stessa chiave).
+   La riduzione del prodotto scalare usa uno shuffle a due livelli
+   (intra-warp via `__shfl_down_sync`, poi un solo `__syncthreads` per
+   la riduzione finale tra warp) invece della classica riduzione ad
+   albero in shared memory, per ridurre il numero di barriere di
+   sincronizzazione. Guadagno reale ma non risolutivo: il gap rispetto
+   a PyTorch scende da ~4× a ~2,8× — resta piu' lento perché ogni
+   blocco (una riga di query) ricarica K/V dalla memoria globale da
+   zero, mentre un vero FlashAttention carica un tile di K/V una sola
+   volta in shared memory e lo riusa per un intero gruppo di righe di
+   query nello stesso blocco (tiling multi-riga) — lavoro futuro
+   esplicito, non ancora affrontato.
 
-Le tre ottimizzazioni sono puramente di **strategia di esecuzione**:
-nessun cambiamento alla matematica, verificato dall'intera suite CUDA
-(391 test) rimasta verde ad ogni passo, inclusi gradient checking e
-parità CPU/GPU per attention e feedforward.
+Le quattro ottimizzazioni sono puramente di **strategia di
+esecuzione**: nessun cambiamento alla matematica, verificato
+dall'intera suite CUDA (391 test) rimasta verde ad ogni passo, inclusi
+gradient checking e parità CPU/GPU per attention e feedforward.
+`batchedQK`/`batchedMask`/`batchedPV` (punto 2) sono stati rimossi dal
+codice dopo essere stati superati dal nucleo fuso del punto 4, non
+lasciati come codice morto.
 
 ## Training (pretraining, fine-tuning, LoRA, forecasting)
 

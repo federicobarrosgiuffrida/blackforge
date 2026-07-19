@@ -105,9 +105,9 @@ SelfAttentionGrad selfAttentionBackward(const DeviceTensor& input, const DeviceT
 // selfAttentionBackward, ma usa matmulBf16Backward invece di
 // matmulBackward per le proiezioni Q/K/V/Out — coerente con l'uso di
 // selfAttentionBf16 nel forward corrispondente. Il nucleo dell'attention
-// (batchedQK/batchedMask/softmax/batchedPV, vedi attention_batched.hpp)
-// resta invariato: solo le proiezioni lineari passano per il Tensor
-// Core.
+// (fusedAttentionForward/fusedAttentionBackward, vedi
+// fused_attention.hpp) resta invariato: solo le proiezioni lineari
+// passano per il Tensor Core.
 SelfAttentionGrad selfAttentionBf16Backward(const DeviceTensor& input, const DeviceTensor& wq,
                                              const DeviceTensor& wk, const DeviceTensor& wv,
                                              const DeviceTensor& wout, std::size_t numHeads,

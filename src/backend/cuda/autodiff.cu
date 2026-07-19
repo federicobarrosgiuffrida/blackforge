@@ -3,8 +3,8 @@
 #include <cmath>
 #include <stdexcept>
 
-#include "blackforge/backend/cuda/attention_batched.hpp"
 #include "blackforge/backend/cuda/cuda_check.hpp"
+#include "blackforge/backend/cuda/fused_attention.hpp"
 #include "blackforge/backend/cuda/ops.hpp"
 
 namespace blackforge::backend::cuda {
@@ -570,50 +570,36 @@ SelfAttentionGrad selfAttentionBackwardImpl(const DeviceTensor& input, const Dev
     std::size_t headDim = dim / numHeads;
     float scaleFactor = 1.0F / std::sqrt(static_cast<float>(headDim));
 
-    // Ricalcola lo stesso forward BATCHIZZATO di ops_transformer.cu/
-    // selfAttention[Bf16] (vedi attention_batched.hpp per il perche':
-    // un singolo kernel per Q@K^T/maschera/probs@V su TUTTE le
-    // combinazioni (batch,testa), non un loop host-side con un lancio
-    // di kernel per combinazione). Il nucleo dell'attention resta
-    // sempre in float32 anche con useBf16: solo le proiezioni Q/K/V/
-    // Out passano per il Tensor Core. normedFlat e' riusato (const&,
-    // ne' matmul() ne' matmulBackward() lo consumano) sia qui sia nel
-    // backward delle proiezioni Q/K/V piu' sotto.
+    // Ricalcola lo stesso forward FUSO di ops_transformer.cu/
+    // selfAttention[Bf16] (vedi fused_attention.hpp per il perche': un
+    // solo kernel a online softmax, mai una matrice di score
+    // materializzata). Il nucleo dell'attention resta sempre in
+    // float32 anche con useBf16: solo le proiezioni Q/K/V/Out passano
+    // per il Tensor Core. normedFlat e' riusato (const&, ne' matmul()
+    // ne' matmulBackward() lo consumano) sia qui sia nel backward
+    // delle proiezioni Q/K/V piu' sotto.
     DeviceTensor normed = rmsnorm(input);
     DeviceTensor normedFlat = flatten2D(normed);
     DeviceTensor q = (useBf16 ? matmulBf16(normedFlat, wq) : matmul(normedFlat, wq)).reshaped({batch, seq, dim});
     DeviceTensor k = (useBf16 ? matmulBf16(normedFlat, wk) : matmul(normedFlat, wk)).reshaped({batch, seq, dim});
     DeviceTensor v = (useBf16 ? matmulBf16(normedFlat, wv) : matmul(normedFlat, wv)).reshaped({batch, seq, dim});
 
-    DeviceTensor scores = batchedQK(q, k, numHeads, scaleFactor);
-    DeviceTensor maskedScores = batchedMask(scores, /*oldLen=*/0);
-    DeviceTensor probs = softmax(maskedScores);
-    DeviceTensor concatenated = batchedPV(probs, v, numHeads);
+    FusedAttentionForwardResult attn = fusedAttentionForward(q, k, v, numHeads, scaleFactor, /*oldLen=*/0);
 
     // --- backward attraverso la proiezione Wout ---
-    MatmulGrad woutGrad = projectionMatmulBackward(flatten2D(concatenated), wout, flatten2D(gradOutput), useBf16);
-    DeviceTensor dConcatenated = std::move(woutGrad.dA).reshaped({batch, seq, dim});
+    MatmulGrad woutGrad =
+        projectionMatmulBackward(flatten2D(attn.output), wout, flatten2D(gradOutput), useBf16);
+    DeviceTensor dOutput = std::move(woutGrad.dA).reshaped({batch, seq, dim});
 
-    // --- backward attraverso probs@V (batchizzato) ---
-    BatchedPVGrad pvGrad = batchedPVBackward(dConcatenated, probs, v, numHeads);
-    // pvGrad.dProbs, pvGrad.dV
+    // --- backward attraverso il nucleo fuso dell'attention (Q@K^T,
+    // maschera, softmax, probs@V insieme): vedi fused_attention.hpp
+    // per la derivazione, ricalcola gli score invece di salvarli. ---
+    FusedAttentionGrad attnGrad =
+        fusedAttentionBackward(dOutput, q, k, v, attn.output, attn.m, attn.l, numHeads, scaleFactor, /*oldLen=*/0);
 
-    // --- backward attraverso softmax ---
-    DeviceTensor dMaskedScores = softmaxBackward(maskedScores, pvGrad.dProbs);
-    // La maschera causale non richiede un passaggio di backward
-    // dedicato: le posizioni mascherate hanno probs == 0, quindi la
-    // formula di softmaxBackward da' loro gradiente esattamente zero
-    // (coerente con il non aver partecipato al forward).
-
-    // --- backward attraverso Q@K^T (batchizzato): il fattore di scala
-    // e' gia' applicato dentro batchedQKBackward (coerente con
-    // batchedQK, che lo applica nello stesso kernel del prodotto,
-    // invece di un passaggio scale() separato) ---
-    BatchedQKGrad qkGrad = batchedQKBackward(dMaskedScores, q, k, numHeads, scaleFactor);
-
-    DeviceTensor dQ = std::move(qkGrad.dQ);
-    DeviceTensor dK = std::move(qkGrad.dK);
-    DeviceTensor dV = std::move(pvGrad.dV);
+    DeviceTensor dQ = std::move(attnGrad.dQ);
+    DeviceTensor dK = std::move(attnGrad.dK);
+    DeviceTensor dV = std::move(attnGrad.dV);
 
     // --- backward attraverso le proiezioni Q/K/V ---
     MatmulGrad qBackward = projectionMatmulBackward(normedFlat, wq, flatten2D(dQ), useBf16);

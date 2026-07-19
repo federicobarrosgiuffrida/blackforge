@@ -99,7 +99,7 @@ DeviceTensor selfAttention(const DeviceTensor& input, const DeviceTensor& wq, co
 // (Tensor Core) invece di matmul() (SGEMM float32) — stessa semantica,
 // stesso schema "mixed precision". Il calcolo dell'attention vera e
 // propria (Q@K^T scalato, maschera, softmax, probs@V — vedi
-// attention_batched.hpp) resta in float32: solo le proiezioni lineari
+// fused_attention.hpp) resta in float32: solo le proiezioni lineari
 // (la parte dominante del costo computazionale) passano per il Tensor
 // Core, come richiesto esplicitamente per questa milestone.
 DeviceTensor selfAttentionBf16(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,

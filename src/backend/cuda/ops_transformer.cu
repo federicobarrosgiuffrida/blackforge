@@ -3,8 +3,8 @@
 #include <string>
 #include <vector>
 
-#include "blackforge/backend/cuda/attention_batched.hpp"
 #include "blackforge/backend/cuda/cuda_check.hpp"
+#include "blackforge/backend/cuda/fused_attention.hpp"
 #include "blackforge/backend/cuda/ops.hpp"
 
 namespace blackforge::backend::cuda {
@@ -108,23 +108,16 @@ DeviceTensor selfAttentionImpl(const DeviceTensor& input, const DeviceTensor& wq
     DeviceTensor v = projectionMatmul(std::move(normed).reshaped({batch * seq, dim}), wv, useBf16)
                           .reshaped({batch, seq, dim});
 
-    // Nucleo batchizzato (vedi attention_batched.hpp): Q@K^T, maschera
-    // causale e probs@V per TUTTE le combinazioni (batch, testa) in
-    // pochi lanci di kernel, invece di un lancio per ciascuna delle
-    // batch*numHeads combinazioni. Resta sempre in float32 anche
-    // quando useBf16 e' attivo: solo le proiezioni lineari (la parte
-    // dominante del costo computazionale) passano per il Tensor Core.
-    // softmax() e' gia' generica rispetto alle dimensioni iniziali
-    // (opera per "riga", l'ultima dimensione), quindi si applica
-    // direttamente a scores [batch,numHeads,seq,seq] senza bisogno di
-    // una versione batchizzata dedicata.
-    DeviceTensor scores = batchedQK(q, k, numHeads, scaleFactor);
-    DeviceTensor maskedScores = batchedMask(scores, /*oldLen=*/0);
-    DeviceTensor probs = softmax(maskedScores);
-    DeviceTensor concatenated = batchedPV(probs, v, numHeads);
+    // Nucleo fuso a online softmax (vedi fused_attention.hpp): mai una
+    // matrice di score materializzata in memoria globale, un solo
+    // lancio di kernel invece di quattro (Q@K^T, maschera, softmax,
+    // probs@V separati). Resta sempre in float32 anche quando useBf16
+    // e' attivo: solo le proiezioni lineari (la parte dominante del
+    // costo computazionale) passano per il Tensor Core.
+    FusedAttentionForwardResult attn = fusedAttentionForward(q, k, v, numHeads, scaleFactor, /*oldLen=*/0);
 
-    DeviceTensor projected =
-        projectionMatmul(std::move(concatenated).reshaped({batch * seq, dim}), wout, useBf16).reshaped({batch, seq, dim});
+    DeviceTensor projected = projectionMatmul(std::move(attn.output).reshaped({batch * seq, dim}), wout, useBf16)
+                                  .reshaped({batch, seq, dim});
     return add(input, projected);
 }
 
@@ -164,18 +157,15 @@ DeviceTensor selfAttentionIncrementalImpl(const DeviceTensor& newInput, const De
     }
     cache.length = oldLen + newLen;
 
-    // Stesso nucleo batchizzato di selfAttentionImpl(): qui newLen (i
-    // token nuovi) e totalLen (l'intera cache K/V aggiornata) possono
+    // Stesso nucleo fuso di selfAttentionImpl(): qui newLen (i token
+    // nuovi) e totalLen (l'intera cache K/V aggiornata) possono
     // differire, e oldLen != 0 generalizza la maschera causale a
     // "posizioni gia' in cache sempre visibili" (vedi
-    // attention_batched.hpp).
+    // fused_attention.hpp).
     float scaleFactor = 1.0F / std::sqrt(static_cast<float>(dim / numHeads));
-    DeviceTensor scores = batchedQK(qNew, cache.k, numHeads, scaleFactor);
-    DeviceTensor maskedScores = batchedMask(scores, oldLen);
-    DeviceTensor probs = softmax(maskedScores);
-    DeviceTensor concatenated = batchedPV(probs, cache.v, numHeads);
+    FusedAttentionForwardResult attn = fusedAttentionForward(qNew, cache.k, cache.v, numHeads, scaleFactor, oldLen);
 
-    DeviceTensor projected = projectionMatmul(std::move(concatenated).reshaped({batch * newLen, dim}), wout, useBf16)
+    DeviceTensor projected = projectionMatmul(std::move(attn.output).reshaped({batch * newLen, dim}), wout, useBf16)
                                   .reshaped({batch, newLen, dim});
     return add(newInput, projected);
 }

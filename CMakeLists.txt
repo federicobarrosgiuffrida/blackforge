@@ -141,7 +141,7 @@ if(BLACKFORGE_ENABLE_CUDA)
         src/backend/cuda/ops_elementwise.cu
         src/backend/cuda/ops_gemm.cu
         src/backend/cuda/ops_tensorcore.cu
-        src/backend/cuda/attention_batched.cu
+        src/backend/cuda/fused_attention.cu
         src/backend/cuda/ops_transformer.cu
         src/backend/cuda/executor.cu
         src/backend/cuda/device_query.cu
