@@ -1,7 +1,15 @@
 # BlackForge
 
+[![Release](https://img.shields.io/github/v/release/federicobarrosgiuffrida/blackforge)](https://github.com/federicobarrosgiuffrida/blackforge/releases/latest)
+
 BlackForge è un linguaggio di programmazione **verticale**, dedicato
 esclusivamente al Machine Learning, scritto interamente in C++.
+
+> **Windows + GPU Blackwell (sm_120, es. RTX 50xx)?** Scarica il binario
+> precompilato e autosufficiente (nessuna compilazione necessaria) dalla
+> [pagina delle release](https://github.com/federicobarrosgiuffrida/blackforge/releases/latest) —
+> utile in particolare su hardware affittato a ore, dove compilare
+> Visual Studio + CUDA Toolkit da zero sprecherebbe tempo (e budget).
 
 Non è un linguaggio general-purpose e non è un clone di Python: è pensato
 per descrivere, compilare ed eseguire workload di ML — pretraining,
