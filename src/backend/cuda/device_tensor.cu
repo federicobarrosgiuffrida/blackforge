@@ -74,6 +74,17 @@ runtime::Tensor DeviceTensor::toHost() const {
     return runtime::Tensor(shape_, std::move(hostData));
 }
 
+DeviceTensor DeviceTensor::reshaped(std::vector<std::size_t> newShape) && {
+    if (product(newShape) != elementCount()) {
+        throw std::invalid_argument("DeviceTensor::reshaped: il numero di elementi non corrisponde");
+    }
+    DeviceTensor result;
+    result.data_ = data_;
+    result.shape_ = std::move(newShape);
+    data_ = nullptr;
+    return result;
+}
+
 DeviceTensor DeviceTensor::clone() const {
     DeviceTensor copy(shape_);
     if (copy.elementCount() > 0) {

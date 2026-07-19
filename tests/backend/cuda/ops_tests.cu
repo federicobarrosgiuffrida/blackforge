@@ -199,3 +199,123 @@ TEST(CudaOpsTest, AddLanciaSuFormeIncompatibili) {
     EXPECT_THROW((void)cuda::add(cuda::DeviceTensor::fromHost(a), cuda::DeviceTensor::fromHost(b)),
                  std::invalid_argument);
 }
+
+// --- Generalizzazione a rango 3, nuovi primitivi, blocchi transformer ---
+
+TEST(CudaOpsTest, LinearFunzionaSuTensoriARango3ECorrispondeAllaVersioneCpu) {
+    Tensor input({2, 3, 2}, {1.0F, 1.0F, 2.0F, 2.0F, 3.0F, 3.0F, 4.0F, 4.0F, 5.0F, 5.0F, 6.0F, 6.0F});
+    Tensor weight({2, 3}, {0.1F, 0.2F, -0.1F, 0.3F, 0.05F, -0.2F});
+    Tensor bias({3}, {1.0F, -1.0F, 0.5F});
+
+    Tensor cpuResult = cpu::linear(input, weight, bias);
+    Tensor gpuResult = cuda::linear(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(weight),
+                                     cuda::DeviceTensor::fromHost(bias))
+                            .toHost();
+
+    ASSERT_EQ(gpuResult.shape(), cpuResult.shape());
+    for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
+        EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-4F) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, MatmulTransposeBCorrispondeAllaVersioneCpu) {
+    Tensor a({2, 3}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F});
+    Tensor b({4, 3}, {0.7F, -0.1F, 0.2F, 0.3F, -0.4F, 0.5F, 0.2F, 0.1F, -0.3F, -0.6F, 0.4F, 0.1F});
+
+    Tensor cpuResult = cpu::matmulTransposeB(a, b);
+    Tensor gpuResult =
+        cuda::matmulTransposeB(cuda::DeviceTensor::fromHost(a), cuda::DeviceTensor::fromHost(b)).toHost();
+
+    ASSERT_EQ(gpuResult.shape(), cpuResult.shape());
+    for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
+        EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-4F) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, EmbeddingLookupCorrispondeAllaVersioneCpu) {
+    Tensor table({3, 4}, {10.0F, 11.0F, 12.0F, 13.0F, 20.0F, 21.0F, 22.0F, 23.0F, 30.0F, 31.0F, 32.0F, 33.0F});
+    Tensor tokenIds({2, 3}, {0.0F, 2.0F, 1.0F, 1.0F, 0.0F, 2.0F});
+
+    Tensor cpuResult = cpu::embeddingLookup(tokenIds, table);
+    Tensor gpuResult =
+        cuda::embeddingLookup(cuda::DeviceTensor::fromHost(tokenIds), cuda::DeviceTensor::fromHost(table)).toHost();
+
+    ASSERT_EQ(gpuResult.shape(), cpuResult.shape());
+    for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
+        EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-5F) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, EmbeddingLookupLanciaSeIlTokenIdEFuoriVocabolario) {
+    Tensor table({3, 2}, {10.0F, 11.0F, 20.0F, 21.0F, 30.0F, 31.0F});
+    Tensor tooLarge({1, 1}, {3.0F});
+    EXPECT_THROW((void)cuda::embeddingLookup(cuda::DeviceTensor::fromHost(tooLarge),
+                                              cuda::DeviceTensor::fromHost(table)),
+                 std::invalid_argument);
+}
+
+TEST(CudaOpsTest, AddPositionalEmbeddingCorrispondeAllaVersioneCpu) {
+    Tensor input({2, 2, 2}, {0.0F, 0.0F, 0.0F, 0.0F, 100.0F, 100.0F, 100.0F, 100.0F});
+    Tensor table({2, 2}, {1.0F, 2.0F, 3.0F, 4.0F});
+
+    Tensor cpuResult = cpu::addPositionalEmbedding(input, table);
+    Tensor gpuResult =
+        cuda::addPositionalEmbedding(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(table))
+            .toHost();
+
+    ASSERT_EQ(gpuResult.shape(), cpuResult.shape());
+    for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
+        EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-5F) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, FeedForwardCorrispondeAllaVersioneCpu) {
+    Tensor input({1, 2, 3}, {0.3F, -0.6F, 0.2F, -0.4F, 0.5F, 0.1F});
+    Tensor w1({3, 4}, {0.2F, -0.1F, 0.3F, 0.1F, -0.2F, 0.4F, 0.1F, -0.3F, 0.3F, 0.2F, -0.1F, 0.2F});
+    Tensor b1({4}, {0.1F, -0.1F, 0.05F, 0.0F});
+    Tensor w2({4, 3}, {0.1F, -0.2F, 0.3F, 0.2F, 0.1F, -0.1F, -0.3F, 0.2F, 0.1F, 0.1F, -0.1F, 0.2F});
+    Tensor b2({3}, {0.05F, -0.05F, 0.1F});
+
+    Tensor cpuResult = cpu::feedForward(input, w1, b1, w2, b2);
+    Tensor gpuResult = cuda::feedForward(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(w1),
+                                          cuda::DeviceTensor::fromHost(b1), cuda::DeviceTensor::fromHost(w2),
+                                          cuda::DeviceTensor::fromHost(b2))
+                            .toHost();
+
+    ASSERT_EQ(gpuResult.shape(), cpuResult.shape());
+    for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
+        EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-4F) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, SelfAttentionCorrispondeAllaVersioneCpu) {
+    Tensor input({1, 3, 4}, {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F, 0.2F, -0.1F, 0.3F, 0.2F, -0.4F, 0.5F});
+    Tensor wq({4, 4}, {0.3F, -0.1F, 0.2F, 0.05F, 0.1F, 0.4F, -0.2F, 0.15F, -0.3F, 0.2F, 0.1F, -0.05F, 0.2F, -0.1F,
+                        0.3F, 0.1F});
+    Tensor wk({4, 4}, {0.1F, 0.2F, -0.1F, 0.3F, -0.2F, 0.1F, 0.4F, -0.1F, 0.3F, -0.3F, 0.1F, 0.2F, -0.1F, 0.2F,
+                        -0.2F, 0.1F});
+    Tensor wv({4, 4}, {0.2F, 0.1F, -0.1F, 0.3F, 0.1F, -0.2F, 0.3F, 0.1F, -0.1F, 0.3F, 0.2F, -0.1F, 0.3F, 0.1F, -0.2F,
+                        0.2F});
+    Tensor wout({4, 4}, {0.1F, -0.1F, 0.2F, 0.1F, 0.2F, 0.1F, -0.1F, 0.2F, -0.1F, 0.2F, 0.1F, -0.1F, 0.1F, 0.2F,
+                          -0.1F, 0.2F});
+
+    Tensor cpuResult = cpu::selfAttention(input, wq, wk, wv, wout, /*numHeads=*/2);
+    Tensor gpuResult = cuda::selfAttention(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(wq),
+                                            cuda::DeviceTensor::fromHost(wk), cuda::DeviceTensor::fromHost(wv),
+                                            cuda::DeviceTensor::fromHost(wout), /*numHeads=*/2)
+                            .toHost();
+
+    ASSERT_EQ(gpuResult.shape(), cpuResult.shape());
+    for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
+        EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-3F) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, SelfAttentionLanciaSeNumHeadsNonDivideDim) {
+    Tensor input({1, 2, 3}, std::vector<float>(6, 0.0F));
+    Tensor w = Tensor::zeros({3, 3});
+    EXPECT_THROW((void)cuda::selfAttention(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(w),
+                                            cuda::DeviceTensor::fromHost(w), cuda::DeviceTensor::fromHost(w),
+                                            cuda::DeviceTensor::fromHost(w), /*numHeads=*/2),
+                 std::invalid_argument);
+}

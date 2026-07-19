@@ -125,16 +125,20 @@ DeviceTensor add(const DeviceTensor& a, const DeviceTensor& b) {
 }
 
 DeviceTensor addBias(const DeviceTensor& input, const DeviceTensor& bias) {
-    if (input.rank() != 2 || bias.rank() != 1 || input.dim(1) != bias.dim(0)) {
-        throw std::invalid_argument("addBias: attesi input [batch, features] e bias [features] con features "
+    // Generalizzato a rango >= 2 (vedi il commento equivalente in
+    // src/backend/cpu/ops.cpp/addBias): 'features' e' sempre l'ultima
+    // dimensione, tutte le altre sono trattate come righe indipendenti.
+    if (input.rank() < 2 || bias.rank() != 1 || input.shape().back() != bias.dim(0)) {
+        throw std::invalid_argument("addBias: attesi input [..., features] e bias [features] con features "
                                      "corrispondenti");
     }
 
+    std::size_t features = input.shape().back();
+    std::size_t rows = input.elementCount() / features;
     DeviceTensor result(input.shape());
     std::size_t n = input.elementCount();
     if (n > 0) {
-        addBiasKernel<<<gridSizeFor(n), kBlockSize>>>(result.data(), input.data(), bias.data(), input.dim(0),
-                                                       input.dim(1));
+        addBiasKernel<<<gridSizeFor(n), kBlockSize>>>(result.data(), input.data(), bias.data(), rows, features);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }
     return result;
@@ -227,33 +231,136 @@ __global__ void softmaxKernel(float* out, const float* input, std::size_t batch,
     }
 }
 
+// Un thread per elemento di output (b,s,d): legge il token id per
+// (b,s), lo arrotonda a intero, e copia la riga corrispondente della
+// tabella.
+__global__ void embeddingLookupKernel(float* out, const float* tokenIds, const float* table, std::size_t batch,
+                                       std::size_t seq, std::size_t vocabSize, std::size_t dim) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = batch * seq * dim;
+    if (idx >= total) {
+        return;
+    }
+    std::size_t token = idx / dim;
+    std::size_t d = idx % dim;
+
+    long long tokenId = static_cast<long long>(lroundf(tokenIds[token]));
+    if (tokenId < 0 || static_cast<std::size_t>(tokenId) >= vocabSize) {
+        // Un kernel CUDA non puo' lanciare eccezioni: la validazione
+        // del range avviene sull'host, in embeddingLookup(), PRIMA di
+        // lanciare questo kernel (vedi sotto). Qui e' una difesa
+        // ridondante che azzera silenziosamente, non dovrebbe mai
+        // scattare in pratica.
+        out[idx] = 0.0F;
+        return;
+    }
+    out[idx] = table[static_cast<std::size_t>(tokenId) * dim + d];
+}
+
+__global__ void addPositionalEmbeddingKernel(float* out, const float* input, const float* table, std::size_t batch,
+                                              std::size_t seq, std::size_t dim) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = batch * seq * dim;
+    if (idx >= total) {
+        return;
+    }
+    std::size_t withinBatch = idx % (seq * dim);  // (s,d) piatto
+    out[idx] = input[idx] + table[withinBatch];
+}
+
 DeviceTensor rmsnorm(const DeviceTensor& input) {
-    if (input.rank() != 2) {
-        throw std::invalid_argument("rmsnorm: richiede un tensore a rango 2 [batch, features] sul device");
+    // Generalizzato a rango >= 2, stessa idea di addBias sopra.
+    if (input.rank() < 2) {
+        throw std::invalid_argument("rmsnorm: richiede un tensore a rango >= 2 sul device");
+    }
+
+    std::size_t features = input.shape().back();
+    std::size_t rows = input.elementCount() / features;
+    DeviceTensor result(input.shape());
+    if (rows > 0 && features > 0) {
+        rmsnormKernel<<<static_cast<int>(rows), kBlockSize, kBlockSize * sizeof(float)>>>(
+            result.data(), input.data(), rows, features);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+DeviceTensor embeddingLookup(const DeviceTensor& tokenIds, const DeviceTensor& table) {
+    if (tokenIds.rank() != 2) {
+        throw std::invalid_argument("embeddingLookup: richiede token id a rango 2 [batch, seq] sul device");
+    }
+    if (table.rank() != 2) {
+        throw std::invalid_argument("embeddingLookup: richiede una tabella a rango 2 [vocabSize, dim] sul device");
+    }
+
+    std::size_t batch = tokenIds.dim(0);
+    std::size_t seq = tokenIds.dim(1);
+    std::size_t vocabSize = table.dim(0);
+    std::size_t dim = table.dim(1);
+
+    // Un kernel CUDA non puo' lanciare eccezioni: la validazione del
+    // range dei token id avviene qui sull'host (una copia di [batch,
+    // seq] float, trascurabile), PRIMA di lanciare il kernel di
+    // gather vero e proprio (che opera interamente su device).
+    runtime::Tensor tokenIdsHost = tokenIds.toHost();
+    for (std::size_t i = 0; i < tokenIdsHost.elementCount(); ++i) {
+        auto tokenId = static_cast<long long>(std::lround(tokenIdsHost.at(i)));
+        if (tokenId < 0 || static_cast<std::size_t>(tokenId) >= vocabSize) {
+            throw std::invalid_argument("embeddingLookup: token id " + std::to_string(tokenId) +
+                                         " fuori dal vocabolario [0, " + std::to_string(vocabSize) + ")");
+        }
+    }
+
+    DeviceTensor result({batch, seq, dim});
+    std::size_t total = batch * seq * dim;
+    if (total > 0) {
+        embeddingLookupKernel<<<gridSizeFor(total), kBlockSize>>>(result.data(), tokenIds.data(), table.data(),
+                                                                   batch, seq, vocabSize, dim);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+DeviceTensor addPositionalEmbedding(const DeviceTensor& input, const DeviceTensor& table) {
+    if (input.rank() != 3) {
+        throw std::invalid_argument("addPositionalEmbedding: richiede un input a rango 3 [batch, seq, dim] sul "
+                                     "device");
+    }
+    if (table.rank() != 2 || table.dim(1) != input.dim(2)) {
+        throw std::invalid_argument("addPositionalEmbedding: richiede una tabella [maxSeqLen, dim] con dim "
+                                     "coerente con l'input sul device");
+    }
+
+    std::size_t batch = input.dim(0);
+    std::size_t seq = input.dim(1);
+    std::size_t dim = input.dim(2);
+    std::size_t maxSeqLen = table.dim(0);
+    if (seq > maxSeqLen) {
+        throw std::invalid_argument("addPositionalEmbedding: la sequenza supera maxSeqLen della tabella");
     }
 
     DeviceTensor result(input.shape());
-    std::size_t batch = input.dim(0);
-    std::size_t features = input.dim(1);
-    if (batch > 0 && features > 0) {
-        rmsnormKernel<<<static_cast<int>(batch), kBlockSize, kBlockSize * sizeof(float)>>>(
-            result.data(), input.data(), batch, features);
+    std::size_t total = batch * seq * dim;
+    if (total > 0) {
+        addPositionalEmbeddingKernel<<<gridSizeFor(total), kBlockSize>>>(result.data(), input.data(), table.data(),
+                                                                          batch, seq, dim);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }
     return result;
 }
 
 DeviceTensor softmax(const DeviceTensor& input) {
-    if (input.rank() != 2) {
-        throw std::invalid_argument("softmax: richiede un tensore a rango 2 [batch, classi] sul device");
+    // Generalizzato a rango >= 2, stessa idea di addBias sopra.
+    if (input.rank() < 2) {
+        throw std::invalid_argument("softmax: richiede un tensore a rango >= 2 sul device");
     }
 
+    std::size_t features = input.shape().back();
+    std::size_t rows = input.elementCount() / features;
     DeviceTensor result(input.shape());
-    std::size_t batch = input.dim(0);
-    std::size_t features = input.dim(1);
-    if (batch > 0 && features > 0) {
-        softmaxKernel<<<static_cast<int>(batch), kBlockSize, kBlockSize * sizeof(float)>>>(
-            result.data(), input.data(), batch, features);
+    if (rows > 0 && features > 0) {
+        softmaxKernel<<<static_cast<int>(rows), kBlockSize, kBlockSize * sizeof(float)>>>(
+            result.data(), input.data(), rows, features);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }
     return result;

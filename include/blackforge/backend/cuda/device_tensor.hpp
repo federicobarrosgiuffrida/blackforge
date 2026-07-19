@@ -49,6 +49,18 @@ public:
     // non e' copiabile per evitare doppie cudaFree accidentali.
     [[nodiscard]] DeviceTensor clone() const;
 
+    // Reinterpreta lo stesso buffer device con una nuova forma, senza
+    // copiare (il numero di elementi deve coincidere): il layout flat
+    // riga-maggiore di [batch, seq, features] e' identico, byte per
+    // byte, a quello di [batch*seq, features], quindi non serve una
+    // vera riorganizzazione dei dati per "appiattire" un tensore a
+    // rango > 2 prima di passarlo a un primitivo puramente 2D come
+    // matmul(). Qualificata su rvalue: consuma questo DeviceTensor
+    // (ownership del buffer trasferita al risultato), per rendere
+    // esplicito nel codice chiamante che non e' piu' utilizzabile con
+    // la forma originale dopo la chiamata.
+    [[nodiscard]] DeviceTensor reshaped(std::vector<std::size_t> newShape) &&;
+
     [[nodiscard]] float* data() { return data_; }
     [[nodiscard]] const float* data() const { return data_; }
 

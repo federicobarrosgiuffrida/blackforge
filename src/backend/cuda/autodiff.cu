@@ -1,5 +1,6 @@
 #include "blackforge/backend/cuda/autodiff.hpp"
 
+#include <cmath>
 #include <stdexcept>
 
 #include "blackforge/backend/cuda/cuda_check.hpp"
@@ -49,6 +50,41 @@ __global__ void matmulBackwardDBKernel(float* dB, const float* a, const float* g
     float sum = 0.0F;
     for (std::size_t i = 0; i < m; ++i) {
         sum += a[i * k + p] * gradOutput[i * n + j];
+    }
+    dB[idx] = sum;
+}
+
+// matmulTransposeB: C = A @ B^T, A:[m,k], B:[n,k], C:[m,n].
+// dA[i,p] = sum_j gradOutput[i,j] * B[j,p] (= matmul(gradOutput, B)).
+__global__ void matmulTransposeBBackwardDAKernel(float* dA, const float* gradOutput, const float* b, std::size_t m,
+                                                  std::size_t k, std::size_t n) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= m * k) {
+        return;
+    }
+    std::size_t i = idx / k;
+    std::size_t p = idx % k;
+
+    float sum = 0.0F;
+    for (std::size_t j = 0; j < n; ++j) {
+        sum += gradOutput[i * n + j] * b[j * k + p];
+    }
+    dA[idx] = sum;
+}
+
+// dB[j,p] = sum_i gradOutput[i,j] * A[i,p].
+__global__ void matmulTransposeBBackwardDBKernel(float* dB, const float* a, const float* gradOutput, std::size_t m,
+                                                  std::size_t k, std::size_t n) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= n * k) {
+        return;
+    }
+    std::size_t j = idx / k;
+    std::size_t p = idx % k;
+
+    float sum = 0.0F;
+    for (std::size_t i = 0; i < m; ++i) {
+        sum += gradOutput[i * n + j] * a[i * k + p];
     }
     dB[idx] = sum;
 }
@@ -186,6 +222,146 @@ __global__ void softmaxBackwardKernel(float* out, const float* y, const float* g
     }
 }
 
+// Duplicati deliberatamente da ops_transformer.cu (namespace anonimo
+// li' come qui, quindi non condivisibili tra le due unita' di
+// traduzione senza un header): helper interni piccoli, stessa scelta
+// gia' fatta per la controparte CPU (src/backend/cpu/autodiff.cpp).
+__global__ void extractHeadKernel(float* out, const float* full, std::size_t b, std::size_t h, std::size_t seq,
+                                   std::size_t dim, std::size_t headDim) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = seq * headDim;
+    if (idx >= total) {
+        return;
+    }
+    std::size_t s = idx / headDim;
+    std::size_t d = idx % headDim;
+    out[idx] = full[(b * seq + s) * dim + h * headDim + d];
+}
+
+__global__ void scatterHeadKernel(float* full, const float* headSlice, std::size_t b, std::size_t h,
+                                   std::size_t seq, std::size_t dim, std::size_t headDim) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = seq * headDim;
+    if (idx >= total) {
+        return;
+    }
+    std::size_t s = idx / headDim;
+    std::size_t d = idx % headDim;
+    full[(b * seq + s) * dim + h * headDim + d] = headSlice[idx];
+}
+
+__global__ void applyCausalMaskKernel(float* scores, std::size_t seq) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = seq * seq;
+    if (idx >= total) {
+        return;
+    }
+    std::size_t i = idx / seq;
+    std::size_t j = idx % seq;
+    if (j > i) {
+        scores[idx] = -INFINITY;
+    }
+}
+
+DeviceTensor extractHead(const DeviceTensor& full, std::size_t b, std::size_t h, std::size_t seq, std::size_t dim,
+                          std::size_t headDim) {
+    DeviceTensor result({seq, headDim});
+    std::size_t total = seq * headDim;
+    if (total > 0) {
+        extractHeadKernel<<<gridSizeFor(total), kBlockSize>>>(result.data(), full.data(), b, h, seq, dim, headDim);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+void scatterHead(DeviceTensor& full, const DeviceTensor& headSlice, std::size_t b, std::size_t h, std::size_t seq,
+                  std::size_t dim, std::size_t headDim) {
+    std::size_t total = seq * headDim;
+    if (total > 0) {
+        scatterHeadKernel<<<gridSizeFor(total), kBlockSize>>>(full.data(), headSlice.data(), b, h, seq, dim,
+                                                               headDim);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+DeviceTensor applyCausalMask(const DeviceTensor& scores) {
+    DeviceTensor result = scores.clone();
+    std::size_t seq = result.dim(0);
+    std::size_t total = seq * seq;
+    if (total > 0) {
+        applyCausalMaskKernel<<<gridSizeFor(total), kBlockSize>>>(result.data(), seq);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+__global__ void scaleKernel(float* out, const float* input, float factor, std::size_t n) {
+    std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = input[i] * factor;
+    }
+}
+
+DeviceTensor scale(const DeviceTensor& input, float factor) {
+    DeviceTensor result(input.shape());
+    std::size_t n = input.elementCount();
+    if (n > 0) {
+        scaleKernel<<<gridSizeFor(n), kBlockSize>>>(result.data(), input.data(), factor, n);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+// Appiattisce un tensore device a rango >= 2 a [rows, features] (stesso
+// layout flat riga-maggiore): serve per poter chiamare matmulBackward()
+// (primitivo puramente 2D) su input a rango > 2 come [batch, seq,
+// features]. Sempre una clone(): il tensore originale a rango > 2
+// resta valido e riutilizzabile dal chiamante dopo questa chiamata
+// (stessa idea di flatten2D in src/backend/cpu/autodiff.cpp).
+DeviceTensor flatten2D(const DeviceTensor& t) {
+    std::size_t features = t.shape().back();
+    std::size_t rows = t.elementCount() / features;
+    return t.clone().reshaped({rows, features});
+}
+
+// Scatter-add: dTable[tokenId,:] += gradOutput[token,:]. Piu' token
+// nella stessa chiamata possono avere lo stesso id (thread diversi che
+// scrivono sulla stessa riga della tabella concorrentemente): serve
+// atomicAdd, a differenza di scatterHeadKernel (ops_transformer.cu) le
+// cui teste non si sovrappongono mai.
+__global__ void embeddingLookupBackwardKernel(float* dTable, const float* tokenIds, const float* gradOutput,
+                                               std::size_t totalTokens, std::size_t dim) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = totalTokens * dim;
+    if (idx >= total) {
+        return;
+    }
+    std::size_t token = idx / dim;
+    std::size_t d = idx % dim;
+
+    long long tokenId = static_cast<long long>(lroundf(tokenIds[token]));
+    // Il range e' gia' stato validato sull'host in
+    // embeddingLookupBackward() prima di lanciare questo kernel.
+    atomicAdd(&dTable[static_cast<std::size_t>(tokenId) * dim + d], gradOutput[idx]);
+}
+
+// dTable[s,d] = sum_b gradOutput[b,s,d]: un thread per (s,d), somma
+// seriale sul batch (il batch e' tipicamente piccolo in questo
+// linguaggio, non serve una riduzione in shared memory).
+__global__ void positionalEmbeddingBackwardKernel(float* dTable, const float* gradOutput, std::size_t batch,
+                                                    std::size_t seq, std::size_t dim) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = seq * dim;
+    if (idx >= total) {
+        return;
+    }
+    float sum = 0.0F;
+    for (std::size_t b = 0; b < batch; ++b) {
+        sum += gradOutput[b * total + idx];
+    }
+    dTable[idx] = sum;
+}
+
 }  // namespace
 
 MatmulGrad matmulBackward(const DeviceTensor& a, const DeviceTensor& b, const DeviceTensor& gradOutput) {
@@ -218,13 +394,46 @@ MatmulGrad matmulBackward(const DeviceTensor& a, const DeviceTensor& b, const De
     return MatmulGrad{std::move(dA), std::move(dB)};
 }
 
-AddBiasGrad addBiasBackward(const DeviceTensor& gradOutput) {
-    if (gradOutput.rank() != 2) {
-        throw std::invalid_argument("addBiasBackward: atteso un gradiente a rango 2 [batch, features] sul device");
+MatmulTransposeBGrad matmulTransposeBBackward(const DeviceTensor& a, const DeviceTensor& b,
+                                               const DeviceTensor& gradOutput) {
+    if (a.rank() != 2 || b.rank() != 2 || gradOutput.rank() != 2 || a.dim(1) != b.dim(1) ||
+        gradOutput.dim(0) != a.dim(0) || gradOutput.dim(1) != b.dim(0)) {
+        throw std::invalid_argument("matmulTransposeBBackward: forme incompatibili sul device");
     }
 
-    std::size_t batch = gradOutput.dim(0);
-    std::size_t features = gradOutput.dim(1);
+    std::size_t m = a.dim(0);
+    std::size_t k = a.dim(1);
+    std::size_t n = b.dim(0);
+
+    DeviceTensor dA({m, k});
+    DeviceTensor dB({n, k});
+
+    std::size_t dACount = m * k;
+    if (dACount > 0) {
+        matmulTransposeBBackwardDAKernel<<<gridSizeFor(dACount), kBlockSize>>>(dA.data(), gradOutput.data(),
+                                                                                b.data(), m, k, n);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+
+    std::size_t dBCount = n * k;
+    if (dBCount > 0) {
+        matmulTransposeBBackwardDBKernel<<<gridSizeFor(dBCount), kBlockSize>>>(dB.data(), a.data(),
+                                                                                gradOutput.data(), m, k, n);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+
+    return MatmulTransposeBGrad{std::move(dA), std::move(dB)};
+}
+
+AddBiasGrad addBiasBackward(const DeviceTensor& gradOutput) {
+    // Generalizzato a rango >= 2 (vedi il commento equivalente in
+    // src/backend/cpu/autodiff.cpp).
+    if (gradOutput.rank() < 2) {
+        throw std::invalid_argument("addBiasBackward: atteso un gradiente a rango >= 2 sul device");
+    }
+
+    std::size_t features = gradOutput.shape().back();
+    std::size_t rows = gradOutput.elementCount() / features;
 
     // dInput e' un'identita' nel gradiente: si copia semplicemente il
     // buffer (device-to-device), non serve un kernel elementwise.
@@ -236,7 +445,7 @@ AddBiasGrad addBiasBackward(const DeviceTensor& gradOutput) {
 
     DeviceTensor dBias({features});
     if (features > 0) {
-        addBiasBackwardDBiasKernel<<<gridSizeFor(features), kBlockSize>>>(dBias.data(), gradOutput.data(), batch,
+        addBiasBackwardDBiasKernel<<<gridSizeFor(features), kBlockSize>>>(dBias.data(), gradOutput.data(), rows,
                                                                            features);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }
@@ -287,17 +496,17 @@ DeviceTensor rmsnormBackward(const DeviceTensor& input, const DeviceTensor& grad
     if (input.shape() != gradOutput.shape()) {
         throw std::invalid_argument("rmsnormBackward: forme incompatibili sul device");
     }
-    if (input.rank() != 2) {
-        throw std::invalid_argument("rmsnormBackward: richiede un tensore a rango 2 [batch, features] sul device");
+    if (input.rank() < 2) {
+        throw std::invalid_argument("rmsnormBackward: richiede un tensore a rango >= 2 sul device");
     }
 
+    std::size_t features = input.shape().back();
+    std::size_t rows = input.elementCount() / features;
     DeviceTensor result(input.shape());
-    std::size_t batch = input.dim(0);
-    std::size_t features = input.dim(1);
-    if (batch > 0 && features > 0) {
+    if (rows > 0 && features > 0) {
         std::size_t sharedBytes = 2 * kBlockSize * sizeof(float);
-        rmsnormBackwardKernel<<<static_cast<int>(batch), kBlockSize, sharedBytes>>>(
-            result.data(), input.data(), gradOutput.data(), batch, features);
+        rmsnormBackwardKernel<<<static_cast<int>(rows), kBlockSize, sharedBytes>>>(
+            result.data(), input.data(), gradOutput.data(), rows, features);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }
     return result;
@@ -307,21 +516,220 @@ DeviceTensor softmaxBackward(const DeviceTensor& input, const DeviceTensor& grad
     if (input.shape() != gradOutput.shape()) {
         throw std::invalid_argument("softmaxBackward: forme incompatibili sul device");
     }
-    if (input.rank() != 2) {
-        throw std::invalid_argument("softmaxBackward: richiede un tensore a rango 2 [batch, classi] sul device");
+    if (input.rank() < 2) {
+        throw std::invalid_argument("softmaxBackward: richiede un tensore a rango >= 2 sul device");
     }
 
     DeviceTensor y = softmax(input);
+    std::size_t features = input.shape().back();
+    std::size_t rows = input.elementCount() / features;
     DeviceTensor result(input.shape());
-    std::size_t batch = input.dim(0);
-    std::size_t features = input.dim(1);
-    if (batch > 0 && features > 0) {
+    if (rows > 0 && features > 0) {
         std::size_t sharedBytes = kBlockSize * sizeof(float);
-        softmaxBackwardKernel<<<static_cast<int>(batch), kBlockSize, sharedBytes>>>(
-            result.data(), y.data(), gradOutput.data(), batch, features);
+        softmaxBackwardKernel<<<static_cast<int>(rows), kBlockSize, sharedBytes>>>(
+            result.data(), y.data(), gradOutput.data(), rows, features);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }
     return result;
+}
+
+DeviceTensor embeddingLookupBackward(const DeviceTensor& tokenIds, const DeviceTensor& gradOutput,
+                                      std::size_t vocabSize) {
+    if (tokenIds.rank() != 2 || gradOutput.rank() != 3 || tokenIds.dim(0) != gradOutput.dim(0) ||
+        tokenIds.dim(1) != gradOutput.dim(1)) {
+        throw std::invalid_argument("embeddingLookupBackward: forme incompatibili sul device");
+    }
+
+    std::size_t dim = gradOutput.dim(2);
+
+    // Stessa validazione del range fatta sull'host in embeddingLookup()
+    // (forward): un kernel CUDA non puo' lanciare eccezioni.
+    runtime::Tensor tokenIdsHost = tokenIds.toHost();
+    for (std::size_t i = 0; i < tokenIdsHost.elementCount(); ++i) {
+        auto tokenId = static_cast<long long>(std::lround(tokenIdsHost.at(i)));
+        if (tokenId < 0 || static_cast<std::size_t>(tokenId) >= vocabSize) {
+            throw std::invalid_argument("embeddingLookupBackward: token id " + std::to_string(tokenId) +
+                                         " fuori dal vocabolario [0, " + std::to_string(vocabSize) + ")");
+        }
+    }
+
+    DeviceTensor dTable = DeviceTensor::zeros({vocabSize, dim});
+    std::size_t totalTokens = tokenIds.elementCount();
+    std::size_t total = totalTokens * dim;
+    if (total > 0) {
+        embeddingLookupBackwardKernel<<<gridSizeFor(total), kBlockSize>>>(dTable.data(), tokenIds.data(),
+                                                                           gradOutput.data(), totalTokens, dim);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return dTable;
+}
+
+PositionalEmbeddingGrad addPositionalEmbeddingBackward(const DeviceTensor& gradOutput, std::size_t maxSeqLen) {
+    if (gradOutput.rank() != 3) {
+        throw std::invalid_argument("addPositionalEmbeddingBackward: atteso un gradiente a rango 3 sul device");
+    }
+
+    std::size_t batch = gradOutput.dim(0);
+    std::size_t seq = gradOutput.dim(1);
+    std::size_t dim = gradOutput.dim(2);
+    if (seq > maxSeqLen) {
+        throw std::invalid_argument("addPositionalEmbeddingBackward: la sequenza supera maxSeqLen");
+    }
+
+    // dInput e' un'identita' nel gradiente: copia device-to-device.
+    DeviceTensor dInput(gradOutput.shape());
+    if (gradOutput.elementCount() > 0) {
+        BLACKFORGE_CUDA_CHECK(cudaMemcpy(dInput.data(), gradOutput.data(), gradOutput.elementCount() * sizeof(float),
+                                         cudaMemcpyDeviceToDevice));
+    }
+
+    // Le righe di dTable oltre 'seq' (se maxSeqLen > seq) non sono
+    // state usate in questo forward: restano a zero, come da
+    // DeviceTensor::zeros.
+    DeviceTensor dTable = DeviceTensor::zeros({maxSeqLen, dim});
+    std::size_t total = seq * dim;
+    if (total > 0) {
+        positionalEmbeddingBackwardKernel<<<gridSizeFor(total), kBlockSize>>>(dTable.data(), gradOutput.data(),
+                                                                               batch, seq, dim);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+
+    return PositionalEmbeddingGrad{std::move(dInput), std::move(dTable)};
+}
+
+FeedForwardGrad feedForwardBackward(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                                     const DeviceTensor& w2, const DeviceTensor& b2, const DeviceTensor& gradOutput) {
+    // b2 non serve al calcolo (vedi il commento equivalente in
+    // src/backend/cpu/autodiff.cpp): resta nella firma solo per
+    // simmetria con feedForward().
+    (void)b2;
+
+    // Ricalcola gli stessi passaggi del forward (vedi
+    // ops_transformer.cu/feedForward).
+    DeviceTensor normed = rmsnorm(input);
+    DeviceTensor preActivation = linear(normed, w1, b1);
+    DeviceTensor hidden = silu(preActivation);
+
+    AddBiasGrad addGrad2 = addBiasBackward(gradOutput);
+    MatmulGrad matGrad2 = matmulBackward(flatten2D(hidden), w2, flatten2D(addGrad2.dInput));
+    DeviceTensor dHidden = std::move(matGrad2.dA).reshaped(hidden.shape());
+
+    DeviceTensor dPreActivation = siluBackward(preActivation, dHidden);
+
+    AddBiasGrad addGrad1 = addBiasBackward(dPreActivation);
+    MatmulGrad matGrad1 = matmulBackward(flatten2D(normed), w1, flatten2D(addGrad1.dInput));
+    DeviceTensor dNormed = std::move(matGrad1.dA).reshaped(normed.shape());
+
+    // y = input + linear2(...): il residual manda gradOutput sia
+    // direttamente a dInput sia, tramite il ramo rmsnorm/linear1/
+    // silu/linear2, di nuovo indietro fino a dInput (i due contributi
+    // si sommano).
+    DeviceTensor dInputFromBranch = rmsnormBackward(input, dNormed);
+    DeviceTensor dInput = add(gradOutput, dInputFromBranch);
+
+    return FeedForwardGrad{std::move(dInput), std::move(matGrad1.dB), std::move(addGrad1.dBias),
+                            std::move(matGrad2.dB), std::move(addGrad2.dBias)};
+}
+
+SelfAttentionGrad selfAttentionBackward(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
+                                         const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
+                                         const DeviceTensor& gradOutput) {
+    std::size_t batch = input.dim(0);
+    std::size_t seq = input.dim(1);
+    std::size_t dim = input.dim(2);
+    std::size_t headDim = dim / numHeads;
+    float scaleFactor = 1.0F / std::sqrt(static_cast<float>(headDim));
+
+    // Ricalcola lo stesso forward di ops_transformer.cu/selfAttention
+    // (normed, Q/K/V, score mascherati per ogni testa, concatenazione):
+    // serve per ricostruire tutti gli stati intermedi di cui il
+    // backward ha bisogno. normedFlat e' riusato (const&, ne'
+    // matmul() ne' matmulBackward() lo consumano) sia qui sia nel
+    // backward delle proiezioni Q/K/V piu' sotto: una sola clone()
+    // invece di sei.
+    DeviceTensor normed = rmsnorm(input);
+    DeviceTensor normedFlat = flatten2D(normed);
+    DeviceTensor q = matmul(normedFlat, wq).reshaped({batch, seq, dim});
+    DeviceTensor k = matmul(normedFlat, wk).reshaped({batch, seq, dim});
+    DeviceTensor v = matmul(normedFlat, wv).reshaped({batch, seq, dim});
+
+    DeviceTensor concatenated = DeviceTensor::zeros({batch, seq, dim});
+    // Cachati per il backward: per ogni (b,h), gli score mascherati
+    // (pre-softmax) e Q/K/V della testa.
+    std::vector<DeviceTensor> maskedScoresPerHead(batch * numHeads);
+    std::vector<DeviceTensor> qHeadPerHead(batch * numHeads);
+    std::vector<DeviceTensor> kHeadPerHead(batch * numHeads);
+    std::vector<DeviceTensor> vHeadPerHead(batch * numHeads);
+
+    for (std::size_t b = 0; b < batch; ++b) {
+        for (std::size_t h = 0; h < numHeads; ++h) {
+            std::size_t idx = b * numHeads + h;
+            DeviceTensor qHead = extractHead(q, b, h, seq, dim, headDim);
+            DeviceTensor kHead = extractHead(k, b, h, seq, dim, headDim);
+            DeviceTensor vHead = extractHead(v, b, h, seq, dim, headDim);
+
+            DeviceTensor scores = scale(matmulTransposeB(qHead, kHead), scaleFactor);
+            DeviceTensor maskedScores = applyCausalMask(scores);
+            DeviceTensor probs = softmax(maskedScores);
+            DeviceTensor headOut = matmul(probs, vHead);
+
+            scatterHead(concatenated, headOut, b, h, seq, dim, headDim);
+
+            maskedScoresPerHead[idx] = std::move(maskedScores);
+            qHeadPerHead[idx] = std::move(qHead);
+            kHeadPerHead[idx] = std::move(kHead);
+            vHeadPerHead[idx] = std::move(vHead);
+        }
+    }
+
+    // --- backward attraverso la proiezione Wout ---
+    MatmulGrad woutGrad = matmulBackward(flatten2D(concatenated), wout, flatten2D(gradOutput));
+    DeviceTensor dConcatenated = std::move(woutGrad.dA).reshaped({batch, seq, dim});
+
+    // --- backward per ogni testa, accumulando dQ/dK/dV su tutto il tensore ---
+    DeviceTensor dQ = DeviceTensor::zeros({batch, seq, dim});
+    DeviceTensor dK = DeviceTensor::zeros({batch, seq, dim});
+    DeviceTensor dV = DeviceTensor::zeros({batch, seq, dim});
+
+    for (std::size_t b = 0; b < batch; ++b) {
+        for (std::size_t h = 0; h < numHeads; ++h) {
+            std::size_t idx = b * numHeads + h;
+            DeviceTensor dHeadOut = extractHead(dConcatenated, b, h, seq, dim, headDim);
+
+            DeviceTensor probs = softmax(maskedScoresPerHead[idx]);
+            MatmulGrad pvGrad = matmulBackward(probs, vHeadPerHead[idx], dHeadOut);
+            // pvGrad.dA = dProbs, pvGrad.dB = dVHead
+
+            DeviceTensor dMaskedScores = softmaxBackward(maskedScoresPerHead[idx], pvGrad.dA);
+            // La maschera causale non richiede un passaggio di backward
+            // dedicato: le posizioni mascherate hanno probs == 0, quindi
+            // la formula di softmaxBackward da' loro gradiente
+            // esattamente zero (coerente con il non aver partecipato al
+            // forward).
+            DeviceTensor dScores = scale(dMaskedScores, scaleFactor);
+
+            MatmulTransposeBGrad qkGrad = matmulTransposeBBackward(qHeadPerHead[idx], kHeadPerHead[idx], dScores);
+
+            scatterHead(dQ, qkGrad.dA, b, h, seq, dim, headDim);
+            scatterHead(dK, qkGrad.dB, b, h, seq, dim, headDim);
+            scatterHead(dV, pvGrad.dB, b, h, seq, dim, headDim);
+        }
+    }
+
+    // --- backward attraverso le proiezioni Q/K/V ---
+    MatmulGrad qBackward = matmulBackward(normedFlat, wq, flatten2D(dQ));
+    MatmulGrad kBackward = matmulBackward(normedFlat, wk, flatten2D(dK));
+    MatmulGrad vBackward = matmulBackward(normedFlat, wv, flatten2D(dV));
+
+    DeviceTensor dNormedFlat = add(add(qBackward.dA, kBackward.dA), vBackward.dA);
+    DeviceTensor dNormed = std::move(dNormedFlat).reshaped({batch, seq, dim});
+
+    // --- backward attraverso rmsnorm, poi residual ---
+    DeviceTensor dInputFromBranch = rmsnormBackward(input, dNormed);
+    DeviceTensor dInput = add(gradOutput, dInputFromBranch);
+
+    return SelfAttentionGrad{std::move(dInput), std::move(qBackward.dB), std::move(kBackward.dB),
+                              std::move(vBackward.dB), std::move(woutGrad.dB)};
 }
 
 }  // namespace blackforge::backend::cuda
