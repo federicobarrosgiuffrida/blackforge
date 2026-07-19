@@ -216,9 +216,14 @@ attraversa la prima pipeline del primo modello applicando le operazioni
 una a una sul backend CPU (`blackforge::backend::cpu`):
 
 - `linear(n)`: prodotto matriciale `[batch, in] x [in, n]` più bias
-  `[n]`, con pesi generati in modo deterministico (seme fisso, non una
-  strategia di inizializzazione statisticamente valida come
-  Xavier/Kaiming);
+  `[n]`. Senza `--from-checkpoint`, i pesi sono generati in modo
+  deterministico (seme fisso, non una strategia di inizializzazione
+  statisticamente valida come Xavier/Kaiming). Con `--from-checkpoint
+  <file>` (CPU e CUDA), i pesi sono invece quelli realmente allenati
+  caricati da quel checkpoint: internamente `run` costruisce un
+  `Model` (che possiede i propri parametri) al posto dell'`Executor`
+  (che li rigenera casuali ad ogni chiamata) e ci carica il file con
+  `loadCheckpoint`;
 - `silu`, `relu`, `gelu`: applicate elemento per elemento;
 - `rmsnorm`: normalizzazione RMS (Zhang & Sennrich, 2019) riga per riga
   su un tensore `[batch, features]`, `y = x / sqrt(mean(x^2) + eps)`

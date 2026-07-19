@@ -47,7 +47,7 @@ obiettivi futuri.
 | Controllo forme tensoriali | ✅ Inferenza reale lungo la pipeline (via IR); vincoli locali via analisi semantica |
 | Rappresentazione interna (IR) | ✅ Completata (Value/Operation/Module, IR builder con inferenza di forma e dtype) |
 | Backend CPU di riferimento (tensori, elementwise, matmul, linear, attivazioni, rmsnorm, softmax) | ✅ Completato per le operazioni attualmente nel linguaggio |
-| Esecuzione (`blackforge run`) | ✅ Esegue un modello con input sintetico e pesi deterministici |
+| Esecuzione (`blackforge run`) | ✅ Esegue un modello con input sintetico; pesi deterministici (casuali) di default, oppure pesi realmente allenati con `--from-checkpoint` (CPU e CUDA) |
 | Autodiff / backward | ✅ Formule analitiche per linear/matmul/addBias/silu/relu/gelu/rmsnorm/softmax, verificate con gradient checking numerico |
 | Loss | ✅ Errore quadratico medio (MSE, per la regressione/forecasting) e cross-entropy con softmax interna (per la classificazione multiclasse, `loss cross_entropy`), entrambe verificate con gradient checking numerico |
 | Optimizer (SGD, AdamW) | ✅ Entrambi implementati e testati (incl. weight decay disaccoppiato di AdamW) |
@@ -164,6 +164,7 @@ blackforge build <file.bf>              # compila e costruisce ogni modello (all
 blackforge run <file.bf>                # esegue il primo modello su CPU (batch=1)
 blackforge run <file.bf> --batch 8      # come sopra, con batch size esplicito
 blackforge run <file.bf> --device cuda:0  # esegue sulla GPU 0 (richiede una build con CUDA)
+blackforge run <file.bf> --from-checkpoint pesi.bfckpt  # esegue con pesi realmente allenati
 blackforge train <file.bf>              # addestra il modello del blocco 'train' (CPU)
 blackforge train <file.bf> --from-checkpoint pesi.bfckpt  # fine-tuning (CPU o CUDA; base per LoRA solo CPU)
 blackforge train <file.bf> --save-checkpoint pesi.bfckpt  # salva i pesi finali (CPU o CUDA)
@@ -178,15 +179,20 @@ blackforge --help
 ```
 
 `blackforge run` esegue la prima pipeline del primo modello con un
-input sintetico (deterministico, non un dataset reale) e pesi generati
-in modo deterministico ma statisticamente arbitrario (non Xavier/Kaiming,
-non caricati da checkpoint): serve a dimostrare che l'intera catena
-letto→validato→compilato→eseguito funziona, non a produrre un modello
-utile. A parità di seme e **senza un blocco `precision`**, `--device cpu`
-e `--device cuda` usano esattamente gli stessi pesi iniziali e producono
-lo stesso risultato (verificato nei test di parità CPU/GPU). `--device
-cuda:N` seleziona l'indice della GPU quando ce n'è più di una (non è
-multi-GPU: si esegue comunque su una sola GPU alla volta).
+input sintetico (deterministico, non un dataset reale). Senza
+`--from-checkpoint`, i pesi sono generati in modo deterministico ma
+statisticamente arbitrario (non Xavier/Kaiming): serve a dimostrare che
+l'intera catena letto→validato→compilato→eseguito funziona, non a
+produrre un output utile. Con `--from-checkpoint <file>` (CPU e CUDA),
+carica invece i pesi realmente allenati da quel checkpoint — è così che
+si esegue un modello per davvero, dopo averlo allenato con
+`blackforge train`. A parità di seme, `--from-checkpoint` assente e
+**senza un blocco `precision`**, `--device cpu` e `--device cuda` usano
+esattamente gli stessi pesi iniziali e producono lo stesso risultato
+(verificato nei test di parità CPU/GPU); con `--from-checkpoint`,
+combaciano allo stesso modo perché caricano entrambi lo stesso file.
+`--device cuda:N` seleziona l'indice della GPU quando ce n'è più di una
+(non è multi-GPU: si esegue comunque su una sola GPU alla volta).
 
 Se il programma dichiara un blocco `precision { storage ... compute ...
 accumulate ... }`, `blackforge run`/`forecast`/`benchmark` lo applicano

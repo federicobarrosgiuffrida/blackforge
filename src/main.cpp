@@ -11,6 +11,7 @@
 
 #include "blackforge/ast/ast.hpp"
 #include "blackforge/backend/cpu/benchmark.hpp"
+#include "blackforge/backend/cpu/checkpoint.hpp"
 #include "blackforge/backend/cpu/executor.hpp"
 #include "blackforge/backend/cpu/forecast_runner.hpp"
 #include "blackforge/backend/cpu/model.hpp"
@@ -26,8 +27,10 @@
 #include "blackforge/sema/semantic_analyzer.hpp"
 
 #if BLACKFORGE_HAS_CUDA
+#include "blackforge/backend/cuda/checkpoint.hpp"
 #include "blackforge/backend/cuda/device_query.hpp"
 #include "blackforge/backend/cuda/executor.hpp"
+#include "blackforge/backend/cuda/model.hpp"
 #include "blackforge/backend/cuda/train_runner.hpp"
 #endif
 
@@ -55,8 +58,8 @@ void printUsage() {
               << "  --device cpu|cuda|cuda:N  Dispositivo su cui eseguire ('run'/'train'/'benchmark', default "
                  "cpu). Su 'train', il backend CUDA supporta solo loss 'mse' e nessun 'lora' per ora (errore "
                  "esplicito se richiesti); checkpoint supportati su entrambi i device, stesso formato\n"
-              << "  --from-checkpoint <file>  Pesi di partenza: fine-tuning/LoRA per 'train' (LoRA solo CPU), "
-                 "obbligatorio per 'forecast' (solo CPU)\n"
+              << "  --from-checkpoint <file>  Pesi da caricare: esecuzione con pesi allenati per 'run', "
+                 "fine-tuning/LoRA per 'train' (LoRA solo CPU), obbligatorio per 'forecast' (solo CPU)\n"
               << "  --save-checkpoint <file>  Dove salvare i pesi al termine dell'addestramento (solo 'train')\n"
               << "  --warmup N         Iterazioni di riscaldamento scartate (solo 'benchmark', default 5)\n"
               << "  --iterations N     Iterazioni misurate (solo 'benchmark', default 20)\n";
@@ -225,7 +228,8 @@ int runCheck(const std::string& path, bool verbose, bool printAst, bool printIr)
     return 1;
 }
 
-int runRun(const std::string& path, std::size_t batchSize, const std::string& device) {
+int runRun(const std::string& path, std::size_t batchSize, const std::string& device,
+           const std::string& fromCheckpoint) {
     DeviceSpec spec;
     std::string deviceError;
     if (!parseDeviceSpec(device, spec, deviceError)) {
@@ -266,13 +270,37 @@ int runRun(const std::string& path, std::size_t batchSize, const std::string& de
         if (!spec.isCuda) {
             blackforge::backend::cpu::Executor executor;
             input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
-            output = executor.run(model, input, result.module.precision);
+
+            if (fromCheckpoint.empty()) {
+                output = executor.run(model, input, result.module.precision);
+            } else {
+                // A differenza di Executor (pesi casuali rigenerati ad ogni
+                // chiamata), Model possiede i propri parametri: e' quello che
+                // serve per eseguire davvero con pesi allenati caricati da
+                // un checkpoint, non solo per verificare che la pipeline
+                // funzioni.
+                blackforge::backend::cpu::Model loadedModel(model, /*seed=*/42, /*lora=*/std::nullopt,
+                                                              result.module.precision);
+                blackforge::backend::cpu::loadCheckpoint(loadedModel, fromCheckpoint);
+                std::cout << "Pesi caricati da '" << fromCheckpoint << "'\n";
+                output = loadedModel.forward(input);
+            }
         } else {
 #if BLACKFORGE_HAS_CUDA
             blackforge::backend::cuda::setActiveDevice(spec.cudaIndex);
             blackforge::backend::cuda::Executor executor;
             input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
-            output = executor.run(model, input);
+
+            if (fromCheckpoint.empty()) {
+                output = executor.run(model, input);
+            } else {
+                blackforge::backend::cuda::Model loadedModel(model);
+                blackforge::backend::cuda::loadCheckpoint(loadedModel, fromCheckpoint);
+                std::cout << "Pesi caricati da '" << fromCheckpoint << "'\n";
+                blackforge::backend::cuda::DeviceTensor inputDevice =
+                    blackforge::backend::cuda::DeviceTensor::fromHost(input);
+                output = loadedModel.forward(inputDevice).toHost();
+            }
             if (result.module.precision.has_value()) {
                 std::cout << "nota: un blocco 'precision' e' dichiarato, ma il backend CUDA non applica ancora "
                              "la quantizzazione simulata (solo il backend CPU lo fa per ora): l'esecuzione "
@@ -687,7 +715,7 @@ int main(int argc, char** argv) {
             std::cerr << "errore: comando 'run' richiede il percorso di un file .bf\n";
             return 2;
         }
-        return runRun(positional.front(), batchSize, device);
+        return runRun(positional.front(), batchSize, device, fromCheckpoint);
     }
     if (command == "train") {
         if (positional.empty()) {
