@@ -941,6 +941,75 @@ misura — stessa scelta gia' fatta per la cache dei piani cuBLASLt
 (mantenuta nonostante lo 0% misurato, perche' corretta e potenzialmente
 utile a scala diversa).
 
+#### Fusione a livello di compilatore (bias+silu, bias+residual) — e un secondo bug di invalidazione trovato dai test
+
+Ottavo intervento, la prima delle due leve identificate per provare a
+**superare** PyTorch (non solo raggiungere la parità): sfruttare la
+conoscenza completa della pipeline, nota in anticipo perché BlackForge
+compila un DSL invece di eseguire in eager mode, per fondere operazioni
+elementwise consecutive che PyTorch eager lancia separatamente.
+
+Nel blocco feedforward, `addBias()+silu()` e `addBias()+add()`
+(residual) erano due kernel ciascuno, con un passaggio completo in
+memoria globale del risultato intermedio tra i due. Sostituiti con
+`addBiasSilu()`/`addBiasResidual()` (`ops_elementwise.cu`): un kernel
+solo, calcola `silu(gemmOutput+bias)` o `gemmOutput+bias+residual` in
+un unico passaggio. `FeedForwardCache` ora cattura il GEMM **grezzo**
+(prima di bias e silu) invece del risultato già con bias applicato: il
+backward fuso (`addBiasSiluBackward`) ricalcola bias+silu al volo
+(un add, economico) invece di leggerli da un tensore intermedio in più
+materializzato dal forward. In più, una pulizia collaterale:
+`addBiasBackward()` calcolava sempre anche `dInput` con una
+`cudaMemcpy` completa, anche quando il chiamante non ne aveva bisogno
+perché è identico per costruzione a `gradOutput` (d(x+bias)/dx = 1) —
+sostituita da `biasGradientOnly()` nei punti dove serviva solo `dBias`,
+eliminando quella copia ridondante.
+
+Nel farlo, sistemato anche un difetto rimasto scoperto dalla milestone
+precedente: il layer `linear` semplice (l'ultimo layer del modello del
+benchmark) non passava ancora dalla cache dei pesi BF16, perché
+`Model::forward()`/`backward()` chiamavano ancora `linearBf16`/
+`matmulBf16Backward` invece delle varianti cachate. Corretto.
+
+Questa correzione ha esposto un secondo bug di invalidazione, più
+subdolo del primo (quello del commit precedente, preso subito dal
+gradient checking): due test di training loop di lunga data
+(`CudaModelTest.TrainingLoopConPrecisionBf16RiduceLaLoss` e la
+variante "modello linguistico") costruiscono `Model`+`AdamW` a mano e
+chiamano `forward()`/`backward()`/`optimizer.step()` in un proprio
+ciclo, **senza mai passare da `train_runner.cu`** — quindi senza mai
+chiamare `invalidateBf16WeightCache()`. Il primo test (solo un layer
+`linear`) è bastato a far fallire l'asserzione "la loss scende" non
+appena `linear` ha iniziato a usare la cache; il secondo
+(`embedding→attention→feedforward→linear`) era probabilmente già
+esposto allo stesso problema fin dalla milestone precedente (attention
+e feedforward usavano già la cache), ma non abbastanza da far fallire
+un controllo così permissivo — l'aggiunta della cache al layer
+`linear` ha fatto traboccare il vaso.
+
+Conclusione: il contratto "chi chiama deve ricordarsi di invalidare"
+si è dimostrato fragile **due volte** nella stessa sessione (la prima
+presa subito dal gradient checking, la seconda quasi passata
+inosservata). Corretto alla radice, non con una toppa: **`Model::forward()`
+invalida incondizionatamente la cache ad ogni sua chiamata**, invece di
+affidarsi a chiamanti esterni. `backward()`, chiamato subito dopo nello
+stesso step, riusa comunque la cache appena popolata da quel preciso
+`forward()` — il beneficio (nessuna doppia conversione forward+backward
+per lo stesso peso) resta intatto, cambia solo *chi* si assume la
+responsabilità: `Model` stesso, mai il chiamante. Le chiamate esplicite
+a `invalidateBf16WeightCache()` in `train_runner.cu`/
+`multi_gpu_train_runner.cu` sono state rimosse perché ridondanti.
+
+Risultato misurato (stesso benchmark a regime, GPU verificata inattiva
+con `nvidia-smi` prima della misura): **21,6-22,1s** contro i 22,2-22,4s
+del commit "cache attivazioni" (l'ultima misura pulita disponibile) —
+un ulteriore **~2%**, più il beneficio (ora davvero verificabile) della
+cache dei pesi BF16 che prima non poteva essere misurato per il rumore
+di sistema. Il gap rispetto a PyTorch scende a **~1,36x più lento**
+(21,85ms/step vs 16,08ms/step). Verificato: 391 test CUDA verdi
+(inclusi i due che avevano scoperto il bug di invalidazione) e 282 test
+CPU.
+
 ## Training (pretraining, fine-tuning, LoRA, forecasting)
 
 `dataset { ... }` e `train { ... }` collegano il linguaggio al motore

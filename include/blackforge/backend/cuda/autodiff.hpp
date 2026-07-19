@@ -51,6 +51,26 @@ struct AddBiasGrad {
 // addBias: output = input + bias (broadcast su ogni riga del batch).
 AddBiasGrad addBiasBackward(const DeviceTensor& gradOutput);
 
+// Come addBiasBackward(), ma calcola SOLO dBias, senza la cudaMemcpy
+// che produce dInput (identico a gradOutput per costruzione — il
+// chiamante che non ne ha bisogno puo' riusare gradOutput direttamente
+// invece di pagare una copia device-to-device inutile). Pensata per il
+// percorso di addestramento (feedForwardBackwardCached).
+DeviceTensor biasGradientOnly(const DeviceTensor& gradOutput);
+
+struct AddBiasSiluGrad {
+    DeviceTensor dGemmOutput;
+    DeviceTensor dBias;
+};
+// Backward fuso di addBiasSilu() (vedi ops.hpp): dato il gemm output
+// GREZZO (prima di bias/silu, come cachato da feedForwardForwardCached)
+// e il gradiente rispetto a hidden = silu(gemmOutput+bias), calcola
+// dGemmOutput e dBias ricalcolando preActivation = gemmOutput+bias al
+// volo (economico) invece di leggerlo da un tensore separato
+// materializzato dal forward.
+AddBiasSiluGrad addBiasSiluBackward(const DeviceTensor& gemmOutput, const DeviceTensor& bias,
+                                     const DeviceTensor& dHidden);
+
 DeviceTensor siluBackward(const DeviceTensor& input, const DeviceTensor& gradOutput);
 DeviceTensor reluBackward(const DeviceTensor& input, const DeviceTensor& gradOutput);
 DeviceTensor geluBackward(const DeviceTensor& input, const DeviceTensor& gradOutput);

@@ -250,6 +250,21 @@ Model::Model(const ir::ModelIR& modelIR, unsigned int seed, std::optional<ir::Pr
 }
 
 DeviceTensor Model::forward(const DeviceTensor& input, bool inputRangeTrusted) {
+    // Invalida SEMPRE la cache dei pesi BF16 (vedi matmulBf16CachedWeight
+    // in ops.hpp) prima di ricominciare un forward: piu' semplice e
+    // molto piu' sicuro che affidarsi a chi chiama Model per ricordarsi
+    // di farlo dopo ogni optimizer->step() — un contratto che si e'
+    // rivelato fragile (due test di training loop diretti, che non
+    // passano da train_runner.cu, non lo rispettavano e usavano pesi
+    // BF16 non aggiornati senza che nessun controllo lo segnalasse).
+    // backward(), chiamato subito dopo nello stesso step, riusa
+    // comunque la cache appena popolata da questo stesso forward() — il
+    // beneficio della cache (niente doppia conversione forward+backward
+    // per lo stesso peso) resta intatto, cambia solo CHI si assume la
+    // responsabilita' di invalidare: Model stesso, non piu' il
+    // chiamante.
+    invalidateBf16WeightCache();
+
     DeviceTensor current = input.clone();
 
     for (auto& layer : layers_) {
@@ -258,8 +273,9 @@ DeviceTensor Model::forward(const DeviceTensor& input, bool inputRangeTrusted) {
 
         switch (layer.kind) {
             case ir::OpKind::Linear:
-                current = useTensorCoreLinear_ ? linearBf16(current, layer.weight->value, layer.bias->value)
-                                                : linear(current, layer.weight->value, layer.bias->value);
+                current = useTensorCoreLinear_
+                              ? linearBf16CachedWeight(current, layer.weight->value, layer.bias->value)
+                              : linear(current, layer.weight->value, layer.bias->value);
                 break;
             case ir::OpKind::Silu: current = silu(current); break;
             case ir::OpKind::Relu: current = relu(current); break;
@@ -298,15 +314,20 @@ void Model::backward(const DeviceTensor& outputGrad, bool inputRangeTrusted) {
 
         switch (layer.kind) {
             case ir::OpKind::Linear: {
-                AddBiasGrad addGrad = addBiasBackward(gradCurrent);
+                // dBias soltanto: dInput di addBias sarebbe comunque una
+                // copia identica di gradCurrent (d(x+bias)/dx = 1), quindi
+                // si riusa gradCurrent direttamente sotto invece di pagare
+                // la cudaMemcpy che addBiasBackward() farebbe per produrlo
+                // (vedi biasGradientOnly in autodiff.hpp).
+                DeviceTensor dBias = biasGradientOnly(gradCurrent);
                 MatmulGrad matGrad =
                     useTensorCoreLinear_
-                        ? matmulBf16Backward(flatten2D(layer.cachedInput), layer.weight->value,
-                                             flatten2D(addGrad.dInput))
-                        : matmulBackward(flatten2D(layer.cachedInput), layer.weight->value, flatten2D(addGrad.dInput));
+                        ? matmulBf16BackwardCachedWeight(flatten2D(layer.cachedInput), layer.weight->value,
+                                                          flatten2D(gradCurrent))
+                        : matmulBackward(flatten2D(layer.cachedInput), layer.weight->value, flatten2D(gradCurrent));
 
                 accumulate(layer.weight->grad, matGrad.dB);
-                accumulate(layer.bias->grad, addGrad.dBias);
+                accumulate(layer.bias->grad, dBias);
 
                 gradCurrent = std::move(matGrad.dA).reshaped(layer.cachedInput.shape());
                 break;

@@ -80,14 +80,6 @@ DeviceTensor projectionMatmulCached(const DeviceTensor& a, const DeviceTensor& b
     return useBf16 ? matmulBf16CachedWeight(a, b) : matmul(a, b);
 }
 
-// Come projectionLinear(), ma usa linearBf16CachedWeight() al posto di
-// linearBf16() quando useBf16 e' attivo — stessa relazione di
-// projectionMatmulCached() rispetto a projectionMatmul().
-DeviceTensor projectionLinearCached(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias,
-                                     bool useBf16) {
-    return useBf16 ? linearBf16CachedWeight(input, weight, bias) : linear(input, weight, bias);
-}
-
 DeviceTensor feedForwardImpl(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
                               const DeviceTensor& w2, const DeviceTensor& b2, bool useBf16) {
     DeviceTensor normed = rmsnorm(input);
@@ -190,11 +182,36 @@ DeviceTensor selfAttentionIncrementalImpl(const DeviceTensor& newInput, const De
 DeviceTensor feedForwardForwardCachedImpl(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
                                            const DeviceTensor& w2, const DeviceTensor& b2, bool useBf16,
                                            FeedForwardCache& cache) {
+    // A differenza di feedForwardImpl(), qui il GEMM grezzo (prima di
+    // bias/silu) viene tenuto separato invece di passare per
+    // projectionLinearCached() (che fonde subito il bias): serve cachare
+    // gemm1 SENZA bias/silu applicati, cosi' addBiasSiluBackward puo'
+    // ricalcolare bias+silu al volo nel backward invece di leggerli da
+    // un tensore intermedio in piu' (vedi FeedForwardCache in ops.hpp).
     cache.normed = rmsnorm(input);
-    cache.preActivation = projectionLinearCached(cache.normed, w1, b1, useBf16);
-    cache.hidden = silu(cache.preActivation);
-    DeviceTensor out = projectionLinearCached(cache.hidden, w2, b2, useBf16);
-    return add(input, out);
+
+    std::size_t dim = cache.normed.shape().back();
+    std::size_t rows = cache.normed.elementCount() / dim;
+    std::size_t hiddenDim = w1.dim(1);
+
+    DeviceTensor gemm1Flat = projectionMatmulCached(cache.normed.clone().reshaped({rows, dim}), w1, useBf16);
+    std::vector<std::size_t> hiddenShape = cache.normed.shape();
+    hiddenShape.back() = hiddenDim;
+    cache.gemm1 = std::move(gemm1Flat).reshaped(hiddenShape);
+    // Fonde addBias(gemm1,b1)+silu(...) in un solo kernel (vedi ops.hpp).
+    cache.hidden = addBiasSilu(cache.gemm1, b1);
+
+    std::size_t hiddenRows = cache.hidden.elementCount() / hiddenDim;
+    std::size_t outDim = w2.dim(1);
+    DeviceTensor gemm2Flat =
+        projectionMatmulCached(cache.hidden.clone().reshaped({hiddenRows, hiddenDim}), w2, useBf16);
+    std::vector<std::size_t> outShape = input.shape();
+    outShape.back() = outDim;
+    DeviceTensor gemm2 = std::move(gemm2Flat).reshaped(outShape);
+
+    // Fonde addBias(gemm2,b2)+add(input,...) (residual) in un solo
+    // kernel (vedi ops.hpp).
+    return addBiasResidual(gemm2, b2, input);
 }
 
 DeviceTensor selfAttentionForwardCachedImpl(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,

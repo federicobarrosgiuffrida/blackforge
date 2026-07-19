@@ -30,6 +30,37 @@ __global__ void addBiasKernel(float* out, const float* input, const float* bias,
     }
 }
 
+// Fonde addBias()+silu() in un solo kernel: evita di materializzare il
+// risultato intermedio di addBias() in memoria globale prima di
+// applicare silu() — un lancio di kernel e un round-trip di memoria in
+// meno rispetto a chiamare le due funzioni in sequenza. Usata dal
+// percorso di addestramento (vedi feedForwardForwardCached in
+// ops_transformer.cu).
+__global__ void addBiasSiluKernel(float* out, const float* gemmOutput, const float* bias, std::size_t batch,
+                                   std::size_t features) {
+    std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = batch * features;
+    if (i < total) {
+        std::size_t col = i % features;
+        float x = gemmOutput[i] + bias[col];
+        out[i] = x / (1.0F + expf(-x));
+    }
+}
+
+// Fonde addBias()+add() (residual) in un solo kernel: out = gemmOutput
+// + bias + residual. Usata dal percorso di addestramento per l'ultimo
+// layer lineare di un blocco feedforward (residual = l'input del
+// blocco).
+__global__ void addBiasResidualKernel(float* out, const float* gemmOutput, const float* bias, const float* residual,
+                                       std::size_t batch, std::size_t features) {
+    std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = batch * features;
+    if (i < total) {
+        std::size_t col = i % features;
+        out[i] = gemmOutput[i] + bias[col] + residual[i];
+    }
+}
+
 // Le formule seguenti sono identiche, elemento per elemento, a quelle
 // del backend CPU di riferimento (src/backend/cpu/ops.cpp): serve a
 // poter confrontare direttamente i risultati CPU/GPU nei test.
@@ -139,6 +170,43 @@ DeviceTensor addBias(const DeviceTensor& input, const DeviceTensor& bias) {
     std::size_t n = input.elementCount();
     if (n > 0) {
         addBiasKernel<<<gridSizeFor(n), kBlockSize>>>(result.data(), input.data(), bias.data(), rows, features);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+DeviceTensor addBiasSilu(const DeviceTensor& gemmOutput, const DeviceTensor& bias) {
+    if (gemmOutput.rank() < 2 || bias.rank() != 1 || gemmOutput.shape().back() != bias.dim(0)) {
+        throw std::invalid_argument("addBiasSilu: attesi gemmOutput [..., features] e bias [features] con "
+                                     "features corrispondenti");
+    }
+    std::size_t features = gemmOutput.shape().back();
+    std::size_t rows = gemmOutput.elementCount() / features;
+    DeviceTensor result(gemmOutput.shape());
+    std::size_t n = gemmOutput.elementCount();
+    if (n > 0) {
+        addBiasSiluKernel<<<gridSizeFor(n), kBlockSize>>>(result.data(), gemmOutput.data(), bias.data(), rows,
+                                                            features);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+DeviceTensor addBiasResidual(const DeviceTensor& gemmOutput, const DeviceTensor& bias, const DeviceTensor& residual) {
+    if (gemmOutput.rank() < 2 || bias.rank() != 1 || gemmOutput.shape().back() != bias.dim(0)) {
+        throw std::invalid_argument("addBiasResidual: attesi gemmOutput [..., features] e bias [features] con "
+                                     "features corrispondenti");
+    }
+    if (gemmOutput.shape() != residual.shape()) {
+        throw std::invalid_argument("addBiasResidual: gemmOutput e residual devono avere la stessa forma");
+    }
+    std::size_t features = gemmOutput.shape().back();
+    std::size_t rows = gemmOutput.elementCount() / features;
+    DeviceTensor result(gemmOutput.shape());
+    std::size_t n = gemmOutput.elementCount();
+    if (n > 0) {
+        addBiasResidualKernel<<<gridSizeFor(n), kBlockSize>>>(result.data(), gemmOutput.data(), bias.data(),
+                                                                residual.data(), rows, features);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }
     return result;

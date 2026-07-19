@@ -13,6 +13,22 @@ DeviceTensor add(const DeviceTensor& a, const DeviceTensor& b);
 // i dettagli, stessa semantica).
 DeviceTensor addBias(const DeviceTensor& input, const DeviceTensor& bias);
 
+// Fonde addBias(gemmOutput, bias) + silu(...) in un solo kernel:
+// hidden = silu(gemmOutput + bias). Generalizzato a rango >= 2 come
+// addBias(). Pensata per il percorso di addestramento
+// (feedForwardForwardCached, vedi sotto): evita di materializzare
+// separatamente il risultato di addBias prima di applicare silu — un
+// lancio di kernel e un round-trip di memoria globale in meno rispetto
+// a chiamare addBias()+silu() in sequenza.
+DeviceTensor addBiasSilu(const DeviceTensor& gemmOutput, const DeviceTensor& bias);
+
+// Fonde addBias(gemmOutput, bias) + add(residual, ...) in un solo
+// kernel: output = gemmOutput + bias + residual. Generalizzato a
+// rango >= 2. Pensata per l'ultimo layer lineare di un blocco
+// feedforward nel percorso di addestramento (residual = l'input del
+// blocco).
+DeviceTensor addBiasResidual(const DeviceTensor& gemmOutput, const DeviceTensor& bias, const DeviceTensor& residual);
+
 // Prodotto matriciale 2D via cuBLAS SGEMM: [M, K] x [K, N] -> [M, N].
 // Primitivo puramente 2D (non generalizzato): e' 'linear' che si
 // occupa di appiattire un input a rango > 2 prima di chiamarlo.
@@ -39,28 +55,28 @@ DeviceTensor matmulBf16(const DeviceTensor& a, const DeviceTensor& b);
 // Come matmulBf16(), ma la conversione BF16 dell'operando 'b' (il peso)
 // viene CACHATA per puntatore invece di essere ricalcolata ad ogni
 // chiamata — 'a' (l'attivazione, che cambia davvero ad ogni chiamata)
-// non e' mai cachata. PRECONDIZIONE, responsabilita' del chiamante:
-// serve chiamare invalidateBf16WeightCache() ogni volta che i VALORI di
-// un peso passato qui possono essere cambiati (dopo optimizer->step(),
-// dopo il caricamento di un checkpoint) — altrimenti si rischia di usare
-// silenziosamente pesi non aggiornati. Per questo NON e' una sostituzione
+// non e' mai cachata. La cache e' invalidata incondizionatamente da
+// cuda::Model::forward() ad ogni sua chiamata (vedi model.cu): nessun
+// altro chiamante deve preoccuparsi di farlo esplicitamente — una prima
+// versione richiedeva un'invalidazione manuale dopo ogni
+// optimizer->step()/caricamento di checkpoint, ma si e' rivelata un
+// contratto fragile (due test di training loop diretti, che non
+// passano da Model::forward() -> nessun altro punto di ingresso, non lo
+// rispettavano silenziosamente). Per questo NON e' una sostituzione
 // generale di matmulBf16(): e' pensata solo per l'uso interno di
 // cuda::Model durante l'addestramento (vedi selfAttentionForwardCached/
 // feedForwardForwardCached sotto, che la usano tramite un helper interno
-// non esposto), dove il chiamante (train_runner.cu/
-// multi_gpu_train_runner.cu) gia' invalida esplicitamente dopo ogni
-// optimizer->step()/caricamento di checkpoint. Il resto del codice (test
-// di gradient checking, blackforge run/executor.cu, ecc.) deve continuare
-// a usare matmulBf16() semplice, che non ha questa precondizione.
+// non esposto). Il resto del codice (test di gradient checking,
+// blackforge run/executor.cu, ecc.) deve continuare a usare matmulBf16()
+// semplice, che non ha alcuna cache.
 DeviceTensor matmulBf16CachedWeight(const DeviceTensor& a, const DeviceTensor& b);
 
 // Invalida la cache dei pesi convertiti in BF16 usata da
 // matmulBf16CachedWeight()/matmulBf16BackwardCachedWeight() (vedi
 // ops_tensorcore.cu, e il commento sopra su matmulBf16CachedWeight per
-// il contratto completo). Il pool di memoria puo' restituire lo STESSO
-// puntatore per un buffer riallocato (vedi device_pool.hpp): la sola
-// identita' del puntatore non basta come chiave di validita', serve
-// questo segnale esplicito.
+// il contratto completo). Chiamata incondizionatamente da
+// cuda::Model::forward() ad ogni sua invocazione: il codice applicativo
+// non deve mai chiamarla direttamente.
 void invalidateBf16WeightCache();
 
 DeviceTensor silu(const DeviceTensor& input);
@@ -125,9 +141,10 @@ DeviceTensor feedForwardBf16(const DeviceTensor& input, const DeviceTensor& w1, 
 // sopra per il razionale completo, identico qui): rmsnorm/linear1/silu
 // riusati dal backward invece di ricalcolati.
 struct FeedForwardCache {
-    DeviceTensor normed;         // [..., dim]: rmsnorm(input)
-    DeviceTensor preActivation;  // [..., hidden]: linear1(normed), PRIMA di silu
-    DeviceTensor hidden;         // [..., hidden]: silu(preActivation)
+    DeviceTensor normed;  // [..., dim]: rmsnorm(input)
+    DeviceTensor gemm1;   // [..., hidden]: normed @ w1, GREZZO (prima di bias E silu — vedi
+                           // addBiasSiluBackward in autodiff.hpp, che ricalcola bias+silu al volo)
+    DeviceTensor hidden;  // [..., hidden]: addBiasSilu(gemm1, b1) = silu(gemm1 + b1)
 };
 
 // Come feedForward()/feedForwardBf16(), ma popola 'cache' — stessa

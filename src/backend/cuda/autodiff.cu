@@ -112,6 +112,22 @@ __global__ void siluBackwardKernel(float* out, const float* input, const float* 
     }
 }
 
+// Backward fuso di addBiasSilu() (vedi ops.hpp): ricalcola preActivation
+// = gemmOutput+bias al volo (economico, un add) invece di leggerlo da
+// un tensore separato materializzato dal forward — lo stesso principio
+// di risparmio di memoria che ha motivato la fusione nel forward.
+__global__ void addBiasSiluBackwardKernel(float* dGemmOutput, const float* gemmOutput, const float* bias,
+                                           const float* dHidden, std::size_t batch, std::size_t features) {
+    std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = batch * features;
+    if (i < total) {
+        std::size_t col = i % features;
+        float x = gemmOutput[i] + bias[col];
+        float sigmoid = 1.0F / (1.0F + expf(-x));
+        dGemmOutput[i] = dHidden[i] * sigmoid * (1.0F + x * (1.0F - sigmoid));
+    }
+}
+
 __global__ void reluBackwardKernel(float* out, const float* input, const float* gradOutput, std::size_t n) {
     std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -362,6 +378,53 @@ AddBiasGrad addBiasBackward(const DeviceTensor& gradOutput) {
     }
 
     return AddBiasGrad{std::move(dInput), std::move(dBias)};
+}
+
+DeviceTensor biasGradientOnly(const DeviceTensor& gradOutput) {
+    // Come addBiasBackward(), ma calcola SOLO dBias, senza la
+    // cudaMemcpy che produce dInput (identico a gradOutput per
+    // costruzione — il chiamante che non ne ha bisogno puo' riusare
+    // gradOutput direttamente, vedi feedForwardBackwardCached in
+    // ops_transformer.cu).
+    if (gradOutput.rank() < 2) {
+        throw std::invalid_argument("biasGradientOnly: atteso un gradiente a rango >= 2 sul device");
+    }
+    std::size_t features = gradOutput.shape().back();
+    std::size_t rows = gradOutput.elementCount() / features;
+
+    DeviceTensor dBias({features});
+    if (features > 0) {
+        addBiasBackwardDBiasKernel<<<gridSizeFor(features), kBlockSize>>>(dBias.data(), gradOutput.data(), rows,
+                                                                           features);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return dBias;
+}
+
+AddBiasSiluGrad addBiasSiluBackward(const DeviceTensor& gemmOutput, const DeviceTensor& bias,
+                                     const DeviceTensor& dHidden) {
+    if (gemmOutput.shape() != dHidden.shape() || bias.rank() != 1 || gemmOutput.shape().back() != bias.dim(0)) {
+        throw std::invalid_argument("addBiasSiluBackward: forme incompatibili sul device");
+    }
+    std::size_t features = gemmOutput.shape().back();
+    std::size_t rows = gemmOutput.elementCount() / features;
+
+    DeviceTensor dGemmOutput(gemmOutput.shape());
+    std::size_t n = gemmOutput.elementCount();
+    if (n > 0) {
+        addBiasSiluBackwardKernel<<<gridSizeFor(n), kBlockSize>>>(dGemmOutput.data(), gemmOutput.data(), bias.data(),
+                                                                    dHidden.data(), rows, features);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+
+    DeviceTensor dBias({features});
+    if (features > 0) {
+        addBiasBackwardDBiasKernel<<<gridSizeFor(features), kBlockSize>>>(dBias.data(), dGemmOutput.data(), rows,
+                                                                           features);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+
+    return AddBiasSiluGrad{std::move(dGemmOutput), std::move(dBias)};
 }
 
 DeviceTensor siluBackward(const DeviceTensor& input, const DeviceTensor& gradOutput) {
@@ -660,23 +723,30 @@ FeedForwardGrad feedForwardBackwardCachedImpl(const DeviceTensor& input, const D
     (void)b1;
     (void)b2;
 
-    AddBiasGrad addGrad2 = addBiasBackward(gradOutput);
-    MatmulGrad matGrad2 =
-        projectionMatmulBackwardCached(flatten2D(cache.hidden), w2, flatten2D(addGrad2.dInput), useBf16);
+    // output = gemm2 + b2 + input (residual, vedi addBiasResidual in
+    // ops.hpp): dGemm2 = gradOutput (identita'), quindi si passa
+    // gradOutput direttamente al backward del matmul invece di pagare
+    // la cudaMemcpy che addBiasBackward() farebbe per produrre un dInput
+    // comunque identico (vedi biasGradientOnly in autodiff.hpp).
+    DeviceTensor dBias2 = biasGradientOnly(gradOutput);
+    MatmulGrad matGrad2 = projectionMatmulBackwardCached(flatten2D(cache.hidden), w2, flatten2D(gradOutput), useBf16);
     DeviceTensor dHidden = std::move(matGrad2.dA).reshaped(cache.hidden.shape());
 
-    DeviceTensor dPreActivation = siluBackward(cache.preActivation, dHidden);
+    // Backward fuso di addBiasSilu (vedi ops.hpp): ricalcola bias+silu
+    // al volo da cache.gemm1 (il GEMM grezzo, senza bias/silu applicati)
+    // invece di leggerli da un tensore intermedio in piu' materializzato
+    // dal forward.
+    AddBiasSiluGrad hiddenGrad = addBiasSiluBackward(cache.gemm1, b1, dHidden);
 
-    AddBiasGrad addGrad1 = addBiasBackward(dPreActivation);
     MatmulGrad matGrad1 =
-        projectionMatmulBackwardCached(flatten2D(cache.normed), w1, flatten2D(addGrad1.dInput), useBf16);
+        projectionMatmulBackwardCached(flatten2D(cache.normed), w1, flatten2D(hiddenGrad.dGemmOutput), useBf16);
     DeviceTensor dNormed = std::move(matGrad1.dA).reshaped(cache.normed.shape());
 
     DeviceTensor dInputFromBranch = rmsnormBackward(input, dNormed);
     DeviceTensor dInput = add(gradOutput, dInputFromBranch);
 
-    return FeedForwardGrad{std::move(dInput), std::move(matGrad1.dB), std::move(addGrad1.dBias),
-                            std::move(matGrad2.dB), std::move(addGrad2.dBias)};
+    return FeedForwardGrad{std::move(dInput), std::move(matGrad1.dB), std::move(hiddenGrad.dBias),
+                            std::move(matGrad2.dB), std::move(dBias2)};
 }
 
 // Come selfAttentionBackwardImpl, ma legge rmsnorm/Q/K/V/l'intero

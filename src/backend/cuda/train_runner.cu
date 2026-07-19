@@ -147,13 +147,10 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
 
     if (!fromCheckpointPath.empty()) {
         loadCheckpoint(model, fromCheckpointPath);
-        // Il pool di memoria puo' restituire lo stesso puntatore per un
-        // buffer riallocato con valori diversi (vedi il commento su
-        // invalidateBf16WeightCache() in ops.hpp): un checkpoint appena
-        // caricato deve invalidare la cache dei pesi BF16, altrimenti
-        // matmulBf16/matmulBf16Backward potrebbero silenziosamente usare
-        // ancora i pesi di prima del caricamento.
-        invalidateBf16WeightCache();
+        // Nessuna invalidazione esplicita della cache dei pesi BF16 qui:
+        // Model::forward() la invalida incondizionatamente ad ogni
+        // chiamata (vedi model.cu), quindi il prossimo forward() dopo
+        // questo caricamento parte gia' pulito.
         if (progressOutput != nullptr) {
             *progressOutput << "Pesi caricati da '" << fromCheckpointPath << "' (fine-tuning)\n";
         }
@@ -236,11 +233,10 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
             DeviceTensor grad = lossAccumulateFn(output, targetDevice, lossAccumulator);
             model.backward(grad, firstLayerVocabSize.has_value());
             optimizer->step(model.parameters());
-            // I pesi sono appena cambiati: la cache dei pesi BF16 usata
-            // dal prossimo forward()/backward() deve essere invalidata
-            // (vedi il commento su invalidateBf16WeightCache() in
-            // ops.hpp).
-            invalidateBf16WeightCache();
+            // Nessuna invalidazione esplicita qui: il prossimo
+            // model.forward() (al giro successivo del ciclo) invalida
+            // la cache dei pesi BF16 incondizionatamente da solo (vedi
+            // model.cu).
         }
 
         float lossSum = lossAccumulator.toHost().at(0);
