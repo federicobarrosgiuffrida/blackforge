@@ -786,6 +786,73 @@ teoria ragionevole, smentita dalla misura diretta). Modifica mantenuta
 comunque: codice piu' pulito (un solo punto di lancio invece di un
 loop), nessuna regressione, verificato sui 391 test CUDA.
 
+#### Cache pesi BF16 + clone in flatten2D: investigati, non implementati
+
+Quinto intervento dell'audit, l'ultimo esaminato in questa sessione.
+Due idee distinte, entrambe misurate/stimate PRIMA di scrivere codice
+definitivo (stesso protocollo di tutta questa sezione):
+
+1. **Cache dei pesi convertiti in BF16**: `matmulBf16`/`matmulBf16Backward`
+   (`ops_tensorcore.cu`) convertono l'operando `b` (il peso) da FP32 a
+   BF16 ad OGNI chiamata (`toBf16`), anche se il peso cambia una sola
+   volta per step (dopo `optimizer->step()`) — forward e backward
+   insieme lo riconvertono piu' volte per step senza necessita'. Prima
+   di implementare una cache corretta (che richiede invalidazione
+   affidabile: il puntatore di `param->value` resta stabile per tutta
+   la vita del modello — l'optimizer scrive in-place — quindi non basta
+   la sola identita' del puntatore come chiave, serve un segnale
+   esplicito di "questo peso e' cambiato"), un esperimento usa-e-getta
+   (cache MAI invalidata, deliberatamente scorretta, scartata subito
+   dopo la misura — la loss infatti non scendeva piu', conferma che il
+   trucco stava davvero bypassando gli aggiornamenti) ha misurato il
+   **tetto massimo** di guadagno possibile: **26,4s** contro 27,4-27,8s
+   — un ~4-5%. Una cache CORRETTA (con invalidazione reale) avrebbe
+   inevitabilmente un overhead proprio (bookkeeping, controllo di
+   validita' ad ogni chiamata) che eroderebbe parte di questo tetto —
+   probabilmente vicino al rumore di misura di questo benchmark (~1-2%
+   tra run identiche). Dato il rischio concreto (un bug di invalidazione
+   qui produrrebbe un training che sembra funzionare ma converge su pesi
+   sbagliati — un bug di correttezza silenzioso, non solo di prestazioni)
+   a fronte di un guadagno atteso piccolo e incerto, non implementata in
+   questa sessione.
+
+2. **`flatten2D` e la sua `clone()`** (`autodiff.cu`/`model.cu`): appiattisce
+   un tensore a rango > 2 a `[righe, features]` per poterlo passare a
+   `matmulBackward`/`matmulBf16Backward` (primitivi puramente 2D),
+   sempre via `clone()` (una copia device-to-device) perche' il
+   tensore originale deve restare valido e riutilizzabile dal chiamante
+   dopo la chiamata (commento esplicito nel codice). Circa 82 chiamate
+   per step di backward sul modello del benchmark. Stima (non misurata
+   con un esperimento usa-e-getta, per il rischio di corruzione di
+   memoria di un hack scorretto su un puntatore condiviso): al più
+   qualche decina di MB di traffico device-to-device ridondante per
+   step, dell'ordine di ~0,1-0,2ms su banda GPU moderna — sotto lo
+   0,5-1% del tempo per step attuale (27,5ms), quindi sotto il rumore di
+   misura di questo stesso benchmark. Correggerlo richiederebbe comunque
+   verificare individualmente ciascuno dei ~7 punti di chiamata per
+   accertare che il tensore originale non serva più dopo (rischio di un
+   bug "use after move" se fatto in fretta). Non implementato: il
+   guadagno atteso è sotto la soglia di rilevabilità di questo
+   benchmark, a fronte di un rischio di correttezza non nullo.
+
+**Conclusione dell'audit**: dopo cinque interventi (cache cuBLASLt: 0%,
+sync host rimosse: ~4%, fix del pool di memoria: **-34%**, optimizer/zeroGrad
+fusi: 0%, cache BF16/flatten2D: non implementati, guadagno atteso sotto
+il rumore), il gap rispetto a PyTorch è sceso da **~2,5x a ~1,7x più
+lento** (39,6ms/step → 27,5ms/step, contro 16,08ms/step di PyTorch). Il
+guadagno decisivo è stato quasi interamente il fix del pool di memoria —
+un bug genuino nascosto in codice già "completato", trovato per caso
+leggendo il codice sorgente prima di implementare l'intervento
+successivo, non dall'audit iniziale basato su stime. Il profilo di
+overhead residuo a questo punto è **piatto**: nessun singolo colpevole
+dominante rimasto, solo tanti piccoli costi sparsi. Trovarne altri
+richiederebbe una profilazione reale (Nsight Compute), non altre
+iterazioni alla cieca — lavoro futuro esplicito. CUDA graph (cattura
+dell'intero step di training) e memoria pinned + prefetch del batch
+successivo restano investimenti implementativi sostanziali con ritorno
+atteso incerto a questo punto, e non sono stati intrapresi in questa
+sessione.
+
 ## Training (pretraining, fine-tuning, LoRA, forecasting)
 
 `dataset { ... }` e `train { ... }` collegano il linguaggio al motore
