@@ -170,6 +170,57 @@ DeviceTensor selfAttentionIncrementalImpl(const DeviceTensor& newInput, const De
     return add(newInput, projected);
 }
 
+DeviceTensor feedForwardForwardCachedImpl(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                                           const DeviceTensor& w2, const DeviceTensor& b2, bool useBf16,
+                                           FeedForwardCache& cache) {
+    cache.normed = rmsnorm(input);
+    cache.preActivation = projectionLinear(cache.normed, w1, b1, useBf16);
+    cache.hidden = silu(cache.preActivation);
+    DeviceTensor out = projectionLinear(cache.hidden, w2, b2, useBf16);
+    return add(input, out);
+}
+
+DeviceTensor selfAttentionForwardCachedImpl(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
+                                             const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
+                                             bool useBf16, SelfAttentionCache& cache, const char* callerName) {
+    if (input.rank() != 3) {
+        throw std::invalid_argument(std::string(callerName) +
+                                     ": richiede un input a rango 3 [batch, seq, dim] sul device");
+    }
+    std::size_t batch = input.dim(0);
+    std::size_t seq = input.dim(1);
+    std::size_t dim = input.dim(2);
+    if (numHeads == 0 || dim % numHeads != 0) {
+        throw std::invalid_argument(std::string(callerName) + ": numHeads deve dividere esattamente dim");
+    }
+    std::size_t headDim = dim / numHeads;
+    float scaleFactor = 1.0F / std::sqrt(static_cast<float>(headDim));
+
+    // rmsnorm(input) e' gia' un prvalue indipendente (non alias di
+    // input): reshaped() diretto sul risultato, zero clone (a
+    // differenza di selfAttentionImpl sopra, che deve clonare 'normed'
+    // perche' li' resta anche a rango 3 per essere riusato tre volte —
+    // qui invece serve solo la forma appiattita, riusata per
+    // riferimento costante da tutte e tre le proiezioni).
+    cache.normedFlat = rmsnorm(input).reshaped({batch * seq, dim});
+    cache.q = projectionMatmul(cache.normedFlat, wq, useBf16).reshaped({batch, seq, dim});
+    cache.k = projectionMatmul(cache.normedFlat, wk, useBf16).reshaped({batch, seq, dim});
+    cache.v = projectionMatmul(cache.normedFlat, wv, useBf16).reshaped({batch, seq, dim});
+
+    FusedAttentionForwardResult attn = fusedAttentionForward(cache.q, cache.k, cache.v, numHeads, scaleFactor,
+                                                               /*oldLen=*/0);
+    cache.attnOutput = std::move(attn.output);
+    cache.attnM = std::move(attn.m);
+    cache.attnL = std::move(attn.l);
+
+    // cache.attnOutput deve restare valido (rango 3) per il backward:
+    // un clone qui, a differenza di selfAttentionImpl che puo' consumare
+    // 'attn.output' direttamente dato che non lo riusa dopo.
+    DeviceTensor projected = projectionMatmul(cache.attnOutput.clone().reshaped({batch * seq, dim}), wout, useBf16)
+                                  .reshaped({batch, seq, dim});
+    return add(input, projected);
+}
+
 }  // namespace
 
 DeviceTensor feedForward(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
@@ -204,6 +255,19 @@ DeviceTensor selfAttentionIncrementalBf16(const DeviceTensor& newInput, const De
                                            std::size_t numHeads, KVCache& cache) {
     return selfAttentionIncrementalImpl(newInput, wq, wk, wv, wout, numHeads, cache, /*useBf16=*/true,
                                          "selfAttentionIncrementalBf16");
+}
+
+DeviceTensor feedForwardForwardCached(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                                       const DeviceTensor& w2, const DeviceTensor& b2, bool useBf16,
+                                       FeedForwardCache& cache) {
+    return feedForwardForwardCachedImpl(input, w1, b1, w2, b2, useBf16, cache);
+}
+
+DeviceTensor selfAttentionForwardCached(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
+                                         const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
+                                         bool useBf16, SelfAttentionCache& cache) {
+    return selfAttentionForwardCachedImpl(input, wq, wk, wv, wout, numHeads, useBf16, cache,
+                                           "selfAttentionForwardCached");
 }
 
 }  // namespace blackforge::backend::cuda

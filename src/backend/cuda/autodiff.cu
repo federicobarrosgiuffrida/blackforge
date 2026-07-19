@@ -641,6 +641,80 @@ SelfAttentionGrad selfAttentionBackwardImpl(const DeviceTensor& input, const Dev
                               std::move(vBackward.dB), std::move(woutGrad.dB)};
 }
 
+// Come feedForwardBackwardImpl, ma legge rmsnorm/linear1/silu dalla
+// cache invece di ricalcolarli (vedi il commento in autodiff.hpp su
+// feedForwardBackwardCached per il razionale completo).
+FeedForwardGrad feedForwardBackwardCachedImpl(const DeviceTensor& input, const DeviceTensor& w1,
+                                               const DeviceTensor& b1, const DeviceTensor& w2, const DeviceTensor& b2,
+                                               const FeedForwardCache& cache, const DeviceTensor& gradOutput,
+                                               bool useBf16) {
+    (void)b1;
+    (void)b2;
+
+    AddBiasGrad addGrad2 = addBiasBackward(gradOutput);
+    MatmulGrad matGrad2 = projectionMatmulBackward(flatten2D(cache.hidden), w2, flatten2D(addGrad2.dInput), useBf16);
+    DeviceTensor dHidden = std::move(matGrad2.dA).reshaped(cache.hidden.shape());
+
+    DeviceTensor dPreActivation = siluBackward(cache.preActivation, dHidden);
+
+    AddBiasGrad addGrad1 = addBiasBackward(dPreActivation);
+    MatmulGrad matGrad1 = projectionMatmulBackward(flatten2D(cache.normed), w1, flatten2D(addGrad1.dInput), useBf16);
+    DeviceTensor dNormed = std::move(matGrad1.dA).reshaped(cache.normed.shape());
+
+    DeviceTensor dInputFromBranch = rmsnormBackward(input, dNormed);
+    DeviceTensor dInput = add(gradOutput, dInputFromBranch);
+
+    return FeedForwardGrad{std::move(dInput), std::move(matGrad1.dB), std::move(addGrad1.dBias),
+                            std::move(matGrad2.dB), std::move(addGrad2.dBias)};
+}
+
+// Come selfAttentionBackwardImpl, ma legge rmsnorm/Q/K/V/l'intero
+// nucleo fuso dell'attention dalla cache invece di ricalcolarli (vedi
+// il commento in autodiff.hpp su selfAttentionBackwardCached per il
+// razionale completo).
+SelfAttentionGrad selfAttentionBackwardCachedImpl(const DeviceTensor& input, const DeviceTensor& wq,
+                                                   const DeviceTensor& wk, const DeviceTensor& wv,
+                                                   const DeviceTensor& wout, std::size_t numHeads,
+                                                   const SelfAttentionCache& cache, const DeviceTensor& gradOutput,
+                                                   bool useBf16) {
+    std::size_t batch = input.dim(0);
+    std::size_t seq = input.dim(1);
+    std::size_t dim = input.dim(2);
+    std::size_t headDim = dim / numHeads;
+    float scaleFactor = 1.0F / std::sqrt(static_cast<float>(headDim));
+
+    // --- backward attraverso la proiezione Wout ---
+    MatmulGrad woutGrad = projectionMatmulBackward(flatten2D(cache.attnOutput), wout, flatten2D(gradOutput), useBf16);
+    DeviceTensor dOutput = std::move(woutGrad.dA).reshaped({batch, seq, dim});
+
+    // --- backward attraverso il nucleo fuso dell'attention: q/k/v e le
+    // statistiche online-softmax (m,l) vengono dalla cache, non
+    // ricalcolati. ---
+    FusedAttentionGrad attnGrad = fusedAttentionBackward(dOutput, cache.q, cache.k, cache.v, cache.attnOutput,
+                                                          cache.attnM, cache.attnL, numHeads, scaleFactor,
+                                                          /*oldLen=*/0);
+
+    DeviceTensor dQ = std::move(attnGrad.dQ);
+    DeviceTensor dK = std::move(attnGrad.dK);
+    DeviceTensor dV = std::move(attnGrad.dV);
+
+    // --- backward attraverso le proiezioni Q/K/V: normedFlat viene
+    // dalla cache. ---
+    MatmulGrad qBackward = projectionMatmulBackward(cache.normedFlat, wq, flatten2D(dQ), useBf16);
+    MatmulGrad kBackward = projectionMatmulBackward(cache.normedFlat, wk, flatten2D(dK), useBf16);
+    MatmulGrad vBackward = projectionMatmulBackward(cache.normedFlat, wv, flatten2D(dV), useBf16);
+
+    DeviceTensor dNormedFlat = add(add(qBackward.dA, kBackward.dA), vBackward.dA);
+    DeviceTensor dNormed = std::move(dNormedFlat).reshaped({batch, seq, dim});
+
+    // --- backward attraverso rmsnorm, poi residual ---
+    DeviceTensor dInputFromBranch = rmsnormBackward(input, dNormed);
+    DeviceTensor dInput = add(gradOutput, dInputFromBranch);
+
+    return SelfAttentionGrad{std::move(dInput), std::move(qBackward.dB), std::move(kBackward.dB),
+                              std::move(vBackward.dB), std::move(woutGrad.dB)};
+}
+
 }  // namespace
 
 FeedForwardGrad feedForwardBackward(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
@@ -665,6 +739,21 @@ SelfAttentionGrad selfAttentionBf16Backward(const DeviceTensor& input, const Dev
                                              const DeviceTensor& wout, std::size_t numHeads,
                                              const DeviceTensor& gradOutput) {
     return selfAttentionBackwardImpl(input, wq, wk, wv, wout, numHeads, gradOutput, /*useBf16=*/true);
+}
+
+FeedForwardGrad feedForwardBackwardCached(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                                           const DeviceTensor& w2, const DeviceTensor& b2,
+                                           const FeedForwardCache& cache, const DeviceTensor& gradOutput,
+                                           bool useBf16) {
+    return feedForwardBackwardCachedImpl(input, w1, b1, w2, b2, cache, gradOutput, useBf16);
+}
+
+SelfAttentionGrad selfAttentionBackwardCached(const DeviceTensor& input, const DeviceTensor& wq,
+                                               const DeviceTensor& wk, const DeviceTensor& wv,
+                                               const DeviceTensor& wout, std::size_t numHeads,
+                                               const SelfAttentionCache& cache, const DeviceTensor& gradOutput,
+                                               bool useBf16) {
+    return selfAttentionBackwardCachedImpl(input, wq, wk, wv, wout, numHeads, cache, gradOutput, useBf16);
 }
 
 }  // namespace blackforge::backend::cuda

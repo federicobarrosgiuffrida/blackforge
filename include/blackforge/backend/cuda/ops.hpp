@@ -94,6 +94,22 @@ DeviceTensor feedForward(const DeviceTensor& input, const DeviceTensor& w1, cons
 DeviceTensor feedForwardBf16(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
                               const DeviceTensor& w2, const DeviceTensor& b2);
 
+// Attivazioni intermedie di un blocco feedForward (vedi SelfAttentionCache
+// sopra per il razionale completo, identico qui): rmsnorm/linear1/silu
+// riusati dal backward invece di ricalcolati.
+struct FeedForwardCache {
+    DeviceTensor normed;         // [..., dim]: rmsnorm(input)
+    DeviceTensor preActivation;  // [..., hidden]: linear1(normed), PRIMA di silu
+    DeviceTensor hidden;         // [..., hidden]: silu(preActivation)
+};
+
+// Come feedForward()/feedForwardBf16(), ma popola 'cache' — stessa
+// relazione di selfAttentionForwardCached() rispetto a
+// selfAttention()/selfAttentionBf16().
+DeviceTensor feedForwardForwardCached(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                                       const DeviceTensor& w2, const DeviceTensor& b2, bool useBf16,
+                                       FeedForwardCache& cache);
+
 // Self-attention causale multi-head, pre-norm con residual (vedi
 // backend::cpu::selfAttention per i dettagli, stessa semantica):
 // y = x + Wout(MultiHeadAttention(Q,K,V da RMSNorm(x))). dim deve
@@ -110,6 +126,39 @@ DeviceTensor selfAttention(const DeviceTensor& input, const DeviceTensor& wq, co
 // Core, come richiesto esplicitamente per questa milestone.
 DeviceTensor selfAttentionBf16(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
                                 const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads);
+
+// Attivazioni intermedie di un blocco selfAttention, prodotte da
+// selfAttentionForwardCached() e consumate da
+// autodiff::selfAttentionBackwardCached(): permettono al backward di
+// RIUSARE il lavoro del forward invece di ricalcolarlo da capo
+// (rmsnorm, le tre proiezioni Q/K/V, l'intero nucleo fuso
+// dell'attention) — il costo dominante trovato analizzando il percorso
+// caldo di un training step completo: selfAttentionBackward() (vedi
+// autodiff.hpp) rifà l'intero forward del layer prima di differenziarlo,
+// un vero e proprio secondo forward per ogni backward, senza motivo dato
+// che Model possiede gia' la memoria per non ributtare via quei
+// risultati.
+struct SelfAttentionCache {
+    DeviceTensor normedFlat;   // [batch*seq, dim]: rmsnorm(input) appiattito
+    DeviceTensor q;            // [batch, seq, dim]
+    DeviceTensor k;            // [batch, seq, dim]
+    DeviceTensor v;            // [batch, seq, dim]
+    DeviceTensor attnOutput;   // [batch, seq, dim]: uscita del nucleo fuso, PRIMA di Wout
+    DeviceTensor attnM;        // statistiche online-softmax per riga, vedi fused_attention.hpp
+    DeviceTensor attnL;
+};
+
+// Come selfAttention()/selfAttentionBf16(), ma popola 'cache' con le
+// attivazioni intermedie invece di scartarle a fine chiamata — usata da
+// cuda::Model durante l'addestramento al posto delle due funzioni sopra
+// (che restano per l'uso generico/inferenza, dove non serve un
+// backward). 'useBf16' sceglie matmulBf16 al posto di matmul per le
+// proiezioni, sostituendo la coppia selfAttention/selfAttentionBf16 con
+// un solo punto di ingresso parametrizzato (stesso principio gia' usato
+// internamente da selfAttentionImpl in ops_transformer.cu).
+DeviceTensor selfAttentionForwardCached(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
+                                         const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
+                                         bool useBf16, SelfAttentionCache& cache);
 
 // Chiavi/valori accumulati di un layer 'attention' attraverso una
 // sessione di generazione autoregressiva incrementale sul device (vedi

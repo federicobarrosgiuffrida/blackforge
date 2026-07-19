@@ -1,6 +1,7 @@
 #pragma once
 
 #include "blackforge/backend/cuda/device_tensor.hpp"
+#include "blackforge/backend/cuda/ops.hpp"
 
 namespace blackforge::backend::cuda {
 
@@ -96,6 +97,17 @@ FeedForwardGrad feedForwardBf16Backward(const DeviceTensor& input, const DeviceT
                                          const DeviceTensor& w2, const DeviceTensor& b2,
                                          const DeviceTensor& gradOutput);
 
+// Come feedForwardBackward()/feedForwardBf16Backward(), ma RIUSA le
+// attivazioni gia' calcolate da feedForwardForwardCached() (vedi
+// ops.hpp) invece di ricalcolarle: rmsnorm/linear1/silu non vengono
+// mai rieseguiti. Usata da cuda::Model durante l'addestramento — 'cache'
+// deve venire dall'ultima chiamata a feedForwardForwardCached() sullo
+// stesso 'input', con lo stesso 'useBf16'.
+FeedForwardGrad feedForwardBackwardCached(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                                           const DeviceTensor& w2, const DeviceTensor& b2,
+                                           const FeedForwardCache& cache, const DeviceTensor& gradOutput,
+                                           bool useBf16);
+
 struct SelfAttentionGrad {
     DeviceTensor dInput;
     DeviceTensor dWq;
@@ -120,5 +132,20 @@ SelfAttentionGrad selfAttentionBf16Backward(const DeviceTensor& input, const Dev
                                              const DeviceTensor& wk, const DeviceTensor& wv,
                                              const DeviceTensor& wout, std::size_t numHeads,
                                              const DeviceTensor& gradOutput);
+
+// Come selfAttentionBackward()/selfAttentionBf16Backward(), ma RIUSA le
+// attivazioni gia' calcolate da selfAttentionForwardCached() (vedi
+// ops.hpp) invece di ricalcolarle: rmsnorm, le tre proiezioni Q/K/V e
+// l'intero nucleo fuso dell'attention (fusedAttentionForward) non
+// vengono mai rieseguiti — fusedAttentionBackward riusa direttamente
+// q/k/v/output/m/l dalla cache. Usata da cuda::Model durante
+// l'addestramento — 'cache' deve venire dall'ultima chiamata a
+// selfAttentionForwardCached() sullo stesso 'input', con lo stesso
+// 'useBf16'.
+SelfAttentionGrad selfAttentionBackwardCached(const DeviceTensor& input, const DeviceTensor& wq,
+                                               const DeviceTensor& wk, const DeviceTensor& wv,
+                                               const DeviceTensor& wout, std::size_t numHeads,
+                                               const SelfAttentionCache& cache, const DeviceTensor& gradOutput,
+                                               bool useBf16);
 
 }  // namespace blackforge::backend::cuda

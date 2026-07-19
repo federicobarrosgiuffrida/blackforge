@@ -134,12 +134,20 @@ private:
         std::optional<Parameter> attnWout;
         std::size_t attentionNumHeads = 0;
         KVCache kvCache;  // usata solo da forwardIncremental()
+        // Attivazioni intermedie dell'ultima forward(), riusate da
+        // backward() invece di essere ricalcolate (vedi
+        // selfAttentionForwardCached/selfAttentionBackwardCached in
+        // ops.hpp/autodiff.hpp): popolata ad ogni forward(), non usata
+        // da forwardIncremental() (che non prevede un backward).
+        SelfAttentionCache attnCache;
 
         // Validi solo se kind == FeedForward.
         std::optional<Parameter> ffW1;
         std::optional<Parameter> ffB1;
         std::optional<Parameter> ffW2;
         std::optional<Parameter> ffB2;
+        // Come attnCache sopra, per il blocco feedforward.
+        FeedForwardCache ffCache;
     };
 
     static std::vector<Parameter*> allParameterSlots(LayerState& layer);

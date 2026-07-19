@@ -835,23 +835,65 @@ definitivo (stesso protocollo di tutta questa sezione):
    guadagno atteso è sotto la soglia di rilevabilità di questo
    benchmark, a fronte di un rischio di correttezza non nullo.
 
-**Conclusione dell'audit**: dopo cinque interventi (cache cuBLASLt: 0%,
-sync host rimosse: ~4%, fix del pool di memoria: **-34%**, optimizer/zeroGrad
-fusi: 0%, cache BF16/flatten2D: non implementati, guadagno atteso sotto
-il rumore), il gap rispetto a PyTorch è sceso da **~2,5x a ~1,7x più
-lento** (39,6ms/step → 27,5ms/step, contro 16,08ms/step di PyTorch). Il
-guadagno decisivo è stato quasi interamente il fix del pool di memoria —
-un bug genuino nascosto in codice già "completato", trovato per caso
-leggendo il codice sorgente prima di implementare l'intervento
-successivo, non dall'audit iniziale basato su stime. Il profilo di
-overhead residuo a questo punto è **piatto**: nessun singolo colpevole
-dominante rimasto, solo tanti piccoli costi sparsi. Trovarne altri
-richiederebbe una profilazione reale (Nsight Compute), non altre
-iterazioni alla cieca — lavoro futuro esplicito. CUDA graph (cattura
-dell'intero step di training) e memoria pinned + prefetch del batch
-successivo restano investimenti implementativi sostanziali con ritorno
-atteso incerto a questo punto, e non sono stati intrapresi in questa
-sessione.
+**Conclusione dell'audit (prima parte)**: dopo cinque interventi (cache
+cuBLASLt: 0%, sync host rimosse: ~4%, fix del pool di memoria: **-34%**,
+optimizer/zeroGrad fusi: 0%, cache BF16/flatten2D: non implementati,
+guadagno atteso sotto il rumore), il gap rispetto a PyTorch è sceso da
+**~2,5x a ~1,7x più lento** (39,6ms/step → 27,5ms/step, contro
+16,08ms/step di PyTorch). Il profilo di overhead a quel punto sembrava
+piatto — nessun singolo colpevole dominante — ma una seconda lettura
+mirata del percorso caldo (non basata su stime, ma su un conteggio
+diretto dei GEMM e dei lanci di kernel per step) ha trovato un'altra
+fonte di overhead strutturale, grande quanto il fix del pool: il
+backward ricalcolava l'intero forward.
+
+#### Il backward ricalcolava l'intero forward: -19%
+
+`selfAttentionBackward`/`feedForwardBackward` (`autodiff.cu`) sono
+sempre state scritte per essere "stateless": dato solo `input` e i
+pesi, ricalcolano da capo `rmsnorm`, le proiezioni Q/K/V, l'intero
+nucleo fuso dell'attention (`fusedAttentionForward`), e per il
+feedforward `linear1`+`silu` — perché `Model` cachava solo
+`layer.cachedInput`, non le attivazioni intermedie del layer. Contando
+i GEMM reali per step sul modello del benchmark: circa 180, contro i
+~90-100 di un training loop PyTorch equivalente (che cachea le
+attivazioni del forward invece di ributtarle via) — quasi il doppio
+del lavoro del solo forward, pagato due volte ad ogni step.
+
+Fix: due nuove coppie forward/backward — `selfAttentionForwardCached`/
+`selfAttentionBackwardCached` e `feedForwardForwardCached`/
+`feedForwardBackwardCached` (`ops.hpp`/`ops_transformer.cu`,
+`autodiff.hpp`/`autodiff.cu`) — che popolano/consumano una cache di
+attivazioni (`SelfAttentionCache`: `normedFlat`, `q`, `k`, `v`,
+`attnOutput`, le statistiche online-softmax `m`/`l`; `FeedForwardCache`:
+`normed`, `preActivation`, `hidden`), salvata in nuovi campi di
+`LayerState` (`model.hpp`) e popolata da `Model::forward()`, poi letta
+da `Model::backward()` invece di richiamare le funzioni "stateless"
+originarie. Il costo aggiuntivo nel forward è minimo (un solo `clone()`
+per layer, per preservare `attnOutput` a rango 3 dato che il backward
+ne ha bisogno) — enormemente più economico del secondo forward completo
+che elimina. Le funzioni originarie (`selfAttention`/`feedForward` e le
+relative backward "stateless") restano invariate e in uso da
+`executor.cu`/`blackforge run` (inferenza, nessun backward necessario)
+e dai test di gradient checking.
+
+Risultato misurato (stesso benchmark a regime): **22,2-22,4s** contro
+27,5-27,7s prima — **-19%**, il secondo guadagno più grande di tutta
+la sessione dopo il fix del pool. Il gap rispetto a PyTorch scende da
+~1,7x a **~1,4x più lento** (22,3ms/step contro 16,08ms/step).
+Verificato: 391 test CUDA verdi, inclusi i test di parità CPU/GPU (la
+versione CPU di riferimento continua a ricalcolare tutto, quindi la
+parità bit-per-bit tra le due implementazioni conferma che la cache non
+ha introdotto alcuna differenza numerica) e il test di parità
+multi-GPU.
+
+**Conclusione aggiornata**: il gap rispetto a PyTorch è ora **~1,4x più
+lento** (22,3ms/step vs 16,08ms/step), sceso da ~2,5x iniziale
+attraverso sei interventi verificati. I prossimi in coda (cache pesi
+BF16 a livello di Model con invalidazione affidabile dopo
+`optimizer->step()`, proiezione QKV fusa, epilogo bias di cuBLASLt,
+CUDA graph sull'intero step) restano il percorso più diretto verso la
+parità o il sorpasso.
 
 ## Training (pretraining, fine-tuning, LoRA, forecasting)
 
