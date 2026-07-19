@@ -21,7 +21,9 @@ class Executor {
 public:
     explicit Executor(unsigned int seed = 42) : seed_(seed) {}
 
-    [[nodiscard]] runtime::Tensor makeSyntheticInput(const ir::Value& inputValue, std::size_t batchSize) const;
+    // Se la prima operazione della pipeline e' 'embedding', genera token
+    // id interi uniformi in [0, vocabolario) (vedi la controparte CPU).
+    [[nodiscard]] runtime::Tensor makeSyntheticInput(const ir::ModelIR& model, std::size_t batchSize) const;
 
     // Lancia std::invalid_argument se il modello non ha pipeline.
     [[nodiscard]] runtime::Tensor run(const ir::ModelIR& model, const runtime::Tensor& input) const;

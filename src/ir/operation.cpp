@@ -14,6 +14,10 @@ const std::unordered_map<std::string, OpKind>& opKindTable() {
         {"gelu", OpKind::Gelu},
         {"rmsnorm", OpKind::RmsNorm},
         {"softmax", OpKind::Softmax},
+        {"embedding", OpKind::Embedding},
+        {"positional_embedding", OpKind::PositionalEmbedding},
+        {"attention", OpKind::Attention},
+        {"feedforward", OpKind::FeedForward},
     };
     return table;
 }
@@ -36,6 +40,10 @@ std::string opKindName(OpKind kind) {
         case OpKind::Gelu: return "gelu";
         case OpKind::RmsNorm: return "rmsnorm";
         case OpKind::Softmax: return "softmax";
+        case OpKind::Embedding: return "embedding";
+        case OpKind::PositionalEmbedding: return "positional_embedding";
+        case OpKind::Attention: return "attention";
+        case OpKind::FeedForward: return "feedforward";
     }
     return "?";
 }

@@ -15,6 +15,34 @@ Dim toIRDim(const ast::ShapeDim& dim) {
     return Dim{false, "", dim.literalValue};
 }
 
+// Legge stage.args[index] come intero letterale positivo. Ritorna
+// nullopt (avendo gia' segnalato l'errore) se l'argomento non e' un
+// intero letterale positivo valido: la stessa validazione di forma e'
+// gia' fatta dall'analisi semantica, ma ir_builder puo' essere invocato
+// anche indipendentemente da essa (es. nei test), quindi ripete il
+// controllo qui invece di assumerlo.
+std::optional<long long> readPositiveIntArg(const ast::PipelineStage& stage, std::size_t index,
+                                             DiagnosticList& diagnostics) {
+    const ast::Expr& arg = stage.args.at(index);
+    if (arg.kind != ast::ExprKind::IntegerLiteral) {
+        diagnostics.addError(arg.location, "'" + stage.name + "' richiede argomenti interi");
+        return std::nullopt;
+    }
+    long long value = 0;
+    try {
+        value = std::stoll(arg.text);
+    } catch (const std::out_of_range&) {
+        diagnostics.addError(arg.location, "valore intero troppo grande per '" + stage.name + "': " + arg.text);
+        return std::nullopt;
+    }
+    if (value <= 0) {
+        diagnostics.addError(arg.location, "'" + stage.name + "' richiede argomenti interi positivi, trovato " +
+                                                arg.text);
+        return std::nullopt;
+    }
+    return value;
+}
+
 }  // namespace
 
 Module IRBuilder::build(const ast::Program& program) {
@@ -158,6 +186,11 @@ void IRBuilder::buildPipeline(const ast::PipelineStmt& stmt, ModelIR& model, std
         const Value& current = model.valueById(currentValueId);
         std::vector<Dim> outputShape = current.shape;
         long long linearOutFeatures = 0;
+        long long embeddingVocabSize = 0;
+        long long embeddingDim = 0;
+        long long positionalMaxSeqLen = 0;
+        long long attentionNumHeads = 0;
+        long long feedForwardHiddenDim = 0;
 
         if (*kind == OpKind::Linear) {
             if (stage.args.size() != 1 || stage.args[0].kind != ast::ExprKind::IntegerLiteral) {
@@ -183,6 +216,59 @@ void IRBuilder::buildPipeline(const ast::PipelineStmt& stmt, ModelIR& model, std
             // con il numero di feature in output; le altre dimensioni
             // (es. 'batch') sono preservate cosi' come sono.
             outputShape.back() = Dim{false, "", linearOutFeatures};
+        } else if (*kind == OpKind::Embedding) {
+            if (stage.args.size() != 2) {
+                diagnostics_.addError(stage.location, "'embedding' richiede due argomenti interi (vocabolario, dim)");
+                return;
+            }
+            std::optional<long long> vocabSize = readPositiveIntArg(stage, 0, diagnostics_);
+            std::optional<long long> dim = readPositiveIntArg(stage, 1, diagnostics_);
+            if (!vocabSize.has_value() || !dim.has_value()) {
+                return;
+            }
+            embeddingVocabSize = *vocabSize;
+            embeddingDim = *dim;
+            // Il lookup di embedding aggiunge una nuova dimensione finale
+            // (dim): [batch, seq] token id -> [batch, seq, dim].
+            outputShape.push_back(Dim{false, "", embeddingDim});
+        } else if (*kind == OpKind::PositionalEmbedding) {
+            if (stage.args.size() != 1) {
+                diagnostics_.addError(stage.location, "'positional_embedding' richiede un singolo argomento intero "
+                                                        "(lunghezza massima di sequenza)");
+                return;
+            }
+            std::optional<long long> maxSeqLen = readPositiveIntArg(stage, 0, diagnostics_);
+            if (!maxSeqLen.has_value()) {
+                return;
+            }
+            positionalMaxSeqLen = *maxSeqLen;
+            // Additivo, stessa forma dell'ingresso (la dimensione 'dim'
+            // usata per la tabella e' dedotta a runtime dall'ultima
+            // dimensione dell'ingresso, non e' un argomento separato).
+        } else if (*kind == OpKind::Attention) {
+            if (stage.args.size() != 1) {
+                diagnostics_.addError(stage.location, "'attention' richiede un singolo argomento intero (numero di "
+                                                        "teste)");
+                return;
+            }
+            std::optional<long long> numHeads = readPositiveIntArg(stage, 0, diagnostics_);
+            if (!numHeads.has_value()) {
+                return;
+            }
+            attentionNumHeads = *numHeads;
+            // Pre-norm + residual interni all'operazione: forma invariata.
+        } else if (*kind == OpKind::FeedForward) {
+            if (stage.args.size() != 1) {
+                diagnostics_.addError(stage.location, "'feedforward' richiede un singolo argomento intero "
+                                                        "(dimensione nascosta)");
+                return;
+            }
+            std::optional<long long> hiddenDim = readPositiveIntArg(stage, 0, diagnostics_);
+            if (!hiddenDim.has_value()) {
+                return;
+            }
+            feedForwardHiddenDim = *hiddenDim;
+            // Pre-norm + residual interni all'operazione: forma invariata.
         }
         // silu/relu/gelu/rmsnorm/softmax non cambiano la forma ne' il
         // formato (rmsnorm/softmax operano lungo l'ultima dimensione a
@@ -196,6 +282,11 @@ void IRBuilder::buildPipeline(const ast::PipelineStmt& stmt, ModelIR& model, std
         operation.input = currentValueId;
         operation.output = outputId;
         operation.linearOutFeatures = linearOutFeatures;
+        operation.embeddingVocabSize = embeddingVocabSize;
+        operation.embeddingDim = embeddingDim;
+        operation.positionalMaxSeqLen = positionalMaxSeqLen;
+        operation.attentionNumHeads = attentionNumHeads;
+        operation.feedForwardHiddenDim = feedForwardHiddenDim;
         pipeline.operations.push_back(operation);
 
         currentValueId = outputId;

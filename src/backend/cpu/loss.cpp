@@ -32,13 +32,19 @@ LossResult softmaxCrossEntropy(const runtime::Tensor& logits, const runtime::Ten
         throw std::invalid_argument("softmaxCrossEntropy: forme incompatibili " + logits.shapeToString() + " e " +
                                      target.shapeToString());
     }
-    if (logits.rank() != 2) {
-        throw std::invalid_argument("softmaxCrossEntropy: richiede un tensore a rango 2 [batch, classi], trovato " +
+    if (logits.rank() < 2) {
+        throw std::invalid_argument("softmaxCrossEntropy: richiede un tensore a rango >= 2 [..., classi], trovato " +
                                      logits.shapeToString());
     }
 
-    std::size_t batch = logits.dim(0);
-    std::size_t numClasses = logits.dim(1);
+    // Generalizzato a rango >= 2 (stessa idea di rmsnorm/softmax in
+    // ops.cpp): per un tensore [batch, seq, classi] tratta ogni "riga"
+    // (ogni posizione di ogni esempio del batch) come un esempio
+    // indipendente di classificazione, e la loss e' la media su tutte
+    // le righe (non solo sul batch) — la convenzione standard per la
+    // loss di next-token-prediction di un modello linguistico.
+    std::size_t numClasses = logits.shape().back();
+    std::size_t batch = logits.elementCount() / numClasses;
 
     std::vector<float> grad(logits.elementCount());
     double totalLoss = 0.0;

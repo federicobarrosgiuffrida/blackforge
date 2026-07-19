@@ -1,6 +1,7 @@
 #include "blackforge/backend/cpu/model.hpp"
 
 #include <algorithm>
+#include <unordered_map>
 
 #include <gtest/gtest.h>
 
@@ -417,6 +418,100 @@ TEST(ModelTest, TrainingLoopRiduceLaLossConAdamW) {
     }
 
     EXPECT_LT(lastLoss, firstLoss * 0.1F);
+}
+
+// --- Modello linguistico minimale (embedding/positional_embedding/attention/feedforward) ---
+
+namespace {
+
+ir::Module buildTinyLmModule() {
+    return buildModule(
+        "model TinyLM {\n"
+        "    input bf16[batch, 3]\n"
+        "    input |> embedding(6, 4) |> positional_embedding(4) |> attention(2) |> feedforward(8) |> linear(6)\n"
+        "}\n");
+}
+
+}  // namespace
+
+TEST(ModelTest, CostruisceIParametriDiUnaPipelineDaModelloLinguistico) {
+    ir::Module module = buildTinyLmModule();
+    backend::cpu::Model model(module.models.front());
+
+    auto params = model.parameters();
+    // embedding: 1 (table). positional_embedding: 1 (table).
+    // attention: 4 (wq, wk, wv, wout). feedforward: 4 (w1, b1, w2, b2).
+    // linear finale: 2 (weight, bias). Totale 12.
+    ASSERT_EQ(params.size(), 12u);
+
+    std::unordered_map<std::string, std::vector<std::size_t>> shapeByName;
+    for (const auto* param : params) {
+        shapeByName[param->name] = param->value.shape();
+    }
+
+    ASSERT_TRUE(shapeByName.count("embedding1.table"));
+    EXPECT_EQ(shapeByName.at("embedding1.table"), (std::vector<std::size_t>{6, 4}));
+    ASSERT_TRUE(shapeByName.count("positional_embedding2.table"));
+    EXPECT_EQ(shapeByName.at("positional_embedding2.table"), (std::vector<std::size_t>{4, 4}));
+    ASSERT_TRUE(shapeByName.count("attention3.wq"));
+    EXPECT_EQ(shapeByName.at("attention3.wq"), (std::vector<std::size_t>{4, 4}));
+    ASSERT_TRUE(shapeByName.count("feedforward4.w1"));
+    EXPECT_EQ(shapeByName.at("feedforward4.w1"), (std::vector<std::size_t>{4, 8}));
+    ASSERT_TRUE(shapeByName.count("linear5.weight"));
+    EXPECT_EQ(shapeByName.at("linear5.weight"), (std::vector<std::size_t>{4, 6}));
+}
+
+TEST(ModelTest, ForwardDiUnModelloLinguisticoProduceLaFormaAttesa) {
+    ir::Module module = buildTinyLmModule();
+    backend::cpu::Model model(module.models.front());
+
+    // Token id in [0, 6), forma [batch=2, seq=3].
+    runtime::Tensor tokenIds({2, 3}, {0.0F, 1.0F, 2.0F, 3.0F, 4.0F, 5.0F});
+    runtime::Tensor output = model.forward(tokenIds);
+    EXPECT_EQ(output.shape(), (std::vector<std::size_t>{2, 3, 6}));
+}
+
+TEST(ModelTest, TrainingLoopDiUnModelloLinguisticoRiduceLaLossConCrossEntropy) {
+    // Esercita l'intera catena di wiring end-to-end: Embedding (lookup di
+    // token id interi) -> PositionalEmbedding -> Attention causale
+    // multi-testa -> FeedForward -> Linear, allenata con AdamW e la loss
+    // di next-token-prediction standard (softmaxCrossEntropy).
+    ir::Module module = buildTinyLmModule();
+    backend::cpu::Model model(module.models.front());
+    backend::cpu::AdamW optimizer(/*learningRate=*/0.05F);
+
+    runtime::Tensor tokenIds({2, 3}, {0.0F, 1.0F, 2.0F, 3.0F, 4.0F, 5.0F});
+
+    // Target one-hot "shift-by-one" (il prossimo token e' quello
+    // corrente + 1 mod vocabSize): un compito minimale ma non banale di
+    // next-token-prediction, sufficiente a verificare che la loss scenda
+    // davvero allenando tutti i parametri della pipeline.
+    constexpr std::size_t vocab = 6;
+    std::vector<float> targetData(2 * 3 * vocab, 0.0F);
+    for (std::size_t b = 0; b < 2; ++b) {
+        for (std::size_t s = 0; s < 3; ++s) {
+            auto tokenId = static_cast<std::size_t>(tokenIds.at(b * 3 + s));
+            std::size_t nextToken = (tokenId + 1) % vocab;
+            targetData[(b * 3 + s) * vocab + nextToken] = 1.0F;
+        }
+    }
+    runtime::Tensor target({2, 3, vocab}, std::move(targetData));
+
+    float firstLoss = 0.0F;
+    float lastLoss = 0.0F;
+    for (int step = 0; step < 200; ++step) {
+        model.zeroGrad();
+        runtime::Tensor output = model.forward(tokenIds);
+        backend::cpu::LossResult loss = backend::cpu::softmaxCrossEntropy(output, target);
+        if (step == 0) {
+            firstLoss = loss.value;
+        }
+        lastLoss = loss.value;
+        model.backward(loss.grad);
+        optimizer.step(model.parameters());
+    }
+
+    EXPECT_LT(lastLoss, firstLoss * 0.5F);
 }
 
 // --- Precisione numerica (quantizzazione simulata) ---

@@ -62,6 +62,21 @@ void writeToyDataset(const std::string& path) {
     data::saveDataset(path, inputShape, targetShape, inputs, targets, 4);
 }
 
+// Dataset di classificazione one-hot a 2 classi (ogni riga somma a 1,
+// coerente con softmaxCrossEntropy), stesso dataset del test CPU
+// equivalente (tests/backend/cpu/train_runner_tests.cpp).
+void writeToyClassificationDataset(const std::string& path) {
+    std::vector<std::size_t> inputShape{4};
+    std::vector<std::size_t> targetShape{2};
+    std::vector<float> inputs{
+        1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F,
+    };
+    std::vector<float> targets{
+        1.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 1.0F,
+    };
+    data::saveDataset(path, inputShape, targetShape, inputs, targets, 4);
+}
+
 std::string toForwardSlashes(const std::string& path) {
     std::string result = path;
     for (char& c : result) {
@@ -190,14 +205,15 @@ TEST(CudaTrainRunnerTest, LanciaSeIlDatasetNonEsiste) {
     EXPECT_THROW((void)backend::cuda::runTraining(compiled.program, compiled.module, "", ""), std::runtime_error);
 }
 
-TEST(CudaTrainRunnerTest, LanciaSeLaLossNonEMse) {
-    // cross-entropy su CUDA non e' ancora supportata: deve fallire con
-    // un errore chiaro, non silenziosamente su MSE o su CPU.
+TEST(CudaTrainRunnerTest, RiduceLaLossConCrossEntropy) {
     TempFile datasetFile("blackforge_cuda_test_train_dataset_ce.bfdata");
-    writeToyDataset(datasetFile.path);
+    writeToyClassificationDataset(datasetFile.path);
 
-    Compiled compiled = compile(toyProgram(datasetFile.path, 1, "sgd", "cross_entropy"));
-    EXPECT_THROW((void)backend::cuda::runTraining(compiled.program, compiled.module, "", ""), std::runtime_error);
+    Compiled compiled = compile(toyProgram(datasetFile.path, /*epochs=*/50, "adamw", "cross_entropy"));
+    backend::cuda::TrainRunResult result = backend::cuda::runTraining(compiled.program, compiled.module, "", "");
+
+    ASSERT_EQ(result.epochLosses.size(), 50u);
+    EXPECT_LT(result.epochLosses.back(), result.epochLosses.front() * 0.1);
 }
 
 TEST(CudaTrainRunnerTest, SalvaERicaricaUnCheckpointPerIlFineTuning) {

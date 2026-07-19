@@ -38,7 +38,7 @@ TEST(CudaExecutorTest, EseguePipelineEProduceLaFormaAttesa) {
     const ir::ModelIR& model = module.models.front();
     backend::cuda::Executor executor;
 
-    runtime::Tensor input = executor.makeSyntheticInput(model.valueById(model.inputValue), /*batchSize=*/5);
+    runtime::Tensor input = executor.makeSyntheticInput(model, /*batchSize=*/5);
     EXPECT_EQ(input.shape(), (std::vector<std::size_t>{5, 16}));
 
     runtime::Tensor output = executor.run(model, input);
@@ -63,8 +63,8 @@ TEST(CudaExecutorTest, ProduceLoStessoRisultatoDelBackendCpuAParitaDiSeme) {
     backend::cpu::Executor cpuExecutor(/*seed=*/7);
     backend::cuda::Executor cudaExecutor(/*seed=*/7);
 
-    runtime::Tensor cpuInput = cpuExecutor.makeSyntheticInput(model.valueById(model.inputValue), 3);
-    runtime::Tensor cudaInput = cudaExecutor.makeSyntheticInput(model.valueById(model.inputValue), 3);
+    runtime::Tensor cpuInput = cpuExecutor.makeSyntheticInput(model, 3);
+    runtime::Tensor cudaInput = cudaExecutor.makeSyntheticInput(model, 3);
 
     // Stesso seme => stesso input sintetico: prerequisito del confronto.
     ASSERT_EQ(cpuInput.elementCount(), cudaInput.elementCount());
@@ -89,7 +89,7 @@ TEST(CudaExecutorTest, LanciaSeIlModelloNonHaPipeline) {
 
     const ir::ModelIR& model = module.models.front();
     backend::cuda::Executor executor;
-    runtime::Tensor input = executor.makeSyntheticInput(model.valueById(model.inputValue), 1);
+    runtime::Tensor input = executor.makeSyntheticInput(model, 1);
 
     EXPECT_THROW((void)executor.run(model, input), std::invalid_argument);
 }

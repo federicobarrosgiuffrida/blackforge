@@ -109,7 +109,35 @@ private:
         std::optional<Parameter> loraA;
         std::optional<Parameter> loraB;
         runtime::Tensor cachedLoraHidden;  // cachedInput @ loraA, popolato da forward()
+
+        // Validi solo se kind == Embedding.
+        std::optional<Parameter> embeddingTable;
+        std::size_t embeddingVocabSize = 0;
+
+        // Valido solo se kind == PositionalEmbedding.
+        std::optional<Parameter> positionalTable;
+        std::size_t positionalMaxSeqLen = 0;
+
+        // Validi solo se kind == Attention (nessun bias, come in LLaMA:
+        // vedi backend::cpu::selfAttention).
+        std::optional<Parameter> attnWq;
+        std::optional<Parameter> attnWk;
+        std::optional<Parameter> attnWv;
+        std::optional<Parameter> attnWout;
+        std::size_t attentionNumHeads = 0;
+
+        // Validi solo se kind == FeedForward.
+        std::optional<Parameter> ffW1;
+        std::optional<Parameter> ffB1;
+        std::optional<Parameter> ffW2;
+        std::optional<Parameter> ffB2;
     };
+
+    // Tutti gli slot Parameter potenzialmente presenti in un layer,
+    // indipendentemente dal loro tipo: usato da zeroGrad()/allParameters(),
+    // che trattano ogni parametro allo stesso modo (parameters() resta
+    // separata perche' applica la logica speciale di LoRA solo a 'linear').
+    static std::vector<Parameter*> allParameterSlots(LayerState& layer);
 
     std::string name_;
     std::vector<LayerState> layers_;

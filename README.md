@@ -47,13 +47,14 @@ obiettivi futuri.
 | Controllo forme tensoriali | ✅ Inferenza reale lungo la pipeline (via IR); vincoli locali via analisi semantica |
 | Rappresentazione interna (IR) | ✅ Completata (Value/Operation/Module, IR builder con inferenza di forma e dtype) |
 | Backend CPU di riferimento (tensori, elementwise, matmul, linear, attivazioni, rmsnorm, softmax) | ✅ Completato per le operazioni attualmente nel linguaggio |
-| Esecuzione (`blackforge run`) | ✅ Esegue un modello con input sintetico; pesi deterministici (casuali) di default, oppure pesi realmente allenati con `--from-checkpoint` (CPU e CUDA) |
-| Autodiff / backward | ✅ Formule analitiche per linear/matmul/addBias/silu/relu/gelu/rmsnorm/softmax, verificate con gradient checking numerico |
+| Blocchi transformer (`embedding`, `positional_embedding`, `attention`, `feedforward`) | ✅ CPU e CUDA, forward e backward, residual/pre-norm interni all'operazione; verificati con gradient checking numerico e parità CPU/GPU — bastano per un modello linguistico decoder-only minimale (vedi [`examples/tiny_lm.bf`](examples/tiny_lm.bf)) |
+| Esecuzione (`blackforge run`) | ✅ Esegue un modello con input sintetico (id di token interi se la pipeline inizia con `embedding`); pesi deterministici (casuali) di default, oppure pesi realmente allenati con `--from-checkpoint` (CPU e CUDA) |
+| Autodiff / backward | ✅ Formule analitiche per linear/matmul/addBias/silu/relu/gelu/rmsnorm/softmax/embedding/positional_embedding/attention/feedforward, verificate con gradient checking numerico |
 | Loss | ✅ Errore quadratico medio (MSE, per la regressione/forecasting) e cross-entropy con softmax interna (per la classificazione multiclasse, `loss cross_entropy`), entrambe verificate con gradient checking numerico |
 | Optimizer (SGD, AdamW) | ✅ Entrambi implementati e testati (incl. weight decay disaccoppiato di AdamW) |
 | Checkpoint (salvataggio/caricamento pesi) | ✅ Formato binario proprietario BlackForge, con round-trip testato |
 | Pass manager / ottimizzazioni (fusione, dead code elimination) | ⏳ Pianificato (ancora rimandato: nessuna ottimizzazione genuina applicabile con l'attuale insieme di operazioni) |
-| Backend CUDA (tensori device, add/addBias/matmul via cuBLAS/silu/relu/gelu/rmsnorm/softmax, esecuzione) | ✅ Implementato e testato su GPU reale (RTX 5060, sm_120) per le operazioni attualmente nel linguaggio |
+| Backend CUDA (tensori device, add/addBias/matmul via cuBLAS/silu/relu/gelu/rmsnorm/softmax/embedding/attention/feedforward, esecuzione) | ✅ Implementato e testato su GPU reale (RTX 5060, sm_120) per le operazioni attualmente nel linguaggio |
 | Rilevamento GPU (`blackforge devices`) | ✅ Elenca le GPU NVIDIA visibili tramite il driver CUDA |
 | Selezione dispositivo (`blackforge run --device cpu\|cuda`) | ✅ Implementata |
 | Tensor Core / precisioni FP8/BF16/TF32 reali su GPU | ⏳ Pianificato — il backend CUDA oggi calcola in float32 (SGEMM), come il backend CPU: nessun uso di Tensor Core o dei formati ridotti come precisione di calcolo reale ancora |
@@ -66,9 +67,9 @@ obiettivi futuri.
 | Fine-tuning (`blackforge train --from-checkpoint`) | ✅ Riprende l'addestramento da un checkpoint esistente |
 | LoRA (`train { lora { rank alpha } }`) | ✅ Adapter a basso rango su ogni layer `linear`, pesi di base congelati; verificato con gradient checking e con un test che conferma che i pesi di base restano invariati dopo l'addestramento |
 | Forecasting (`forecast { model horizon }`, `blackforge forecast`) | ✅ Rollout autoregressivo (l'output di un passo diventa l'input del successivo); richiede che l'ultima dimensione di input e output del modello coincidano e un checkpoint pre-allenato |
-| Autodiff su GPU (`blackforge train --device cuda`) | ✅ Kernel CUDA scritti a mano per ogni backward (matmul, addBias, silu/relu/gelu, rmsnorm, softmax), loss MSE e optimizer (SGD, AdamW) interamente su device; ogni kernel confrontato numericamente contro la controparte CPU, incluso un test di parità sull'intero training loop (stessa loss finale, stessi pesi finali, CPU vs GPU) |
+| Autodiff su GPU (`blackforge train --device cuda`) | ✅ Kernel CUDA scritti a mano per ogni backward (matmul, addBias, silu/relu/gelu, rmsnorm, softmax, embedding, positional_embedding, attention, feedforward), loss MSE **e cross-entropy**, optimizer (SGD, AdamW) interamente su device; ogni kernel confrontato numericamente contro la controparte CPU, incluso un test di parità sull'intero training loop (stessa loss finale, stessi pesi finali, CPU vs GPU) — inclusa la pipeline completa di un modello linguistico |
 | Checkpoint su GPU (`--from-checkpoint`/`--save-checkpoint` con `--device cuda`) | ✅ Stesso formato binario del backend CPU (magic `BFCKPT1` identico): un checkpoint salvato da CUDA è caricabile da CPU e viceversa, verificato con un test di interoperabilità dedicato |
-| Training/fine-tuning/LoRA su GPU (oltre il percorso minimo sopra) | ⏳ Pianificato: cross-entropy su GPU, LoRA su GPU |
+| Training/fine-tuning/LoRA su GPU (oltre il percorso minimo sopra) | ⏳ Pianificato: LoRA su GPU |
 | CLI completa (`check`, `build`, `run`, `train`, `forecast`, `benchmark`, `inspect`, `devices`) | ✅ Tutti e 6 i comandi della visione originale implementati, più `forecast`/`devices` |
 | Benchmark (`blackforge benchmark`) | ✅ Hardware rilevato, precisione dichiarata (e realmente applicata sul backend CPU, vedi riga sopra), forma, tempo medio, throughput, memoria stimata, iterazioni/warmup configurabili; con `--device cuda` confronta automaticamente con la CPU (speedup e scarto massimo) |
 | Profiling | 🟡 Timing aggregato per iterazione più breakdown per singola operazione della pipeline, ciascuna misurata separatamente sul proprio input reale (solo backend CPU: su CUDA servirebbero timer basati su cudaEvent, i lanci di kernel sono asincroni) |
@@ -219,16 +220,18 @@ non ha senso allenare un adapter su pesi casuali).
 
 Con `--device cuda`, l'intero ciclo di addestramento (forward, loss,
 backward, aggiornamento dei pesi) avviene su device: ogni kernel di
-backward (matmul, addBias, silu/relu/gelu, rmsnorm, softmax) e ogni
-optimizer (SGD, AdamW) sono implementazioni CUDA scritte a mano,
-verificate contro la controparte CPU sia kernel per kernel sia
-sull'intero training loop (vedi `tests/backend/cuda/`).
+backward (matmul, addBias, silu/relu/gelu, rmsnorm, softmax, embedding,
+positional_embedding, attention, feedforward) e ogni optimizer (SGD,
+AdamW) sono implementazioni CUDA scritte a mano, verificate contro la
+controparte CPU sia kernel per kernel sia sull'intero training loop
+(vedi `tests/backend/cuda/`) — sia `loss mse` sia `loss cross_entropy`
+sono supportate su GPU, quindi si può allenare un modello linguistico
+(next-token-prediction) interamente su device.
 `--from-checkpoint`/`--save-checkpoint` funzionano anche su GPU, con lo
 stesso formato binario del backend CPU (un checkpoint CUDA è caricabile
 da CPU e viceversa). E' comunque un **percorso minimo, non ancora alla
-pari con la CPU**: supporta solo `loss mse` (non `cross_entropy`) e
-nessun blocco `lora`. Se il programma richiede una di queste
-funzionalità con `--device cuda`, il comando fallisce con un errore
+pari con la CPU**: nessun blocco `lora` ancora su GPU. Se il programma
+richiede LoRA con `--device cuda`, il comando fallisce con un errore
 esplicito — non esegue un fallback silenzioso sulla CPU né ignora la
 richiesta.
 
@@ -284,6 +287,21 @@ allocazione (es. una dimensione delle feature ancora simbolica).
   8 esempi, 2 classi). Esegui
   `blackforge train examples/tiny_classification.bf` per vedere la loss
   scendere da ~`ln(2)` (predizione casuale a 2 classi) verso zero.
+- [`examples/tiny_lm.bf`](examples/tiny_lm.bf) — esempio **eseguibile
+  end-to-end** di modello linguistico minimale (decoder-only,
+  LLaMA-like): `embedding |> positional_embedding |> attention |>
+  feedforward |> linear`, allenato con `loss cross_entropy` sul dataset
+  incluso ([`tiny_lm_dataset.bfdata`](examples/tiny_lm_dataset.bfdata),
+  64 sequenze di 6 token). Il compito è "shift-copy" (predire il token
+  della posizione precedente): risolvibile solo grazie ad `attention`
+  (embedding/feedforward, essendo per-posizione, non possono da soli
+  spostare informazione tra posizioni della sequenza), quindi vedere la
+  loss scendere qui dimostra che l'intera pipeline transformer sta
+  imparando. Esegui `blackforge train examples/tiny_lm.bf
+  --save-checkpoint tiny_lm.bfckpt` (aggiungi `--device cuda` per
+  allenare sulla GPU), poi `blackforge run examples/tiny_lm.bf
+  --from-checkpoint tiny_lm.bfckpt` per generare i logit con i pesi
+  allenati.
 
 ## Struttura del repository
 
@@ -312,6 +330,7 @@ PolyForm Noncommercial License 1.0.0 — vedi [LICENSE.md](LICENSE.md).
 7. ✅ Backend CUDA: tensori device, add/addBias/matmul (cuBLAS)/silu/relu/gelu, esecuzione (`blackforge run --device cuda`), rilevamento GPU (`blackforge devices`) — testato su GPU reale. Tensor Core e precisioni ridotte reali (fp8/bf16/tf32) restano lavoro futuro.
 8. ✅ Training: grammatica `dataset`/`train`/`forecast`, formato dataset su disco, pretraining, fine-tuning, LoRA (`train { lora { ... } }`) e forecasting autoregressivo (`blackforge forecast`) — tutti completati e verificati end-to-end su CPU (loss che scende davvero, pesi di base verificati congelati durante LoRA, rollout autoregressivo verificato con un modello identita'). Alla fine di questa milestone, training/fine-tuning/LoRA su GPU erano ancora lavoro futuro (l'autodiff esisteva solo su CPU): risolto in parte da lavoro successivo, vedi la riga "Autodiff su GPU" nella tabella di stato sopra.
 9. ✅ CLI completa (`build`, `benchmark`, `inspect` aggiunti — tutti e 6 i comandi della visione originale ora esistono), benchmark con confronto CPU/GPU automatico, selezione GPU per indice (`--device cuda:N`), documentazione finale aggiornata. Profiling resta parziale (solo timing aggregato, nessun breakdown per operazione); pass manager e generazione di codice nativo non sono stati iniziati.
+10. ✅ Addestramento di modelli linguistici: generalizzazione di `linear`/`silu`/`relu`/`gelu`/`rmsnorm`/`softmax`/`cross_entropy` a tensori di rango >= 3, e quattro nuovi blocchi di pipeline — `embedding`, `positional_embedding`, `attention` (self-attention causale multi-testa, con residual/pre-norm interni), `feedforward` (con residual/pre-norm interni) — forward e backward su CPU e CUDA, verificati con gradient checking numerico e parità CPU/GPU sull'intero training loop. `cross_entropy` ora supportata anche su `--device cuda`. `blackforge run --from-checkpoint` esteso a `run` (prima funzionava solo per `train`). Esempio end-to-end incluso ([`examples/tiny_lm.bf`](examples/tiny_lm.bf)): un modello linguistico decoder-only minimale, allenato su CPU e su GPU, con loss verificata scendere a ~zero su un compito che richiede genuinamente attention. LoRA su GPU resta lavoro futuro.
 
 ## Contribuire
 

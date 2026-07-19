@@ -133,7 +133,7 @@ BenchmarkResult runBenchmark(const ir::ModelIR& model, std::size_t batchSize, st
     }
 
     Executor executor;
-    runtime::Tensor input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
+    runtime::Tensor input = executor.makeSyntheticInput(model, batchSize);
 
     for (std::size_t i = 0; i < warmupIterations; ++i) {
         runtime::Tensor output = executor.run(model, input, precision);

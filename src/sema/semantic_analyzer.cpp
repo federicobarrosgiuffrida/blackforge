@@ -28,8 +28,20 @@ const std::unordered_map<std::string, int>& knownOperations() {
         {"gelu", 0},
         {"rmsnorm", 0},
         {"softmax", 0},
+        {"embedding", 2},
+        {"positional_embedding", 1},
+        {"attention", 1},
+        {"feedforward", 1},
     };
     return operations;
+}
+
+// Vero per le operazioni che richiedono TUTTI i loro argomenti come
+// interi positivi (embedding/positional_embedding/attention/feedforward,
+// come 'linear'): evita di ripetere lo stesso controllo quattro volte.
+bool requiresPositiveIntegerArgs(const std::string& opName) {
+    return opName == "linear" || opName == "embedding" || opName == "positional_embedding" ||
+           opName == "attention" || opName == "feedforward";
 }
 
 std::string precisionFieldName(ast::PrecisionFieldKind kind) {
@@ -171,9 +183,10 @@ void SemanticAnalyzer::analyzeTensorType(const ast::TensorType& type) {
 void SemanticAnalyzer::analyzeStage(const ast::PipelineStage& stage) {
     auto it = knownOperations().find(stage.name);
     if (it == knownOperations().end()) {
-        diagnostics_.addError(stage.location,
-                               "operazione sconosciuta '" + stage.name +
-                                   "'. Operazioni supportate: linear, silu, relu, gelu, rmsnorm, softmax");
+        diagnostics_.addError(stage.location, "operazione sconosciuta '" + stage.name +
+                                                   "'. Operazioni supportate: linear, silu, relu, gelu, rmsnorm, "
+                                                   "softmax, embedding, positional_embedding, attention, "
+                                                   "feedforward");
         return;
     }
 
@@ -184,24 +197,26 @@ void SemanticAnalyzer::analyzeStage(const ast::PipelineStage& stage) {
         return;
     }
 
-    if (stage.name == "linear") {
-        const ast::Expr& arg = stage.args.front();
-        if (arg.kind != ast::ExprKind::IntegerLiteral) {
-            diagnostics_.addError(arg.location, "'linear' richiede un numero intero di feature in output, trovato "
-                                                     "un " +
-                                                     std::string(arg.kind == ast::ExprKind::FloatLiteral ? "float"
-                                                                 : arg.kind == ast::ExprKind::StringLiteral
-                                                                     ? "stringa"
-                                                                     : "identificatore"));
-        } else {
+    if (requiresPositiveIntegerArgs(stage.name)) {
+        for (const ast::Expr& arg : stage.args) {
+            if (arg.kind != ast::ExprKind::IntegerLiteral) {
+                diagnostics_.addError(arg.location, "'" + stage.name +
+                                                          "' richiede argomenti interi, trovato un " +
+                                                          std::string(arg.kind == ast::ExprKind::FloatLiteral ? "float"
+                                                                      : arg.kind == ast::ExprKind::StringLiteral
+                                                                          ? "stringa"
+                                                                          : "identificatore"));
+                continue;
+            }
             try {
                 if (std::stoll(arg.text) <= 0) {
-                    diagnostics_.addError(arg.location,
-                                           "'linear' richiede un numero di feature in output positivo, trovato " +
-                                               arg.text);
+                    diagnostics_.addError(arg.location, "'" + stage.name +
+                                                              "' richiede argomenti interi positivi, trovato " +
+                                                              arg.text);
                 }
             } catch (const std::out_of_range&) {
-                diagnostics_.addError(arg.location, "valore intero troppo grande per 'linear': " + arg.text);
+                diagnostics_.addError(arg.location,
+                                       "valore intero troppo grande per '" + stage.name + "': " + arg.text);
             }
         }
     }

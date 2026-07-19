@@ -269,7 +269,7 @@ int runRun(const std::string& path, std::size_t batchSize, const std::string& de
 
         if (!spec.isCuda) {
             blackforge::backend::cpu::Executor executor;
-            input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
+            input = executor.makeSyntheticInput(model, batchSize);
 
             if (fromCheckpoint.empty()) {
                 output = executor.run(model, input, result.module.precision);
@@ -289,7 +289,7 @@ int runRun(const std::string& path, std::size_t batchSize, const std::string& de
 #if BLACKFORGE_HAS_CUDA
             blackforge::backend::cuda::setActiveDevice(spec.cudaIndex);
             blackforge::backend::cuda::Executor executor;
-            input = executor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
+            input = executor.makeSyntheticInput(model, batchSize);
 
             if (fromCheckpoint.empty()) {
                 output = executor.run(model, input);
@@ -469,7 +469,7 @@ int runBenchmark(const std::string& path, const std::string& device, std::size_t
 
             blackforge::backend::cuda::Executor cudaExecutor;
             blackforge::runtime::Tensor cudaInput =
-                cudaExecutor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
+                cudaExecutor.makeSyntheticInput(model, batchSize);
 
             for (std::size_t i = 0; i < warmupIterations; ++i) {
                 blackforge::runtime::Tensor warm = cudaExecutor.run(model, cudaInput);
@@ -497,7 +497,7 @@ int runBenchmark(const std::string& path, const std::string& device, std::size_t
             // seme, quindi stesso input e stessi pesi iniziali.
             blackforge::backend::cpu::Executor cpuExecutor;
             blackforge::runtime::Tensor cpuInput =
-                cpuExecutor.makeSyntheticInput(model.valueById(model.inputValue), batchSize);
+                cpuExecutor.makeSyntheticInput(model, batchSize);
             blackforge::runtime::Tensor cpuOutput = cpuExecutor.run(model, cpuInput);
 
             float maxAbsDiff = 0.0F;

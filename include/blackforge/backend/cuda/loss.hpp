@@ -17,9 +17,14 @@ struct LossResult {
 // della computazione sulla CPU, e' l'unica cosa che una stampa a
 // schermo puo' mai richiedere.
 //
-// Solo questa loss e' implementata sul backend CUDA per ora:
-// cross-entropy (softmax) su GPU e' lavoro futuro, vedi
-// backend::cuda::runTraining per l'errore esplicito se richiesta.
 LossResult meanSquaredError(const DeviceTensor& prediction, const DeviceTensor& target);
+
+// Cross-entropy softmax per la classificazione multiclasse, calcolata
+// interamente su device (un blocco per "riga", riduzione in shared
+// memory). Vedi backend::cpu::softmaxCrossEntropy per la semantica
+// completa (identica: generalizzata a rango >= 2, [..., classi], la loss
+// e' la media su tutte le righe). Lancia std::invalid_argument se le
+// forme non coincidono o se non sono a rango >= 2.
+LossResult softmaxCrossEntropy(const DeviceTensor& logits, const DeviceTensor& target);
 
 }  // namespace blackforge::backend::cuda

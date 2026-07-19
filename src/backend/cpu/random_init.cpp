@@ -21,6 +21,23 @@ runtime::Tensor randomTensor(std::vector<std::size_t> shape, unsigned int seed) 
     return runtime::Tensor(std::move(shape), std::move(data));
 }
 
+runtime::Tensor randomTokenIdTensor(std::vector<std::size_t> shape, std::size_t vocabSize, unsigned int seed) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<std::size_t> dist(0, vocabSize > 0 ? vocabSize - 1 : 0);
+
+    std::size_t count = 1;
+    for (std::size_t dim : shape) {
+        count *= dim;
+    }
+
+    std::vector<float> data(count);
+    for (float& value : data) {
+        value = static_cast<float>(dist(rng));
+    }
+
+    return runtime::Tensor(std::move(shape), std::move(data));
+}
+
 unsigned int seedFor(unsigned int base, std::size_t valueId, unsigned int salt) {
     return base ^ (static_cast<unsigned int>(valueId) * salt);
 }

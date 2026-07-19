@@ -67,7 +67,30 @@ private:
         std::optional<Parameter> weight;  // valido solo se kind == Linear
         std::optional<Parameter> bias;    // valido solo se kind == Linear
         DeviceTensor cachedInput;         // popolato da forward()
+
+        // Valido solo se kind == Embedding.
+        std::optional<Parameter> embeddingTable;
+        std::size_t embeddingVocabSize = 0;
+
+        // Valido solo se kind == PositionalEmbedding.
+        std::optional<Parameter> positionalTable;
+        std::size_t positionalMaxSeqLen = 0;
+
+        // Validi solo se kind == Attention.
+        std::optional<Parameter> attnWq;
+        std::optional<Parameter> attnWk;
+        std::optional<Parameter> attnWv;
+        std::optional<Parameter> attnWout;
+        std::size_t attentionNumHeads = 0;
+
+        // Validi solo se kind == FeedForward.
+        std::optional<Parameter> ffW1;
+        std::optional<Parameter> ffB1;
+        std::optional<Parameter> ffW2;
+        std::optional<Parameter> ffB2;
     };
+
+    static std::vector<Parameter*> allParameterSlots(LayerState& layer);
 
     std::string name_;
     std::vector<LayerState> layers_;

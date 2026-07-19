@@ -23,8 +23,13 @@ public:
 
     // Risolve ogni dimensione simbolica del Value in ingresso (es.
     // 'batch') a batchSize e genera un tensore di input deterministico
-    // con quella forma.
-    [[nodiscard]] runtime::Tensor makeSyntheticInput(const ir::Value& inputValue, std::size_t batchSize) const;
+    // con quella forma. Se la prima operazione della pipeline e'
+    // 'embedding', genera token id interi uniformi in [0, vocabolario)
+    // invece di valori continui in [-0.1, 0.1] (che non sarebbero id di
+    // vocabolario validi): serve a rendere 'blackforge run'/'blackforge
+    // benchmark' utilizzabili anche su modelli che iniziano con
+    // 'embedding', senza dover fornire per forza un dataset reale.
+    [[nodiscard]] runtime::Tensor makeSyntheticInput(const ir::ModelIR& model, std::size_t batchSize) const;
 
     // Esegue la prima pipeline del modello sul tensore di input fornito.
     // Se 'precision' e' presente, applica la quantizzazione simulata

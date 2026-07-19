@@ -164,8 +164,10 @@ Dopo il parsing, `blackforge check` valida:
   altro identificatore come sorgente è un errore di "non definito".
 - **Operazioni**: le fasi di pipeline devono essere tra le operazioni
   note — `linear(n)` (un intero positivo), `silu`, `relu`, `gelu`,
-  `rmsnorm`, `softmax` (zero argomenti). Questo elenco crescerà quando
-  il backend implementerà davvero le operazioni.
+  `rmsnorm`, `softmax` (zero argomenti), `embedding(vocab, dim)` (due
+  interi positivi), `positional_embedding(maxSeq)`, `attention(numHeads)`,
+  `feedforward(hiddenDim)` (un intero positivo ciascuna). Questo elenco
+  crescerà quando il backend implementerà davvero le operazioni.
 - **Dataset**: nome univoco nel programma; esattamente un campo `path`,
   un `input` e un `labels`, entrambi tensori validi (stesse regole di
   forma/dtype di un `model`).
@@ -203,6 +205,17 @@ comunque riga per riga nel caso di `rmsnorm`/`softmax`). Questo
 permette di rilevare errori come "linear applicato a un tensore senza
 dimensioni" che l'analisi semantica locale non può vedere.
 
+`embedding(vocab, dim)` aggiunge una nuova dimensione finale `dim` (es.
+`[batch, seq]` → `[batch, seq, dim]`): è l'unica operazione che cambia
+il *rango* del tensore, non solo una dimensione esistente.
+`positional_embedding(maxSeq)`, `attention(numHeads)` e
+`feedforward(hiddenDim)` non alterano la forma (sono operazioni
+additive/residuali: l'uscita ha esattamente la stessa forma
+dell'ingresso) — la loro validazione di forma "vera" (es. `dim %
+numHeads == 0`, o che la dimensione delle feature sia concreta e non
+simbolica) avviene un livello più giù, alla costruzione di
+`backend::{cpu,cuda}::Model` (vedi sotto), non qui nell'IR.
+
 Non esiste ancora un pass manager con ottimizzazioni (fusione,
 eliminazione di operazioni morte): con l'attuale insieme minimo di
 operazioni non c'è ancora nulla di genuino da ottimizzare.
@@ -215,33 +228,108 @@ genera un tensore di input sintetico (le dimensioni simboliche come
 attraversa la prima pipeline del primo modello applicando le operazioni
 una a una sul backend CPU (`blackforge::backend::cpu`):
 
-- `linear(n)`: prodotto matriciale `[batch, in] x [in, n]` più bias
-  `[n]`. Senza `--from-checkpoint`, i pesi sono generati in modo
-  deterministico (seme fisso, non una strategia di inizializzazione
-  statisticamente valida come Xavier/Kaiming). Con `--from-checkpoint
-  <file>` (CPU e CUDA), i pesi sono invece quelli realmente allenati
-  caricati da quel checkpoint: internamente `run` costruisce un
-  `Model` (che possiede i propri parametri) al posto dell'`Executor`
-  (che li rigenera casuali ad ogni chiamata) e ci carica il file con
-  `loadCheckpoint`;
+- `linear(n)`: prodotto matriciale `[..., in] x [in, n]` più bias `[n]`
+  (generalizzato a rango >= 2: per un ingresso a rango > 2, es.
+  `[batch, seq, in]`, appiattisce temporaneamente a `[batch*seq, in]`
+  prima del prodotto e ripristina la forma dopo — lo stesso layout flat
+  riga-maggiore rende l'operazione a costo zero). Senza
+  `--from-checkpoint`, i pesi sono generati in modo deterministico (seme
+  fisso, non una strategia di inizializzazione statisticamente valida
+  come Xavier/Kaiming). Con `--from-checkpoint <file>` (CPU e CUDA), i
+  pesi sono invece quelli realmente allenati caricati da quel
+  checkpoint: internamente `run` costruisce un `Model` (che possiede i
+  propri parametri) al posto dell'`Executor` (che li rigenera casuali ad
+  ogni chiamata) e ci carica il file con `loadCheckpoint`;
 - `silu`, `relu`, `gelu`: applicate elemento per elemento;
 - `rmsnorm`: normalizzazione RMS (Zhang & Sennrich, 2019) riga per riga
-  su un tensore `[batch, features]`, `y = x / sqrt(mean(x^2) + eps)`
-  con `eps = 1e-6` fisso. **Senza** il fattore di scala `gamma`
-  allenabile della formulazione più comune (es. LLaMA): è
-  normalizzazione pura, senza parametri propri — una scelta di scope
-  deliberata per non dover estendere ancora il formato dei checkpoint e
-  l'interazione con LoRA per un singolo layer. Backward verificato con
-  gradient checking numerico (vedi `tests/backend/cpu/autodiff_tests.cpp`).
-- `softmax`: softmax riga per riga su un tensore `[batch, classi]`,
-  `y_j = exp(x_j - max) / sum_k exp(x_k - max)` (sottrazione del
-  massimo per stabilità numerica). Operazione di pipeline a sé stante
-  (utile per ottenere probabilità esplicite in uscita da un modello,
-  es. per l'inferenza), distinta dalla softmax applicata internamente
-  da `loss cross_entropy` (che usa una formula combinata
-  softmax+cross-entropy più efficiente per l'addestramento — le due
-  implementazioni non sono collegate). Backward verificato con
+  (rango >= 2: l'ultima dimensione sono le "feature", tutte le altre
+  sono "righe" indipendenti), `y = x / sqrt(mean(x^2) + eps)` con
+  `eps = 1e-6` fisso. **Senza** il fattore di scala `gamma` allenabile
+  della formulazione più comune (es. LLaMA): è normalizzazione pura,
+  senza parametri propri — una scelta di scope deliberata per non dover
+  estendere ancora il formato dei checkpoint e l'interazione con LoRA
+  per un singolo layer. Backward verificato con gradient checking
+  numerico (vedi `tests/backend/cpu/autodiff_tests.cpp`).
+- `softmax`: softmax riga per riga (rango >= 2, stessa generalizzazione
+  di `rmsnorm`), `y_j = exp(x_j - max) / sum_k exp(x_k - max)`
+  (sottrazione del massimo per stabilità numerica). Operazione di
+  pipeline a sé stante (utile per ottenere probabilità esplicite in
+  uscita da un modello, es. per l'inferenza), distinta dalla softmax
+  applicata internamente da `loss cross_entropy` (che usa una formula
+  combinata softmax+cross-entropy più efficiente per l'addestramento —
+  le due implementazioni non sono collegate). Backward verificato con
   gradient checking numerico.
+- `embedding`, `positional_embedding`, `attention`, `feedforward`: vedi
+  la sezione dedicata "Blocchi transformer" più sotto.
+
+### Blocchi transformer: `embedding`, `positional_embedding`, `attention`, `feedforward`
+
+Disponibili sia sul backend CPU sia su CUDA, come qualunque altra
+operazione di pipeline — questi quattro blocchi sono ciò che serve per
+costruire un modello linguistico minimale in stile decoder-only
+(LLaMA-like), oltre a `linear`:
+
+- **`embedding(vocab, dim)`**: lookup di embedding. L'ingresso è un
+  tensore `[batch, seq]` di **id di token**, rappresentati come float
+  non negativi (non c'è ancora un dtype intero/indice dedicato nel
+  linguaggio: gli id vengono arrotondati con `std::lround` internamente,
+  una semplificazione pragmatica esplicita). L'uscita è `[batch, seq,
+  dim]`. Lancia un errore se un id è fuori da `[0, vocab)`. Il
+  parametro allenabile è la tabella `[vocab, dim]`; il gradiente rispetto
+  agli id non esiste (sono indici, non differenziabili) — solo la
+  tabella riceve gradiente, via scatter-add (più occorrenze dello stesso
+  token nello stesso batch accumulano il contributo di ogni occorrenza).
+- **`positional_embedding(maxSeq)`**: aggiunge un embedding posizionale
+  allenabile `table[s, :]` a ogni posizione `s` della sequenza (additivo,
+  forma invariata: `[batch, seq, dim] → [batch, seq, dim]`). La
+  dimensione `dim` della tabella `[maxSeq, dim]` è dedotta a runtime
+  dall'ultima dimensione dell'ingresso (tipicamente l'uscita di
+  `embedding` che la precede), non è un argomento separato.
+- **`attention(numHeads)`**: self-attention causale multi-testa
+  (mascheramento autoregressivo: la posizione `s` può guardare solo alle
+  posizioni `≤ s`), **con residual e pre-norm interni all'operazione**
+  (`y = x + Wout · MultiHeadAttn(Q, K, V da RMSNorm(x))`, proiezioni
+  Q/K/V/Out senza bias, come in LLaMA). `dim` (l'ultima dimensione
+  dell'ingresso) deve essere divisibile per `numHeads`, controllato alla
+  costruzione del modello (non nell'analisi semantica, che non conosce
+  ancora `dim` in quel punto). Forma invariata.
+- **`feedforward(hiddenDim)`**: blocco feed-forward pre-norm con
+  residual (`y = x + Linear2(SiLU(Linear1(RMSNorm(x))))`). Forma
+  invariata.
+
+**Perché residual e pre-norm sono "dentro" l'operazione invece che
+espressi nella sintassi `.bf`**: la pipeline di BlackForge
+(`input |> op1 |> op2 |> ...`) è oggi una sequenza strettamente lineare,
+senza un modo di esprimere una connessione residua o un binding con
+nome per un risultato intermedio a cui tornare più avanti. Piuttosto che
+riprogettare la sintassi della pipeline per supportare grafi generici (un
+cambiamento di scope molto più ampio), `attention` e `feedforward`
+incapsulano l'intero blocco transformer standard (norm → trasformazione
+→ residual) come un'unica operazione atomica — la stessa scelta fatta da
+molte implementazioni di riferimento di Transformer block.
+
+Un modello linguistico minimale completo:
+
+```blackforge
+model TinyLM {
+    input bf16[batch, 6]
+    input |> embedding(8, 8) |> positional_embedding(6) |> attention(2) |> feedforward(16) |> linear(8)
+}
+```
+
+Vedi [`examples/tiny_lm.bf`](../examples/tiny_lm.bf) per un esempio
+completo ed eseguibile (con dataset incluso), allenato con
+`loss cross_entropy` su un compito minimale di "shift-copy" (predire il
+token della posizione precedente: risolvibile solo con attention, non da
+embedding/feedforward presi da soli, che sono per-posizione e non
+possono spostare informazione tra posizioni della sequenza).
+
+Sia il backward di `attention` sia quello di `feedforward` **ricalcolano
+il forward internamente** a partire da `input` + pesi (stessa convenzione
+già usata da `softmaxBackward`), invece di mettere in cache stati
+intermedi aggiuntivi: mantiene invariata la struttura di caching di
+`Model` (che deve solo salvare `cachedInput` per ogni layer, come già
+faceva per `linear`).
 
 Se il programma dichiara un blocco `precision { storage ... compute ...
 accumulate ... }` (vedi `include/blackforge/backend/cpu/quantize.hpp`),
@@ -293,9 +381,10 @@ training/fine-tuning/LoRA):
   `geluBackward`) — non un autodiff generico basato su un grafo di
   espressioni, dato il piccolo insieme fisso di operazioni. Verificate
   con *gradient checking* numerico (differenze finite) nei test.
-- **Loss**: solo `meanSquaredError` (errore quadratico medio) per ora.
-  Altre loss (es. cross-entropy) richiedono prima che il linguaggio
-  possa dichiarare il tipo di compito (classificazione vs regressione).
+- **Loss**: `meanSquaredError` (regressione) e `softmaxCrossEntropy`
+  (classificazione multiclasse, softmax applicata internamente) — vedi
+  la sezione "Training" più sotto per i dettagli, entrambe raggiungibili
+  da sintassi `.bf` tramite il campo `loss` di un blocco `train`.
 - **Optimizer**: `SGD` (senza momento: `param -= lr * grad`) e `AdamW`
   (Loshchilov & Hutter 2019, con weight decay disaccoppiato dal
   gradiente).
@@ -332,7 +421,14 @@ RTX 5060, Blackwell/sm_120):
   `rmsnorm`; massimo poi somma degli esponenziali per `softmax`,
   numericamente stabile), verificati anche con `features` maggiore del
   numero di thread per blocco, per esercitare davvero il ciclo
-  grid-stride dentro il kernel.
+  grid-stride dentro il kernel. `embedding`/`positional_embedding`/
+  `attention`/`feedforward` (`src/backend/cuda/ops_transformer.cu`)
+  mirrorano esattamente la logica del backend CPU: `attention` decompone
+  la multi-head attention in un loop host-side su `(batch, testa)` che
+  estrae/riscrive fette di tensore e richiama gli stessi primitivi 2D
+  già testati (`matmul`, `matmulTransposeB`, `softmax`), invece di un
+  kernel monolitico fuso — riduce la superficie di codice nuovo e non
+  verificato per un'operazione complessa come l'attention causale.
 - **`Executor`** (in `blackforge::backend::cuda`, da non confondere con
   `blackforge::backend::cpu::Executor`): stessa interfaccia della
   controparte CPU, stessa inizializzazione dei pesi a parità di seme —
@@ -414,13 +510,17 @@ Il campo `loss` accetta due valori:
   purché coincidano.
 - **`cross_entropy`** (cross-entropy con softmax interna): pensata per
   la classificazione multiclasse. Richiede `prediction`/`target` a
-  rango 2 `[batch, classi]`; `prediction` sono i logit grezzi del
-  modello (l'operazione applica una softmax internamente, in modo
-  numericamente stabile), `target` è una distribuzione di probabilità
-  per esempio (tipicamente one-hot). Il gradiente restituito è la
-  forma chiusa standard per softmax+cross-entropy combinati
-  (`softmax(logits) - target`, diviso per la dimensione del batch), non
-  richiede quindi un backward separato per la softmax.
+  rango >= 2 `[..., classi]` (es. `[batch, classi]` per la
+  classificazione, `[batch, seq, classi]` per la next-token-prediction
+  di un modello linguistico: la loss è la media su tutte le "righe", non
+  solo sul batch); `prediction` sono i logit grezzi del modello
+  (l'operazione applica una softmax internamente, in modo numericamente
+  stabile), `target` è una distribuzione di probabilità per riga
+  (tipicamente one-hot). Il gradiente restituito è la forma chiusa
+  standard per softmax+cross-entropy combinati (`softmax(logits) -
+  target`, diviso per il numero di righe), non richiede quindi un
+  backward separato per la softmax. Supportata sia su CPU sia su
+  `--device cuda`.
 
 Entrambe sono implementate in `blackforge::backend::cpu` (vedi
 `loss.hpp`) e verificate con gradient checking numerico (differenze
@@ -551,9 +651,15 @@ nascoste: se richieste, `blackforge train --device cuda` fallisce con
 un errore chiaro (mai un fallback silenzioso sulla CPU, mai un
 risultato quietamente sbagliato):
 
-- Solo `loss mse`: `cross_entropy` su GPU è lavoro futuro.
 - Nessun blocco `lora`: nessun adapter a basso rango implementato su
-  `cuda::Model`.
+  `cuda::Model`. Usa `--device cpu` per LoRA.
+
+Sia `loss mse` sia `loss cross_entropy` sono supportate su
+`--device cuda` (`softmaxCrossEntropy` è un kernel CUDA scritto a mano,
+un blocco per riga con riduzione in shared memory, verificato per
+parità numerica con la controparte CPU) — necessario per allenare un
+modello linguistico (next-token-prediction) davvero sulla GPU, non solo
+per la regressione.
 
 `--from-checkpoint`/`--save-checkpoint` **sono** supportati su
 `--device cuda`, con lo stesso formato binario del backend CPU

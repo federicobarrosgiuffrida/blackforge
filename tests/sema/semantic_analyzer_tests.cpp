@@ -166,6 +166,61 @@ TEST(SemanticAnalyzerTest, RifiutaSoftmaxConArgomenti) {
     EXPECT_TRUE(analyzer.diagnostics().hasErrors());
 }
 
+TEST(SemanticAnalyzerTest, AccettaPipelineDaModelloLinguistico) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> embedding(100, 16) |> positional_embedding(8) |> attention(4) |> feedforward(32) |> "
+        "linear(100)\n"
+        "}\n");
+    EXPECT_FALSE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaEmbeddingConNumeroArgomentiErrato) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> embedding(100)\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaEmbeddingConArgomentoNonPositivo) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> embedding(0, 16)\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaPositionalEmbeddingConArgomenti) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> positional_embedding\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaAttentionConArgomentoNonIntero) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> attention(2.5)\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaFeedforwardConArgomentoNonPositivo) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> feedforward(0)\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
 TEST(SemanticAnalyzerTest, RifiutaIdentificatoreNonDefinitoComeSorgentePipeline) {
     auto analyzer = analyze(
         "model M {\n"

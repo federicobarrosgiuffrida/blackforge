@@ -97,6 +97,71 @@ TEST(IRBuilderTest, PropagaLaFormaAttraversoLaPipeline) {
     EXPECT_EQ(afterLinear2.dtype, sema::DType::BF16);
 }
 
+TEST(IRBuilderTest, PropagaLaFormaAttraversoUnaPipelineDaModelloLinguistico) {
+    BuildResult result = buildIR(
+        "model TinyLM {\n"
+        "    input bf16[batch, 8]\n"
+        "\n"
+        "    input\n"
+        "        |> embedding(100, 16)\n"
+        "        |> positional_embedding(8)\n"
+        "        |> attention(4)\n"
+        "        |> feedforward(32)\n"
+        "        |> linear(100)\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    const ir::ModelIR& model = result.module.models[0];
+    const ir::Pipeline& pipeline = model.pipelines[0];
+    ASSERT_EQ(pipeline.operations.size(), 5u);
+
+    // embedding(100, 16): [batch, 8] -> [batch, 8, 16] (aggiunge una dimensione).
+    const ir::Operation& embeddingOp = pipeline.operations[0];
+    EXPECT_EQ(embeddingOp.kind, ir::OpKind::Embedding);
+    EXPECT_EQ(embeddingOp.embeddingVocabSize, 100);
+    EXPECT_EQ(embeddingOp.embeddingDim, 16);
+    const ir::Value& afterEmbedding = model.valueById(embeddingOp.output);
+    ASSERT_EQ(afterEmbedding.shape.size(), 3u);
+    EXPECT_TRUE(afterEmbedding.shape[0].isSymbolic);
+    EXPECT_EQ(afterEmbedding.shape[1].literalValue, 8);
+    EXPECT_EQ(afterEmbedding.shape[2].literalValue, 16);
+
+    // positional_embedding(8): forma invariata.
+    const ir::Operation& posOp = pipeline.operations[1];
+    EXPECT_EQ(posOp.kind, ir::OpKind::PositionalEmbedding);
+    EXPECT_EQ(posOp.positionalMaxSeqLen, 8);
+    const ir::Value& afterPositional = model.valueById(posOp.output);
+    ASSERT_EQ(afterPositional.shape.size(), 3u);
+    EXPECT_EQ(afterPositional.shape[1].literalValue, 8);
+    EXPECT_EQ(afterPositional.shape[2].literalValue, 16);
+
+    // attention(4): forma invariata (residual + pre-norm interni).
+    const ir::Operation& attnOp = pipeline.operations[2];
+    EXPECT_EQ(attnOp.kind, ir::OpKind::Attention);
+    EXPECT_EQ(attnOp.attentionNumHeads, 4);
+    const ir::Value& afterAttention = model.valueById(attnOp.output);
+    ASSERT_EQ(afterAttention.shape.size(), 3u);
+    EXPECT_EQ(afterAttention.shape[1].literalValue, 8);
+    EXPECT_EQ(afterAttention.shape[2].literalValue, 16);
+
+    // feedforward(32): forma invariata.
+    const ir::Operation& ffOp = pipeline.operations[3];
+    EXPECT_EQ(ffOp.kind, ir::OpKind::FeedForward);
+    EXPECT_EQ(ffOp.feedForwardHiddenDim, 32);
+    const ir::Value& afterFeedForward = model.valueById(ffOp.output);
+    ASSERT_EQ(afterFeedForward.shape.size(), 3u);
+    EXPECT_EQ(afterFeedForward.shape[1].literalValue, 8);
+    EXPECT_EQ(afterFeedForward.shape[2].literalValue, 16);
+
+    // linear(100): rimpiazza l'ultima dimensione con le feature in uscita.
+    const ir::Operation& linearOp = pipeline.operations[4];
+    EXPECT_EQ(linearOp.kind, ir::OpKind::Linear);
+    const ir::Value& afterLinear = model.valueById(linearOp.output);
+    ASSERT_EQ(afterLinear.shape.size(), 3u);
+    EXPECT_EQ(afterLinear.shape[1].literalValue, 8);
+    EXPECT_EQ(afterLinear.shape[2].literalValue, 100);
+}
+
 TEST(IRBuilderTest, RmsnormNonAlteraFormaNeFormato) {
     BuildResult result = buildIR(
         "model TinyModel {\n"

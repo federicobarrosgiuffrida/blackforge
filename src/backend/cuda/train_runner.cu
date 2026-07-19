@@ -1,5 +1,6 @@
 #include "blackforge/backend/cuda/train_runner.hpp"
 
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <variant>
@@ -82,13 +83,6 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
         throw std::runtime_error("'blackforge train --device cuda' non supporta ancora 'lora': nessun adapter a "
                                   "basso rango implementato su cuda::Model. Usa '--device cpu' per LoRA.");
     }
-    if (lossField->name != "mse") {
-        throw std::runtime_error("'blackforge train --device cuda' supporta solo 'loss mse' per ora (dichiarata: '" +
-                                  lossField->name +
-                                  "'): cross-entropy su GPU e' lavoro futuro. Usa '--device cpu' per "
-                                  "'cross_entropy'.");
-    }
-
     const ir::ModelIR* modelIR = findModelIR(module, modelField->name);
     if (modelIR == nullptr) {
         throw std::runtime_error("modello '" + modelField->name + "' non trovato nella rappresentazione interna");
@@ -106,6 +100,13 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
     data::Dataset dataset = data::loadDataset(pathField->path);
 
     Model model(*modelIR);
+
+    std::function<LossResult(const DeviceTensor&, const DeviceTensor&)> lossFn;
+    if (lossField->name == "cross_entropy") {
+        lossFn = softmaxCrossEntropy;
+    } else {
+        lossFn = meanSquaredError;
+    }
 
     if (!fromCheckpointPath.empty()) {
         loadCheckpoint(model, fromCheckpointPath);
@@ -163,7 +164,7 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
 
             model.zeroGrad();
             DeviceTensor output = model.forward(inputDevice);
-            LossResult loss = meanSquaredError(output, targetDevice);
+            LossResult loss = lossFn(output, targetDevice);
             model.backward(loss.grad);
             optimizer->step(model.parameters());
 

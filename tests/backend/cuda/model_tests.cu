@@ -263,6 +263,89 @@ TEST(CudaModelTest, TrainingLoopRiduceLaLossConAdamW) {
     EXPECT_LT(lastLoss, firstLoss * 0.1F);
 }
 
+// --- Modello linguistico minimale (embedding/positional_embedding/attention/feedforward) ---
+
+namespace {
+
+ir::Module buildTinyLmModule() {
+    return buildModule(
+        "model TinyLM {\n"
+        "    input bf16[batch, 3]\n"
+        "    input |> embedding(6, 4) |> positional_embedding(4) |> attention(2) |> feedforward(8) |> linear(6)\n"
+        "}\n");
+}
+
+}  // namespace
+
+TEST(CudaModelTest, ForwardDiUnModelloLinguisticoCorrispondeAllaVersioneCpuAParitaDiSeme) {
+    ir::Module module = buildTinyLmModule();
+
+    cpu::Model cpuModel(module.models.front(), /*seed=*/11);
+    cuda::Model cudaModel(module.models.front(), /*seed=*/11);
+
+    Tensor tokenIds({2, 3}, {0.0F, 1.0F, 2.0F, 3.0F, 4.0F, 5.0F});
+    Tensor cpuOut = cpuModel.forward(tokenIds);
+    Tensor cudaOut = cudaModel.forward(cuda::DeviceTensor::fromHost(tokenIds)).toHost();
+
+    ASSERT_EQ(cpuOut.shape(), (std::vector<std::size_t>{2, 3, 6}));
+    ASSERT_EQ(cpuOut.elementCount(), cudaOut.elementCount());
+    for (std::size_t i = 0; i < cpuOut.elementCount(); ++i) {
+        EXPECT_NEAR(cpuOut.at(i), cudaOut.at(i), 1e-3F) << "indice " << i;
+    }
+}
+
+TEST(CudaModelTest, TrainingLoopDiUnModelloLinguisticoCorrispondeAllaVersioneCpuAParitaDiSeme) {
+    // Stesso principio del test di parita' generico piu' sotto, ma sulla
+    // pipeline completa di un modello linguistico (embedding, attention
+    // causale multi-testa, feedforward), allenata con cross-entropy:
+    // verifica che l'intera catena backward (inclusi
+    // embeddingLookupBackward, addPositionalEmbeddingBackward,
+    // selfAttentionBackward, feedForwardBackward) sia numericamente
+    // equivalente tra CPU e GPU dopo piu' step di addestramento.
+    ir::Module module = buildTinyLmModule();
+
+    cpu::Model cpuModel(module.models.front(), /*seed=*/5);
+    cuda::Model cudaModel(module.models.front(), /*seed=*/5);
+
+    Tensor tokenIds({2, 3}, {0.0F, 1.0F, 2.0F, 3.0F, 4.0F, 5.0F});
+    cuda::DeviceTensor tokenIdsDevice = cuda::DeviceTensor::fromHost(tokenIds);
+
+    constexpr std::size_t vocab = 6;
+    std::vector<float> targetData(2 * 3 * vocab, 0.0F);
+    for (std::size_t b = 0; b < 2; ++b) {
+        for (std::size_t s = 0; s < 3; ++s) {
+            auto tokenId = static_cast<std::size_t>(tokenIds.at(b * 3 + s));
+            std::size_t nextToken = (tokenId + 1) % vocab;
+            targetData[(b * 3 + s) * vocab + nextToken] = 1.0F;
+        }
+    }
+    Tensor target({2, 3, vocab}, targetData);
+    cuda::DeviceTensor targetDevice = cuda::DeviceTensor::fromHost(target);
+
+    cpu::AdamW cpuOptimizer(/*learningRate=*/0.05F);
+    cuda::AdamW cudaOptimizer(/*learningRate=*/0.05F);
+
+    float cpuLoss = 0.0F;
+    float cudaLoss = 0.0F;
+    for (int step = 0; step < 30; ++step) {
+        cpuModel.zeroGrad();
+        Tensor cpuOutput = cpuModel.forward(tokenIds);
+        cpu::LossResult cpuLossResult = cpu::softmaxCrossEntropy(cpuOutput, target);
+        cpuLoss = cpuLossResult.value;
+        cpuModel.backward(cpuLossResult.grad);
+        cpuOptimizer.step(cpuModel.parameters());
+
+        cudaModel.zeroGrad();
+        cuda::DeviceTensor cudaOutput = cudaModel.forward(tokenIdsDevice);
+        cuda::LossResult cudaLossResult = cuda::softmaxCrossEntropy(cudaOutput, targetDevice);
+        cudaLoss = cudaLossResult.value;
+        cudaModel.backward(cudaLossResult.grad);
+        cudaOptimizer.step(cudaModel.parameters());
+    }
+
+    EXPECT_NEAR(cpuLoss, cudaLoss, 5e-2F);
+}
+
 TEST(CudaModelTest, TrainingLoopCorrispondeAllaVersioneCpuAParitaDiSeme) {
     // Il test di parita' piu' importante di questa milestone: lo stesso
     // ciclo di addestramento (stesso seme, stessi dati, stesso
