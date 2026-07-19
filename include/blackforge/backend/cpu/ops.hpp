@@ -76,6 +76,15 @@ Tensor embeddingLookup(const Tensor& tokenIds, const Tensor& table);
 // se seq supera maxSeqLen o se dim non coincide.
 Tensor addPositionalEmbedding(const Tensor& input, const Tensor& table);
 
+// Come addPositionalEmbedding, ma la riga della tabella usata per la
+// posizione s e' 'offset + s' invece di semplicemente 's': serve alla
+// generazione incrementale (vedi selfAttentionIncremental), dove ogni
+// chiamata processa solo i token NUOVI di una sequenza che sta
+// crescendo, quindi la loro posizione assoluta non parte mai da zero
+// dopo la prima chiamata. Lancia std::invalid_argument se offset + seq
+// supera maxSeqLen o se dim non coincide.
+Tensor addPositionalEmbeddingAt(const Tensor& input, const Tensor& table, std::size_t offset);
+
 // Blocco feed-forward pre-norm con residual (convenzione usata da
 // LLaMA/GPT-NeoX e simili): y = x + Linear2(SiLU(Linear1(RMSNorm(x)))).
 // input: [batch, seq, dim] (o [batch, dim]). w1: [dim, hiddenDim],
@@ -100,5 +109,37 @@ Tensor feedForward(const Tensor& input, const Tensor& w1, const Tensor& b1, cons
 // se l'input non e' a rango 3.
 Tensor selfAttention(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv, const Tensor& wout,
                       std::size_t numHeads);
+
+// Chiavi/valori accumulati di un layer 'attention' attraverso una
+// sessione di generazione autoregressiva incrementale (vedi
+// selfAttentionIncremental): 'k'/'v' hanno forma [batch, length, dim],
+// crescente di 'newLen' ad ogni chiamata. Un'istanza per-layer, non
+// condivisa tra layer diversi (ogni blocco attention della pipeline ha
+// le proprie proiezioni K/V, quindi la propria cache).
+struct KVCache {
+    Tensor k;
+    Tensor v;
+    std::size_t length = 0;
+};
+
+// Variante incrementale di selfAttention, pensata per la generazione
+// autoregressiva token per token: 'newInput' contiene SOLO i token
+// NUOVI rispetto all'ultima chiamata (l'intero prompt alla prima
+// chiamata per "innescare" la cache, un solo token ad ogni chiamata
+// successiva), non l'intera sequenza generata finora. Calcola Q/K/V
+// solo per le posizioni nuove, accumula K/V in 'cache' (mutata in
+// place, cresce di newInput.dim(1) posizioni), e fa attendere le nuove
+// query all'INTERA cache aggiornata (vecchia + nuova) con il vincolo
+// causale corretto per le posizioni assolute coinvolte. Matematicamente
+// produce, per ogni posizione nuova, ESATTAMENTE lo stesso risultato
+// che selfAttention() darebbe per quella posizione se le venisse
+// passata l'intera sequenza fino a quel punto (verificato nei test) —
+// e' un'ottimizzazione (evita di ricalcolare Q/K/V per le posizioni
+// gia' processate ad ogni nuovo token), non un'approssimazione. 'cache'
+// deve essere una KVCache{} appena costruita (length == 0) all'inizio
+// di una nuova sequenza di generazione. Lancia std::invalid_argument
+// se dim non e' divisibile per numHeads o se l'input non e' a rango 3.
+Tensor selfAttentionIncremental(const Tensor& newInput, const Tensor& wq, const Tensor& wk, const Tensor& wv,
+                                 const Tensor& wout, std::size_t numHeads, KVCache& cache);
 
 }  // namespace blackforge::backend::cpu

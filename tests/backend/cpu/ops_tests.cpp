@@ -355,3 +355,73 @@ TEST(CpuOpsTest, SelfAttentionLanciaSeNumHeadsNonDivideDim) {
     Tensor w = Tensor::zeros({3, 3});
     EXPECT_THROW((void)cpu::selfAttention(input, w, w, w, w, /*numHeads=*/2), std::invalid_argument);
 }
+
+TEST(CpuOpsTest, SelfAttentionIncrementaleCorrispondeASelfAttentionSuTutteLePosizioni) {
+    // Stessi pesi di SelfAttentionRispettaLaMascheraCausale: alimenta
+    // l'intera sequenza [1,3,4] a selfAttention() in un colpo solo, poi
+    // le stesse 3 posizioni una alla volta a selfAttentionIncremental()
+    // (usando la STESSA cache K/V via riferimento, che cresce ad ogni
+    // chiamata) — le due devono produrre esattamente lo stesso output,
+    // posizione per posizione: il KV-cache e' una riorganizzazione del
+    // calcolo, non un'approssimazione.
+    Tensor wq({4, 4}, {0.3F, -0.1F, 0.2F, 0.05F, 0.1F, 0.4F, -0.2F, 0.15F, -0.3F, 0.2F, 0.1F, -0.05F, 0.2F, -0.1F,
+                        0.3F, 0.1F});
+    Tensor wk({4, 4}, {0.1F, 0.2F, -0.1F, 0.3F, -0.2F, 0.1F, 0.4F, -0.1F, 0.3F, -0.3F, 0.1F, 0.2F, -0.1F, 0.2F,
+                        -0.2F, 0.1F});
+    Tensor wv({4, 4}, {0.2F, 0.1F, -0.1F, 0.3F, 0.1F, -0.2F, 0.3F, 0.1F, -0.1F, 0.3F, 0.2F, -0.1F, 0.3F, 0.1F, -0.2F,
+                        0.2F});
+    Tensor wout({4, 4}, {0.1F, -0.1F, 0.2F, 0.1F, 0.2F, 0.1F, -0.1F, 0.2F, -0.1F, 0.2F, 0.1F, -0.1F, 0.1F, 0.2F,
+                          -0.1F, 0.2F});
+
+    Tensor input({1, 3, 4}, {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F, 0.2F, -0.1F, 0.3F, 0.2F, -0.4F, 0.5F});
+    Tensor fullResult = cpu::selfAttention(input, wq, wk, wv, wout, /*numHeads=*/2);
+
+    cpu::KVCache cache;
+    for (std::size_t s = 0; s < 3; ++s) {
+        Tensor oneToken({1, 1, 4},
+                         {input.at(s * 4 + 0), input.at(s * 4 + 1), input.at(s * 4 + 2), input.at(s * 4 + 3)});
+        Tensor incResult = cpu::selfAttentionIncremental(oneToken, wq, wk, wv, wout, /*numHeads=*/2, cache);
+
+        ASSERT_EQ(incResult.shape(), (std::vector<std::size_t>{1, 1, 4}));
+        for (std::size_t d = 0; d < 4; ++d) {
+            EXPECT_NEAR(incResult.at(d), fullResult.at(s * 4 + d), 1e-4F) << "posizione " << s << " indice " << d;
+        }
+    }
+    EXPECT_EQ(cache.length, 3u);
+}
+
+TEST(CpuOpsTest, SelfAttentionIncrementaleLanciaSeNumHeadsNonDivideDim) {
+    Tensor input({1, 1, 3}, std::vector<float>(3, 0.0F));
+    Tensor w = Tensor::zeros({3, 3});
+    cpu::KVCache cache;
+    EXPECT_THROW((void)cpu::selfAttentionIncremental(input, w, w, w, w, /*numHeads=*/2, cache),
+                 std::invalid_argument);
+}
+
+TEST(CpuOpsTest, AddPositionalEmbeddingAtCorrispondeAllaVersioneSenzaOffsetQuandoOffsetEZero) {
+    Tensor input({1, 2, 2}, {0.1F, -0.2F, 0.3F, 0.4F});
+    Tensor table({4, 2}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F});
+
+    Tensor withoutOffset = cpu::addPositionalEmbedding(input, table);
+    Tensor withZeroOffset = cpu::addPositionalEmbeddingAt(input, table, /*offset=*/0);
+
+    for (std::size_t i = 0; i < withoutOffset.elementCount(); ++i) {
+        EXPECT_FLOAT_EQ(withZeroOffset.at(i), withoutOffset.at(i)) << "indice " << i;
+    }
+}
+
+TEST(CpuOpsTest, AddPositionalEmbeddingAtUsaLeRigheDellaTabellaSpostateDiOffset) {
+    Tensor input({1, 1, 2}, {0.0F, 0.0F});
+    Tensor table({4, 2}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F});
+
+    Tensor result = cpu::addPositionalEmbeddingAt(input, table, /*offset=*/2);
+    // offset=2, s=0 -> riga 2 della tabella: {5.0, 6.0}.
+    EXPECT_FLOAT_EQ(result.at(0), 5.0F);
+    EXPECT_FLOAT_EQ(result.at(1), 6.0F);
+}
+
+TEST(CpuOpsTest, AddPositionalEmbeddingAtLanciaSeOffsetPiuSeqSuperaMaxSeqLen) {
+    Tensor input({1, 2, 2}, {0.0F, 0.0F, 0.0F, 0.0F});
+    Tensor table({3, 2}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F});
+    EXPECT_THROW((void)cpu::addPositionalEmbeddingAt(input, table, /*offset=*/2), std::invalid_argument);
+}

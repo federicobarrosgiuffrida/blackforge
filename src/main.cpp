@@ -55,6 +55,8 @@ void printUsage() {
               << "  dataset-build <corpus.txt> <tok.bftok>   Tokenizza un corpus e costruisce un dataset .bfdata\n"
               << "                                  per l'addestramento di un modello linguistico (richiede\n"
               << "                                  --seq-len e --output)\n"
+              << "  generate <file>     Genera testo autoregressivamente con cache K/V (CPU, greedy/argmax,\n"
+              << "                                  richiede --from-checkpoint, --tokenizer, --prompt)\n"
               << "  --help, -h         Mostra questo messaggio\n"
               << "  --version, -v      Mostra la versione del compilatore\n\n"
               << "Opzioni:\n"
@@ -74,7 +76,10 @@ void printUsage() {
               << "  --vocab-size N     Dimensione del vocabolario da apprendere (solo 'tokenizer-train'; deve "
                  "superare " << blackforge::tokenizer::Tokenizer::kFirstMergeId << ")\n"
               << "  --seq-len N        Lunghezza di sequenza di ogni esempio (solo 'dataset-build')\n"
-              << "  --output <file>    Percorso di output (solo 'tokenizer-train'/'dataset-build')\n";
+              << "  --output <file>    Percorso di output (solo 'tokenizer-train'/'dataset-build')\n"
+              << "  --tokenizer <file> Tokenizer .bftok da usare (solo 'generate')\n"
+              << "  --prompt <testo>   Testo iniziale da cui continuare la generazione (solo 'generate')\n"
+              << "  --max-new-tokens N Numero massimo di token da generare (solo 'generate', default 50)\n";
 }
 
 void printDevices() {
@@ -397,6 +402,92 @@ int runForecast(const std::string& path, const std::string& fromCheckpoint, std:
         blackforge::backend::cpu::runForecast(result.program, result.module, fromCheckpoint, batchSize, &std::cout);
     } catch (const std::exception& e) {
         std::cerr << "errore di forecasting: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
+// Genera testo autoregressivamente da un modello linguistico allenato,
+// usando la cache K/V (Model::forwardIncremental): decodifica sempre
+// greedy (argmax sulla posizione piu' recente), nessuna strategia di
+// campionamento (temperatura/top-k/nucleus) ancora implementata — una
+// limitazione esplicita, non nascosta: la stessa sequenza in ingresso
+// produce sempre la stessa continuazione. Solo CPU per ora: cuda::Model
+// non ha ancora un percorso di generazione incrementale (vedi
+// backend::cpu::Model::forwardIncremental).
+int runGenerate(const std::string& path, const std::string& fromCheckpoint, const std::string& tokenizerPath,
+                 const std::string& prompt, std::size_t maxNewTokens) {
+    if (fromCheckpoint.empty()) {
+        std::cerr << "errore: comando 'generate' richiede '--from-checkpoint' (generare da pesi casuali non ha "
+                     "senso)\n";
+        return 2;
+    }
+    if (tokenizerPath.empty()) {
+        std::cerr << "errore: comando 'generate' richiede '--tokenizer <file.bftok>'\n";
+        return 2;
+    }
+
+    CompileOutput result = compile(path, /*verbose=*/false, /*printAst=*/false, /*printIr=*/false);
+    if (result.status == CompileStatus::FileNotFound) {
+        return 2;
+    }
+    if (result.status == CompileStatus::AnalysisFailed) {
+        std::cerr << path << ": impossibile generare, l'analisi ha trovato errori\n";
+        return 1;
+    }
+    if (result.module.models.empty()) {
+        std::cerr << "errore: il programma non definisce alcun modello da usare per la generazione\n";
+        return 1;
+    }
+    const blackforge::ir::ModelIR& model = result.module.models.front();
+
+    try {
+        blackforge::tokenizer::Tokenizer tok = blackforge::tokenizer::loadTokenizer(tokenizerPath);
+
+        blackforge::backend::cpu::Model loadedModel(model);
+        blackforge::backend::cpu::loadCheckpoint(loadedModel, fromCheckpoint);
+
+        std::vector<std::uint32_t> promptIds = tok.encode(prompt);
+        if (promptIds.empty()) {
+            std::cerr << "errore: il prompt codificato e' vuoto (prompt vuoto?)\n";
+            return 1;
+        }
+
+        loadedModel.resetGenerationState();
+
+        std::vector<float> promptFloats(promptIds.begin(), promptIds.end());
+        blackforge::runtime::Tensor promptTensor({1, promptIds.size()}, promptFloats);
+        blackforge::runtime::Tensor logits = loadedModel.forwardIncremental(promptTensor);
+
+        std::vector<std::uint32_t> generated = promptIds;
+        for (std::size_t step = 0; step < maxNewTokens; ++step) {
+            std::size_t vocabSize = logits.dim(2);
+            std::size_t lastPos = logits.dim(1) - 1;
+
+            std::size_t bestId = 0;
+            float bestVal = logits.at(lastPos * vocabSize);
+            for (std::size_t v = 1; v < vocabSize; ++v) {
+                float val = logits.at(lastPos * vocabSize + v);
+                if (val > bestVal) {
+                    bestVal = val;
+                    bestId = v;
+                }
+            }
+            generated.push_back(static_cast<std::uint32_t>(bestId));
+
+            try {
+                blackforge::runtime::Tensor nextInput({1, 1}, {static_cast<float>(bestId)});
+                logits = loadedModel.forwardIncremental(nextInput);
+            } catch (const std::exception&) {
+                std::cout << "(lunghezza massima di sequenza del modello raggiunta, generazione interrotta)\n";
+                break;
+            }
+        }
+
+        std::cout << tok.decode(generated) << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "errore di generazione: " << e.what() << "\n";
         return 1;
     }
 
@@ -741,6 +832,9 @@ int main(int argc, char** argv) {
     std::size_t vocabSize = 0;
     std::size_t seqLen = 0;
     std::string outputPath;
+    std::string tokenizerPath;
+    std::string prompt;
+    std::size_t maxNewTokens = 50;
     std::vector<std::string> positional;
     std::string command = args.front();
 
@@ -813,6 +907,24 @@ int main(int argc, char** argv) {
                 return 2;
             }
             outputPath = args[++i];
+        } else if (args[i] == "--tokenizer") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--tokenizer' richiede un percorso\n";
+                return 2;
+            }
+            tokenizerPath = args[++i];
+        } else if (args[i] == "--prompt") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--prompt' richiede un testo\n";
+                return 2;
+            }
+            prompt = args[++i];
+        } else if (args[i] == "--max-new-tokens") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--max-new-tokens' richiede un valore\n";
+                return 2;
+            }
+            maxNewTokens = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
         } else {
             positional.push_back(args[i]);
         }
@@ -899,6 +1011,13 @@ int main(int argc, char** argv) {
             return 2;
         }
         return runDatasetBuild(positional[0], positional[1], seqLen, outputPath);
+    }
+    if (command == "generate") {
+        if (positional.empty()) {
+            std::cerr << "errore: comando 'generate' richiede il percorso di un file .bf\n";
+            return 2;
+        }
+        return runGenerate(positional.front(), fromCheckpoint, tokenizerPath, prompt, maxNewTokens);
     }
 
     std::cerr << "errore: comando sconosciuto '" << command << "'\n";

@@ -63,6 +63,43 @@ Tensor applyCausalMask(const Tensor& scores) {
     return Tensor({seq, seq}, std::move(result));
 }
 
+// Concatena due tensori [batch, seqA, dim] e [batch, seqB, dim] lungo
+// la dimensione di sequenza, producendo [batch, seqA+seqB, dim]: usato
+// da selfAttentionIncremental per accumulare K/V nella cache.
+Tensor concatSeq(const Tensor& a, const Tensor& b) {
+    std::size_t batch = a.dim(0);
+    std::size_t seqA = a.dim(1);
+    std::size_t seqB = b.dim(1);
+    std::size_t dim = a.dim(2);
+    std::size_t seqTotal = seqA + seqB;
+
+    std::vector<float> result(batch * seqTotal * dim);
+    for (std::size_t bIdx = 0; bIdx < batch; ++bIdx) {
+        std::copy_n(a.data().begin() + static_cast<std::ptrdiff_t>(bIdx * seqA * dim), seqA * dim,
+                    result.begin() + static_cast<std::ptrdiff_t>(bIdx * seqTotal * dim));
+        std::copy_n(b.data().begin() + static_cast<std::ptrdiff_t>(bIdx * seqB * dim), seqB * dim,
+                    result.begin() + static_cast<std::ptrdiff_t>(bIdx * seqTotal * dim + seqA * dim));
+    }
+    return Tensor({batch, seqTotal, dim}, std::move(result));
+}
+
+// Come applyCausalMask, ma per una matrice di score [newLen, totalLen]
+// dove le query sono solo le 'newLen' posizioni piu' recenti (assolute:
+// oldLen..oldLen+newLen-1) e le chiavi coprono l'intera cache
+// [0, totalLen). La query alla riga i (posizione assoluta oldLen+i) puo'
+// attendere solo alle chiavi j <= oldLen+i.
+Tensor applyIncrementalCausalMask(const Tensor& scores, std::size_t oldLen) {
+    std::size_t newLen = scores.dim(0);
+    std::size_t totalLen = scores.dim(1);
+    std::vector<float> result(scores.data());
+    for (std::size_t i = 0; i < newLen; ++i) {
+        for (std::size_t j = oldLen + i + 1; j < totalLen; ++j) {
+            result[i * totalLen + j] = -std::numeric_limits<float>::infinity();
+        }
+    }
+    return Tensor({newLen, totalLen}, std::move(result));
+}
+
 Tensor elementwise(const Tensor& input, float (*fn)(float)) {
     std::vector<float> result(input.elementCount());
     for (std::size_t i = 0; i < result.size(); ++i) {
@@ -351,6 +388,42 @@ Tensor addPositionalEmbedding(const Tensor& input, const Tensor& table) {
     return Tensor(input.shape(), std::move(result));
 }
 
+Tensor addPositionalEmbeddingAt(const Tensor& input, const Tensor& table, std::size_t offset) {
+    if (input.rank() != 3) {
+        throw std::invalid_argument("addPositionalEmbeddingAt: richiede un input a rango 3 [batch, seq, dim], "
+                                     "trovato " +
+                                     input.shapeToString());
+    }
+    if (table.rank() != 2 || table.dim(1) != input.dim(2)) {
+        throw std::invalid_argument("addPositionalEmbeddingAt: richiede una tabella [maxSeqLen, dim] con dim "
+                                     "coerente con l'input, trovato " +
+                                     table.shapeToString() + " per input " + input.shapeToString());
+    }
+
+    std::size_t batch = input.dim(0);
+    std::size_t seq = input.dim(1);
+    std::size_t dim = input.dim(2);
+    std::size_t maxSeqLen = table.dim(0);
+    if (offset + seq > maxSeqLen) {
+        throw std::invalid_argument("addPositionalEmbeddingAt: la posizione assoluta (" +
+                                     std::to_string(offset + seq) + ") supera maxSeqLen (" +
+                                     std::to_string(maxSeqLen) + ") della tabella");
+    }
+
+    std::vector<float> result(input.elementCount());
+    for (std::size_t b = 0; b < batch; ++b) {
+        for (std::size_t s = 0; s < seq; ++s) {
+            std::size_t inOffset = (b * seq + s) * dim;
+            std::size_t tableOffset = (offset + s) * dim;
+            for (std::size_t d = 0; d < dim; ++d) {
+                result[inOffset + d] = input.at(inOffset + d) + table.at(tableOffset + d);
+            }
+        }
+    }
+
+    return Tensor(input.shape(), std::move(result));
+}
+
 Tensor feedForward(const Tensor& input, const Tensor& w1, const Tensor& b1, const Tensor& w2, const Tensor& b2) {
     Tensor normed = rmsnorm(input);
     Tensor hidden = silu(linear(normed, w1, b1));
@@ -408,6 +481,65 @@ Tensor selfAttention(const Tensor& input, const Tensor& wq, const Tensor& wk, co
     Tensor projected({batch, seq, dim}, std::move(projectedFlat.data()));
 
     return add(input, projected);
+}
+
+Tensor selfAttentionIncremental(const Tensor& newInput, const Tensor& wq, const Tensor& wk, const Tensor& wv,
+                                 const Tensor& wout, std::size_t numHeads, KVCache& cache) {
+    if (newInput.rank() != 3) {
+        throw std::invalid_argument("selfAttentionIncremental: richiede un input a rango 3 [batch, seq, dim], "
+                                     "trovato " +
+                                     newInput.shapeToString());
+    }
+    std::size_t batch = newInput.dim(0);
+    std::size_t newLen = newInput.dim(1);
+    std::size_t dim = newInput.dim(2);
+    if (numHeads == 0 || dim % numHeads != 0) {
+        throw std::invalid_argument("selfAttentionIncremental: numHeads (" + std::to_string(numHeads) +
+                                     ") deve dividere esattamente dim (" + std::to_string(dim) + ")");
+    }
+    std::size_t headDim = dim / numHeads;
+    float scaleFactor = 1.0F / std::sqrt(static_cast<float>(headDim));
+
+    // Pre-norm: e' per-posizione (nessuna dipendenza tra posizioni),
+    // quindi applicarla solo ai token nuovi e' esatto, non
+    // un'approssimazione.
+    Tensor normed = rmsnorm(newInput);
+    Tensor normedFlat({batch * newLen, dim}, normed.data());
+    Tensor qNewFlat = matmul(normedFlat, wq);
+    Tensor kNewFlat = matmul(normedFlat, wk);
+    Tensor vNewFlat = matmul(normedFlat, wv);
+    Tensor qNew({batch, newLen, dim}, qNewFlat.data());
+    Tensor kNew({batch, newLen, dim}, kNewFlat.data());
+    Tensor vNew({batch, newLen, dim}, vNewFlat.data());
+
+    std::size_t oldLen = cache.length;
+    cache.k = (oldLen == 0) ? kNew : concatSeq(cache.k, kNew);
+    cache.v = (oldLen == 0) ? vNew : concatSeq(cache.v, vNew);
+    cache.length = oldLen + newLen;
+    std::size_t totalLen = cache.length;
+
+    std::vector<float> concatenatedData(batch * newLen * dim);
+    for (std::size_t b = 0; b < batch; ++b) {
+        for (std::size_t h = 0; h < numHeads; ++h) {
+            Tensor qHead = extractHead(qNew, b, h, newLen, dim, headDim);
+            Tensor kHead = extractHead(cache.k, b, h, totalLen, dim, headDim);
+            Tensor vHead = extractHead(cache.v, b, h, totalLen, dim, headDim);
+
+            Tensor scores = scale(matmulTransposeB(qHead, kHead), scaleFactor);  // [newLen, totalLen]
+            Tensor maskedScores = applyIncrementalCausalMask(scores, oldLen);
+            Tensor probs = softmax(maskedScores);
+            Tensor headOut = matmul(probs, vHead);  // [newLen, headDim]
+
+            scatterHead(concatenatedData, headOut, b, h, newLen, dim, headDim);
+        }
+    }
+    Tensor concatenated({batch, newLen, dim}, std::move(concatenatedData));
+
+    Tensor concatenatedFlat({batch * newLen, dim}, concatenated.data());
+    Tensor projectedFlat = matmul(concatenatedFlat, wout);
+    Tensor projected({batch, newLen, dim}, std::move(projectedFlat.data()));
+
+    return add(newInput, projected);
 }
 
 }  // namespace blackforge::backend::cpu

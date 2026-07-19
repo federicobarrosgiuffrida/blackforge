@@ -734,6 +734,63 @@ non ha accesso alla IR con le forme inferite): un modello come
 `linear(2)` con input a 4 feature viene rifiutato con un errore chiaro.
 Come per `train`, `--from-checkpoint` è obbligatorio.
 
+### Generazione autoregressiva con cache K/V (`blackforge generate`)
+
+`forecast` (sopra) è pensato per modelli generici dove l'intero output
+di un passo diventa l'input del passo successivo — non si applica a un
+modello linguistico, dove l'input è una sequenza di **id di token** che
+**cresce** ad ogni passo (non viene sostituita) e l'output è una
+distribuzione sul vocabolario da cui va scelto il prossimo token.
+`blackforge generate` è il comando dedicato a questo caso:
+
+```bash
+blackforge generate modello.bf --from-checkpoint pesi.bfckpt \
+    --tokenizer tok.bftok --prompt "il gatto" --max-new-tokens 50
+```
+
+Ricalcolare l'intera pipeline da capo ad ogni nuovo token (come farebbe
+un `forward()` ingenuo su una sequenza che cresce di 1 ad ogni passo)
+costerebbe O(N³) per generare N token in totale (O(N) chiamate, ciascuna
+O(N²) per via dell'attention). `Model::forwardIncremental` (CPU, vedi
+`include/blackforge/backend/cpu/model.hpp`) mantiene invece una **cache
+K/V** per ogni layer `attention` della pipeline (`ops::KVCache`):
+ogni chiamata processa SOLO i token nuovi (l'intero prompt alla prima
+chiamata, un solo token ad ogni chiamata successiva), calcola Q/K/V
+solo per quelli, li accumula nella cache, e fa attendere le nuove query
+all'intera cache — riducendo il costo totale a O(N²) (la parte
+quadratica nel numero di token è intrinseca all'attention causale
+stessa, non ulteriormente eliminabile senza cambiare l'architettura).
+`embedding`/`positional_embedding`/`feedforward`/`linear` non hanno
+bisogno di cache (sono per-posizione, nessuna dipendenza tra posizioni):
+vengono applicati solo ai token nuovi ad ogni chiamata, cosa già
+sufficiente ed esatta. `positional_embedding` usa la posizione
+**assoluta** del token nella sequenza generata finora
+(`addPositionalEmbeddingAt`, non semplicemente la posizione locale
+nella chiamata corrente).
+
+**Verificato per correttezza, non solo per velocità**: la cache è
+un'ottimizzazione (riorganizzazione del calcolo), non
+un'approssimazione — `ModelTest.ForwardIncrementalCorrispondeAForward
+CompletoTokenPerToken` verifica che generare token per token con la
+cache produca, posizione per posizione, esattamente lo stesso risultato
+che si otterrebbe ricalcolando l'intera sottosequenza da capo con
+`forward()` ad ogni passo.
+
+La decodifica è sempre **greedy** (argmax sulla distribuzione
+dell'ultima posizione): nessuna strategia di campionamento
+(temperatura, top-k, nucleus/top-p) è ancora implementata — la stessa
+sequenza in ingresso produce sempre la stessa continuazione,
+deterministica. Se la sequenza generata supera la lunghezza massima che
+il modello supporta (`positional_embedding`'s `maxSeq`), la generazione
+si interrompe con un messaggio esplicito invece di fallire in modo
+oscuro.
+
+**Limitazione esplicita**: `forwardIncremental`/cache K/V esistono solo
+sul backend CPU per ora. `cuda::Model` non ha ancora un percorso di
+generazione incrementale — mirrorarlo su CUDA (stessi
+`addPositionalEmbeddingAt`/`selfAttentionIncremental`/`KVCache`, ma con
+`DeviceTensor`) è lavoro futuro esplicito, non un'omissione nascosta.
+
 ### Addestramento su GPU (`blackforge train --device cuda`)
 
 `blackforge::backend::cuda` include ora un motore di addestramento
@@ -840,7 +897,9 @@ blackforge check <file>       Analizza (lessico, sintassi, semantica); --verbose
 blackforge build <file>       Compila e costruisce ogni modello (alloca i parametri) senza eseguirlo
 blackforge run <file>         Esegue il primo modello; --batch N, --device cpu|cuda|cuda:N
 blackforge train <file>       Addestra (CPU o CUDA); --device, --from-checkpoint/--save-checkpoint (entrambi i device)
-blackforge forecast <file>    Rollout autoregressivo (CPU); --from-checkpoint (obbligatorio), --batch N
+blackforge forecast <file>    Rollout autoregressivo generico (CPU); --from-checkpoint (obbligatorio), --batch N
+blackforge generate <file>    Genera testo con cache K/V (CPU, greedy); --from-checkpoint, --tokenizer, --prompt,
+                               --max-new-tokens
 blackforge benchmark <file>   Tempo/throughput/memoria; --device, --batch, --warmup, --iterations
 blackforge inspect <file>     Riepilogo: input, pipeline, numero di parametri per ogni modello
 blackforge devices            Elenca i dispositivi disponibili (CPU e GPU CUDA rilevate)

@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "blackforge/backend/cpu/ops.hpp"
 #include "blackforge/ir/module.hpp"
 #include "blackforge/runtime/tensor.hpp"
 
@@ -79,6 +80,27 @@ public:
 
     void zeroGrad();
 
+    // Genera un output autoregressivo incrementale: 'newTokenIds'
+    // contiene SOLO i token nuovi rispetto all'ultima chiamata (l'intero
+    // prompt alla prima chiamata dopo resetGenerationState(), un solo
+    // token ad ogni chiamata successiva). Mantiene una cache K/V per
+    // ogni layer 'attention' della pipeline (vedi ops.hpp::KVCache),
+    // crescente ad ogni chiamata: evita di ricalcolare l'attention
+    // sull'intera sequenza generata finora ad ogni nuovo token. Non
+    // salva alcuno stato per backward() (la generazione e' solo
+    // inferenza): chiamarla non interferisce con forward()/backward(),
+    // ma nemmeno vale il contrario — non mescolare le due modalita'
+    // sulla stessa istanza senza chiamare resetGenerationState() in
+    // mezzo. Layer diversi da Embedding/PositionalEmbedding/Attention/
+    // FeedForward/Linear/Silu/Relu/Gelu/RmsNorm/Softmax non sono
+    // previsti (nessuno lo e' ancora nel linguaggio).
+    runtime::Tensor forwardIncremental(const runtime::Tensor& newTokenIds);
+
+    // Azzera la cache K/V di ogni layer 'attention' e la posizione
+    // assoluta corrente: va chiamata prima di iniziare una nuova
+    // sessione di generazione (o tra una sessione e la successiva).
+    void resetGenerationState();
+
     // Parametri ALLENABILI: pesi/bias dei layer 'linear' normalmente,
     // oppure solo gli adapter LoRA (A/B) per i layer con LoRA attivo
     // (weight/bias restano congelati e non compaiono qui). E' quello
@@ -125,6 +147,7 @@ private:
         std::optional<Parameter> attnWv;
         std::optional<Parameter> attnWout;
         std::size_t attentionNumHeads = 0;
+        KVCache kvCache;  // usata solo da forwardIncremental()
 
         // Validi solo se kind == FeedForward.
         std::optional<Parameter> ffW1;
@@ -143,6 +166,7 @@ private:
     std::vector<LayerState> layers_;
     std::optional<LoraOptions> loraOptions_;
     std::optional<ir::PrecisionPolicy> precision_;
+    std::size_t generationPosition_ = 0;  // usata solo da forwardIncremental()
 };
 
 }  // namespace blackforge::backend::cpu

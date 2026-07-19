@@ -317,6 +317,45 @@ void Model::backward(const runtime::Tensor& outputGrad) {
     }
 }
 
+runtime::Tensor Model::forwardIncremental(const runtime::Tensor& newTokenIds) {
+    runtime::Tensor current = newTokenIds;
+    std::size_t newLen = current.rank() >= 2 ? current.dim(1) : 0;
+
+    for (auto& layer : layers_) {
+        switch (layer.kind) {
+            case ir::OpKind::Linear: current = linear(current, layer.weight->value, layer.bias->value); break;
+            case ir::OpKind::Silu: current = silu(current); break;
+            case ir::OpKind::Relu: current = relu(current); break;
+            case ir::OpKind::Gelu: current = gelu(current); break;
+            case ir::OpKind::RmsNorm: current = rmsnorm(current); break;
+            case ir::OpKind::Softmax: current = softmax(current); break;
+            case ir::OpKind::Embedding: current = embeddingLookup(current, layer.embeddingTable->value); break;
+            case ir::OpKind::PositionalEmbedding:
+                current = addPositionalEmbeddingAt(current, layer.positionalTable->value, generationPosition_);
+                break;
+            case ir::OpKind::Attention:
+                current = selfAttentionIncremental(current, layer.attnWq->value, layer.attnWk->value,
+                                                    layer.attnWv->value, layer.attnWout->value,
+                                                    layer.attentionNumHeads, layer.kvCache);
+                break;
+            case ir::OpKind::FeedForward:
+                current = feedForward(current, layer.ffW1->value, layer.ffB1->value, layer.ffW2->value,
+                                       layer.ffB2->value);
+                break;
+        }
+    }
+
+    generationPosition_ += newLen;
+    return current;
+}
+
+void Model::resetGenerationState() {
+    generationPosition_ = 0;
+    for (auto& layer : layers_) {
+        layer.kvCache = KVCache{};
+    }
+}
+
 std::vector<Parameter*> Model::allParameterSlots(LayerState& layer) {
     std::vector<Parameter*> result;
     auto add = [&](std::optional<Parameter>& slot) {

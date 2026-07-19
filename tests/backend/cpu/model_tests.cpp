@@ -514,6 +514,86 @@ TEST(ModelTest, TrainingLoopDiUnModelloLinguisticoRiduceLaLossConCrossEntropy) {
     EXPECT_LT(lastLoss, firstLoss * 0.5F);
 }
 
+// --- Generazione incrementale con cache K/V ---
+
+TEST(ModelTest, ForwardIncrementalCorrispondeAForwardCompletoTokenPerToken) {
+    // Il test di correttezza fondamentale del KV-cache: genera una
+    // sequenza di 5 token uno alla volta con forwardIncremental()
+    // (prompt iniziale di 2 token, poi 3 chiamate con un solo token
+    // nuovo ciascuna), e verifica che l'uscita per OGNI posizione
+    // coincida esattamente con quella che forward() produrrebbe
+    // ricalcolando l'intera sottosequenza da capo fino a quel punto.
+    // Se la cache o la maschera causale incrementale avessero un
+    // errore, questo confronto lo rivelerebbe (le due modalita' devono
+    // essere matematicamente identiche, non solo "vicine": nessuna
+    // riduzione di precisione e' coinvolta, e' pura riorganizzazione
+    // del calcolo).
+    ir::Module module = buildTinyLmModule();
+    backend::cpu::Model incrementalModel(module.models.front(), /*seed=*/11);
+    backend::cpu::Model referenceModel(module.models.front(), /*seed=*/11);
+
+    // 4 token (batch=1): buildTinyLmModule() usa positional_embedding(4),
+    // quindi 4 e' la lunghezza massima di sequenza che il modello supporta.
+    std::vector<float> fullSequence = {0.0F, 3.0F, 1.0F, 4.0F};
+    incrementalModel.resetGenerationState();
+
+    // Prompt iniziale: i primi 2 token in una sola chiamata.
+    runtime::Tensor prompt({1, 2}, {fullSequence[0], fullSequence[1]});
+    runtime::Tensor incOut = incrementalModel.forwardIncremental(prompt);
+
+    runtime::Tensor refPrompt({1, 2}, {fullSequence[0], fullSequence[1]});
+    runtime::Tensor refOut = referenceModel.forward(refPrompt);
+
+    ASSERT_EQ(incOut.shape(), refOut.shape());
+    for (std::size_t i = 0; i < incOut.elementCount(); ++i) {
+        EXPECT_NEAR(incOut.at(i), refOut.at(i), 1e-4F) << "prompt, indice " << i;
+    }
+
+    // Poi un token nuovo alla volta: forwardIncremental() vede solo
+    // l'ultimo token; forward() (di riferimento) rivede l'intera
+    // sottosequenza da capo ogni volta e si confronta solo con
+    // l'ultima posizione della sua uscita (l'unica che
+    // forwardIncremental produce in questa chiamata).
+    for (std::size_t step = 2; step < fullSequence.size(); ++step) {
+        runtime::Tensor newToken({1, 1}, {fullSequence[step]});
+        runtime::Tensor incStepOut = incrementalModel.forwardIncremental(newToken);
+
+        std::vector<float> subsequence(fullSequence.begin(), fullSequence.begin() + static_cast<std::ptrdiff_t>(step) + 1);
+        runtime::Tensor refSub({1, subsequence.size()}, subsequence);
+        runtime::Tensor refSubOut = referenceModel.forward(refSub);
+
+        std::size_t vocab = incStepOut.dim(2);
+        ASSERT_EQ(incStepOut.shape(), (std::vector<std::size_t>{1, 1, vocab}));
+        for (std::size_t v = 0; v < vocab; ++v) {
+            float incValue = incStepOut.at(v);
+            float refValue = refSubOut.at(step * vocab + v);  // ultima posizione di refSubOut
+            EXPECT_NEAR(incValue, refValue, 1e-4F) << "step " << step << " colonna " << v;
+        }
+    }
+}
+
+TEST(ModelTest, ResetGenerationStateAzzeraLaCacheELaPosizione) {
+    // Dopo resetGenerationState(), una nuova sessione di generazione
+    // deve comportarsi esattamente come la prima (stessa cache vuota,
+    // stessa posizione 0): due sessioni identiche in sequenza sulla
+    // stessa istanza di Model devono produrre lo stesso risultato.
+    ir::Module module = buildTinyLmModule();
+    backend::cpu::Model model(module.models.front(), /*seed=*/3);
+
+    runtime::Tensor prompt({1, 2}, {1.0F, 2.0F});
+
+    model.resetGenerationState();
+    runtime::Tensor firstSessionOut = model.forwardIncremental(prompt);
+
+    model.resetGenerationState();
+    runtime::Tensor secondSessionOut = model.forwardIncremental(prompt);
+
+    ASSERT_EQ(firstSessionOut.shape(), secondSessionOut.shape());
+    for (std::size_t i = 0; i < firstSessionOut.elementCount(); ++i) {
+        EXPECT_FLOAT_EQ(firstSessionOut.at(i), secondSessionOut.at(i)) << "indice " << i;
+    }
+}
+
 // --- Precisione numerica (quantizzazione simulata) ---
 
 TEST(ModelPrecisionTest, SenzaPrecisionPolicyIlForwardENonQuantizzato) {
