@@ -371,6 +371,70 @@ TEST(CudaOpsTest, SelfAttentionLanciaSeNumHeadsNonDivideDim) {
                  std::invalid_argument);
 }
 
+TEST(CudaOpsTest, SelfAttentionBf16CorrispondeApprossimativamenteASelfAttentionFp32) {
+    // Le proiezioni Q/K/V/Out passano per matmulBf16 (Tensor Core),
+    // il nucleo dell'attention (Q@K^T/maschera/softmax/probs@V) resta
+    // float32: stessa tolleranza allargata degli altri confronti
+    // BF16/FP32 di questo file (vedi MatmulBf16CorrispondeApprossimativamenteA...).
+    Tensor input({1, 3, 4}, {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F, 0.2F, -0.1F, 0.3F, 0.2F, -0.4F, 0.5F});
+    Tensor wq({4, 4}, {0.3F, -0.1F, 0.2F, 0.05F, 0.1F, 0.4F, -0.2F, 0.15F, -0.3F, 0.2F, 0.1F, -0.05F, 0.2F, -0.1F,
+                        0.3F, 0.1F});
+    Tensor wk({4, 4}, {0.1F, 0.2F, -0.1F, 0.3F, -0.2F, 0.1F, 0.4F, -0.1F, 0.3F, -0.3F, 0.1F, 0.2F, -0.1F, 0.2F,
+                        -0.2F, 0.1F});
+    Tensor wv({4, 4}, {0.2F, 0.1F, -0.1F, 0.3F, 0.1F, -0.2F, 0.3F, 0.1F, -0.1F, 0.3F, 0.2F, -0.1F, 0.3F, 0.1F, -0.2F,
+                        0.2F});
+    Tensor wout({4, 4}, {0.1F, -0.1F, 0.2F, 0.1F, 0.2F, 0.1F, -0.1F, 0.2F, -0.1F, 0.2F, 0.1F, -0.1F, 0.1F, 0.2F,
+                          -0.1F, 0.2F});
+
+    Tensor fp32Result = cuda::selfAttention(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(wq),
+                                             cuda::DeviceTensor::fromHost(wk), cuda::DeviceTensor::fromHost(wv),
+                                             cuda::DeviceTensor::fromHost(wout), /*numHeads=*/2)
+                             .toHost();
+    Tensor bf16Result =
+        cuda::selfAttentionBf16(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(wq),
+                                 cuda::DeviceTensor::fromHost(wk), cuda::DeviceTensor::fromHost(wv),
+                                 cuda::DeviceTensor::fromHost(wout), /*numHeads=*/2)
+            .toHost();
+
+    ASSERT_EQ(bf16Result.shape(), fp32Result.shape());
+    for (std::size_t i = 0; i < fp32Result.elementCount(); ++i) {
+        float tolerance = std::max(0.05F, std::abs(fp32Result.at(i)) * 0.1F);
+        EXPECT_NEAR(bf16Result.at(i), fp32Result.at(i), tolerance) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, SelfAttentionBf16LanciaSeNumHeadsNonDivideDim) {
+    Tensor input({1, 2, 3}, std::vector<float>(6, 0.0F));
+    Tensor w = Tensor::zeros({3, 3});
+    EXPECT_THROW((void)cuda::selfAttentionBf16(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(w),
+                                                cuda::DeviceTensor::fromHost(w), cuda::DeviceTensor::fromHost(w),
+                                                cuda::DeviceTensor::fromHost(w), /*numHeads=*/2),
+                 std::invalid_argument);
+}
+
+TEST(CudaOpsTest, FeedForwardBf16CorrispondeApprossimativamenteAFeedForwardFp32) {
+    Tensor input({1, 2, 3}, {0.3F, -0.6F, 0.2F, -0.4F, 0.5F, 0.1F});
+    Tensor w1({3, 4}, {0.2F, -0.1F, 0.3F, 0.1F, -0.2F, 0.4F, 0.1F, -0.3F, 0.3F, 0.2F, -0.1F, 0.2F});
+    Tensor b1({4}, {0.1F, -0.1F, 0.05F, 0.0F});
+    Tensor w2({4, 3}, {0.1F, -0.2F, 0.3F, 0.2F, 0.1F, -0.1F, -0.3F, 0.2F, 0.1F, 0.1F, -0.1F, 0.2F});
+    Tensor b2({3}, {0.05F, -0.05F, 0.1F});
+
+    Tensor fp32Result = cuda::feedForward(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(w1),
+                                           cuda::DeviceTensor::fromHost(b1), cuda::DeviceTensor::fromHost(w2),
+                                           cuda::DeviceTensor::fromHost(b2))
+                             .toHost();
+    Tensor bf16Result = cuda::feedForwardBf16(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(w1),
+                                               cuda::DeviceTensor::fromHost(b1), cuda::DeviceTensor::fromHost(w2),
+                                               cuda::DeviceTensor::fromHost(b2))
+                             .toHost();
+
+    ASSERT_EQ(bf16Result.shape(), fp32Result.shape());
+    for (std::size_t i = 0; i < fp32Result.elementCount(); ++i) {
+        float tolerance = std::max(0.05F, std::abs(fp32Result.at(i)) * 0.1F);
+        EXPECT_NEAR(bf16Result.at(i), fp32Result.at(i), tolerance) << "indice " << i;
+    }
+}
+
 TEST(CudaOpsTest, AddPositionalEmbeddingAtCorrispondeAllaVersioneCpu) {
     Tensor input({1, 2, 2}, {0.0F, 0.0F, 100.0F, 100.0F});
     Tensor table({4, 2}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F});

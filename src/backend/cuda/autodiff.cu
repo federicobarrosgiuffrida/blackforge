@@ -508,27 +508,45 @@ PositionalEmbeddingGrad addPositionalEmbeddingBackward(const DeviceTensor& gradO
     return PositionalEmbeddingGrad{std::move(dInput), std::move(dTable)};
 }
 
-FeedForwardGrad feedForwardBackward(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
-                                     const DeviceTensor& w2, const DeviceTensor& b2, const DeviceTensor& gradOutput) {
+namespace {
+
+// Sceglie matmulBackward()/matmulBf16Backward() a seconda di 'useBf16':
+// un solo punto di scelta condiviso da feedForwardBf16Backward/
+// selfAttentionBf16Backward, invece di duplicare interamente
+// feedForwardBackward/selfAttentionBackward per la variante BF16
+// (stesso principio gia' usato in ops_transformer.cu per il forward).
+MatmulGrad projectionMatmulBackward(const DeviceTensor& a, const DeviceTensor& b, const DeviceTensor& gradOutput,
+                                     bool useBf16) {
+    return useBf16 ? matmulBf16Backward(a, b, gradOutput) : matmulBackward(a, b, gradOutput);
+}
+
+DeviceTensor projectionLinear(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias,
+                               bool useBf16) {
+    return useBf16 ? linearBf16(input, weight, bias) : linear(input, weight, bias);
+}
+
+FeedForwardGrad feedForwardBackwardImpl(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                                         const DeviceTensor& w2, const DeviceTensor& b2,
+                                         const DeviceTensor& gradOutput, bool useBf16) {
     // b2 non serve al calcolo (vedi il commento equivalente in
     // src/backend/cpu/autodiff.cpp): resta nella firma solo per
     // simmetria con feedForward().
     (void)b2;
 
     // Ricalcola gli stessi passaggi del forward (vedi
-    // ops_transformer.cu/feedForward).
+    // ops_transformer.cu/feedForward[Bf16]).
     DeviceTensor normed = rmsnorm(input);
-    DeviceTensor preActivation = linear(normed, w1, b1);
+    DeviceTensor preActivation = projectionLinear(normed, w1, b1, useBf16);
     DeviceTensor hidden = silu(preActivation);
 
     AddBiasGrad addGrad2 = addBiasBackward(gradOutput);
-    MatmulGrad matGrad2 = matmulBackward(flatten2D(hidden), w2, flatten2D(addGrad2.dInput));
+    MatmulGrad matGrad2 = projectionMatmulBackward(flatten2D(hidden), w2, flatten2D(addGrad2.dInput), useBf16);
     DeviceTensor dHidden = std::move(matGrad2.dA).reshaped(hidden.shape());
 
     DeviceTensor dPreActivation = siluBackward(preActivation, dHidden);
 
     AddBiasGrad addGrad1 = addBiasBackward(dPreActivation);
-    MatmulGrad matGrad1 = matmulBackward(flatten2D(normed), w1, flatten2D(addGrad1.dInput));
+    MatmulGrad matGrad1 = projectionMatmulBackward(flatten2D(normed), w1, flatten2D(addGrad1.dInput), useBf16);
     DeviceTensor dNormed = std::move(matGrad1.dA).reshaped(normed.shape());
 
     // y = input + linear2(...): il residual manda gradOutput sia
@@ -542,9 +560,10 @@ FeedForwardGrad feedForwardBackward(const DeviceTensor& input, const DeviceTenso
                             std::move(matGrad2.dB), std::move(addGrad2.dBias)};
 }
 
-SelfAttentionGrad selfAttentionBackward(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
-                                         const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
-                                         const DeviceTensor& gradOutput) {
+SelfAttentionGrad selfAttentionBackwardImpl(const DeviceTensor& input, const DeviceTensor& wq,
+                                             const DeviceTensor& wk, const DeviceTensor& wv,
+                                             const DeviceTensor& wout, std::size_t numHeads,
+                                             const DeviceTensor& gradOutput, bool useBf16) {
     std::size_t batch = input.dim(0);
     std::size_t seq = input.dim(1);
     std::size_t dim = input.dim(2);
@@ -552,17 +571,19 @@ SelfAttentionGrad selfAttentionBackward(const DeviceTensor& input, const DeviceT
     float scaleFactor = 1.0F / std::sqrt(static_cast<float>(headDim));
 
     // Ricalcola lo stesso forward BATCHIZZATO di ops_transformer.cu/
-    // selfAttention (vedi attention_batched.hpp per il perche': un
-    // singolo kernel per Q@K^T/maschera/probs@V su TUTTE le
+    // selfAttention[Bf16] (vedi attention_batched.hpp per il perche':
+    // un singolo kernel per Q@K^T/maschera/probs@V su TUTTE le
     // combinazioni (batch,testa), non un loop host-side con un lancio
-    // di kernel per combinazione). normedFlat e' riusato (const&, ne'
-    // matmul() ne' matmulBackward() lo consumano) sia qui sia nel
+    // di kernel per combinazione). Il nucleo dell'attention resta
+    // sempre in float32 anche con useBf16: solo le proiezioni Q/K/V/
+    // Out passano per il Tensor Core. normedFlat e' riusato (const&,
+    // ne' matmul() ne' matmulBackward() lo consumano) sia qui sia nel
     // backward delle proiezioni Q/K/V piu' sotto.
     DeviceTensor normed = rmsnorm(input);
     DeviceTensor normedFlat = flatten2D(normed);
-    DeviceTensor q = matmul(normedFlat, wq).reshaped({batch, seq, dim});
-    DeviceTensor k = matmul(normedFlat, wk).reshaped({batch, seq, dim});
-    DeviceTensor v = matmul(normedFlat, wv).reshaped({batch, seq, dim});
+    DeviceTensor q = (useBf16 ? matmulBf16(normedFlat, wq) : matmul(normedFlat, wq)).reshaped({batch, seq, dim});
+    DeviceTensor k = (useBf16 ? matmulBf16(normedFlat, wk) : matmul(normedFlat, wk)).reshaped({batch, seq, dim});
+    DeviceTensor v = (useBf16 ? matmulBf16(normedFlat, wv) : matmul(normedFlat, wv)).reshaped({batch, seq, dim});
 
     DeviceTensor scores = batchedQK(q, k, numHeads, scaleFactor);
     DeviceTensor maskedScores = batchedMask(scores, /*oldLen=*/0);
@@ -570,7 +591,7 @@ SelfAttentionGrad selfAttentionBackward(const DeviceTensor& input, const DeviceT
     DeviceTensor concatenated = batchedPV(probs, v, numHeads);
 
     // --- backward attraverso la proiezione Wout ---
-    MatmulGrad woutGrad = matmulBackward(flatten2D(concatenated), wout, flatten2D(gradOutput));
+    MatmulGrad woutGrad = projectionMatmulBackward(flatten2D(concatenated), wout, flatten2D(gradOutput), useBf16);
     DeviceTensor dConcatenated = std::move(woutGrad.dA).reshaped({batch, seq, dim});
 
     // --- backward attraverso probs@V (batchizzato) ---
@@ -595,9 +616,9 @@ SelfAttentionGrad selfAttentionBackward(const DeviceTensor& input, const DeviceT
     DeviceTensor dV = std::move(pvGrad.dV);
 
     // --- backward attraverso le proiezioni Q/K/V ---
-    MatmulGrad qBackward = matmulBackward(normedFlat, wq, flatten2D(dQ));
-    MatmulGrad kBackward = matmulBackward(normedFlat, wk, flatten2D(dK));
-    MatmulGrad vBackward = matmulBackward(normedFlat, wv, flatten2D(dV));
+    MatmulGrad qBackward = projectionMatmulBackward(normedFlat, wq, flatten2D(dQ), useBf16);
+    MatmulGrad kBackward = projectionMatmulBackward(normedFlat, wk, flatten2D(dK), useBf16);
+    MatmulGrad vBackward = projectionMatmulBackward(normedFlat, wv, flatten2D(dV), useBf16);
 
     DeviceTensor dNormedFlat = add(add(qBackward.dA, kBackward.dA), vBackward.dA);
     DeviceTensor dNormed = std::move(dNormedFlat).reshaped({batch, seq, dim});
@@ -608,6 +629,32 @@ SelfAttentionGrad selfAttentionBackward(const DeviceTensor& input, const DeviceT
 
     return SelfAttentionGrad{std::move(dInput), std::move(qBackward.dB), std::move(kBackward.dB),
                               std::move(vBackward.dB), std::move(woutGrad.dB)};
+}
+
+}  // namespace
+
+FeedForwardGrad feedForwardBackward(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                                     const DeviceTensor& w2, const DeviceTensor& b2, const DeviceTensor& gradOutput) {
+    return feedForwardBackwardImpl(input, w1, b1, w2, b2, gradOutput, /*useBf16=*/false);
+}
+
+FeedForwardGrad feedForwardBf16Backward(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                                         const DeviceTensor& w2, const DeviceTensor& b2,
+                                         const DeviceTensor& gradOutput) {
+    return feedForwardBackwardImpl(input, w1, b1, w2, b2, gradOutput, /*useBf16=*/true);
+}
+
+SelfAttentionGrad selfAttentionBackward(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
+                                         const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
+                                         const DeviceTensor& gradOutput) {
+    return selfAttentionBackwardImpl(input, wq, wk, wv, wout, numHeads, gradOutput, /*useBf16=*/false);
+}
+
+SelfAttentionGrad selfAttentionBf16Backward(const DeviceTensor& input, const DeviceTensor& wq,
+                                             const DeviceTensor& wk, const DeviceTensor& wv,
+                                             const DeviceTensor& wout, std::size_t numHeads,
+                                             const DeviceTensor& gradOutput) {
+    return selfAttentionBackwardImpl(input, wq, wk, wv, wout, numHeads, gradOutput, /*useBf16=*/true);
 }
 
 }  // namespace blackforge::backend::cuda

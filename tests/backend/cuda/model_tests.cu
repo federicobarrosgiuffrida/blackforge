@@ -446,6 +446,89 @@ TEST(CudaModelTest, TrainingLoopDiUnModelloLinguisticoCorrispondeAllaVersioneCpu
     EXPECT_NEAR(cpuLoss, cudaLoss, 5e-2F);
 }
 
+TEST(CudaModelTest, ForwardDiUnModelloLinguisticoConPrecisionBf16CorrispondeApprossimativamenteAllaVersioneFp32) {
+    // Estende ForwardConPrecisionBf16CorrispondeApprossimativamenteAllaVersioneFp32
+    // (che copre solo 'linear') a un modello con attention/feedforward:
+    // verifica che cuda::Model instradi davvero selfAttentionBf16/
+    // feedForwardBf16 (non solo linearBf16) quando 'precision { compute
+    // bf16 }' e' dichiarato.
+    ir::Module fp32Module = buildTinyLmModule();
+    ir::Module bf16Module = buildModule(
+        "precision {\n"
+        "    compute bf16\n"
+        "}\n"
+        "model TinyLM {\n"
+        "    input bf16[batch, 3]\n"
+        "    input |> embedding(6, 4) |> positional_embedding(4) |> attention(2) |> feedforward(8) |> linear(6)\n"
+        "}\n");
+    ASSERT_TRUE(bf16Module.precision.has_value());
+    ASSERT_EQ(bf16Module.precision->compute, sema::DType::BF16);
+
+    cuda::Model fp32Model(fp32Module.models.front(), /*seed=*/11);
+    cuda::Model bf16Model(bf16Module.models.front(), /*seed=*/11, bf16Module.precision);
+
+    Tensor tokenIds({2, 3}, {0.0F, 1.0F, 2.0F, 3.0F, 4.0F, 5.0F});
+    Tensor fp32Out = fp32Model.forward(cuda::DeviceTensor::fromHost(tokenIds)).toHost();
+    Tensor bf16Out = bf16Model.forward(cuda::DeviceTensor::fromHost(tokenIds)).toHost();
+
+    ASSERT_EQ(fp32Out.elementCount(), bf16Out.elementCount());
+    for (std::size_t i = 0; i < fp32Out.elementCount(); ++i) {
+        float tolerance = std::max(0.1F, std::abs(fp32Out.at(i)) * 0.1F);
+        EXPECT_NEAR(bf16Out.at(i), fp32Out.at(i), tolerance) << "indice " << i;
+    }
+}
+
+TEST(CudaModelTest, TrainingLoopDiUnModelloLinguisticoConPrecisionBf16RiduceLaLoss) {
+    // Prova che il percorso Tensor Core esteso ad attention/feedforward
+    // sia genuinamente allenabile (forward E backward via
+    // selfAttentionBf16Backward/feedForwardBf16Backward), non solo
+    // utilizzabile per l'inferenza — stesso principio di
+    // TrainingLoopConPrecisionBf16RiduceLaLoss, ma sull'intera pipeline
+    // di un modello linguistico invece di un singolo 'linear'.
+    ir::Module module = buildModule(
+        "precision {\n"
+        "    compute bf16\n"
+        "}\n"
+        "model TinyLM {\n"
+        "    input bf16[batch, 3]\n"
+        "    input |> embedding(6, 4) |> positional_embedding(4) |> attention(2) |> feedforward(8) |> linear(6)\n"
+        "}\n");
+
+    cuda::Model model(module.models.front(), /*seed=*/5, module.precision);
+    Tensor tokenIds({2, 3}, {0.0F, 1.0F, 2.0F, 3.0F, 4.0F, 5.0F});
+    cuda::DeviceTensor tokenIdsDevice = cuda::DeviceTensor::fromHost(tokenIds);
+
+    constexpr std::size_t vocab = 6;
+    std::vector<float> targetData(2 * 3 * vocab, 0.0F);
+    for (std::size_t b = 0; b < 2; ++b) {
+        for (std::size_t s = 0; s < 3; ++s) {
+            auto tokenId = static_cast<std::size_t>(tokenIds.at(b * 3 + s));
+            std::size_t nextToken = (tokenId + 1) % vocab;
+            targetData[(b * 3 + s) * vocab + nextToken] = 1.0F;
+        }
+    }
+    Tensor target({2, 3, vocab}, targetData);
+    cuda::DeviceTensor targetDevice = cuda::DeviceTensor::fromHost(target);
+
+    cuda::AdamW optimizer(/*learningRate=*/0.05F);
+
+    float firstLoss = 0.0F;
+    float lastLoss = 0.0F;
+    for (int step = 0; step < 30; ++step) {
+        model.zeroGrad();
+        cuda::DeviceTensor output = model.forward(tokenIdsDevice);
+        cuda::LossResult loss = cuda::softmaxCrossEntropy(output, targetDevice);
+        if (step == 0) {
+            firstLoss = loss.value;
+        }
+        lastLoss = loss.value;
+        model.backward(loss.grad);
+        optimizer.step(model.parameters());
+    }
+
+    EXPECT_LT(lastLoss, firstLoss * 0.5F);
+}
+
 // --- Generazione incrementale con cache K/V (mirror CUDA di
 // ModelTest.ForwardIncrementalCorrispondeAForwardCompletoTokenPerToken /
 // ResetGenerationStateAzzeraLaCacheELaPosizione in tests/backend/cpu/model_tests.cpp) ---

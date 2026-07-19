@@ -78,12 +78,32 @@ DeviceTensor addPositionalEmbeddingAt(const DeviceTensor& input, const DeviceTen
 DeviceTensor feedForward(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
                           const DeviceTensor& w2, const DeviceTensor& b2);
 
+// Come feedForward(), ma i due prodotti matriciali interni (Linear1,
+// Linear2) usano linearBf16() (Tensor Core) invece di linear() (SGEMM
+// float32) — stessa semantica, stesso schema "mixed precision" di
+// linearBf16/matmulBf16 (vedi sopra). Usata da cuda::Model quando
+// 'precision { compute bf16 }' e' dichiarato (vedi
+// cuda::Model::useTensorCoreLinear_), esattamente come linearBf16 lo e'
+// gia' per il layer di pipeline 'linear'.
+DeviceTensor feedForwardBf16(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                              const DeviceTensor& w2, const DeviceTensor& b2);
+
 // Self-attention causale multi-head, pre-norm con residual (vedi
 // backend::cpu::selfAttention per i dettagli, stessa semantica):
 // y = x + Wout(MultiHeadAttention(Q,K,V da RMSNorm(x))). dim deve
 // essere divisibile per numHeads.
 DeviceTensor selfAttention(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
                             const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads);
+
+// Come selfAttention(), ma le proiezioni Q/K/V/Out usano matmulBf16()
+// (Tensor Core) invece di matmul() (SGEMM float32) — stessa semantica,
+// stesso schema "mixed precision". Il calcolo dell'attention vera e
+// propria (Q@K^T scalato, maschera, softmax, probs@V — vedi
+// attention_batched.hpp) resta in float32: solo le proiezioni lineari
+// (la parte dominante del costo computazionale) passano per il Tensor
+// Core, come richiesto esplicitamente per questa milestone.
+DeviceTensor selfAttentionBf16(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
+                                const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads);
 
 // Chiavi/valori accumulati di un layer 'attention' attraverso una
 // sessione di generazione autoregressiva incrementale sul device (vedi
@@ -110,6 +130,16 @@ struct KVCache {
 DeviceTensor selfAttentionIncremental(const DeviceTensor& newInput, const DeviceTensor& wq, const DeviceTensor& wk,
                                        const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
                                        KVCache& cache);
+
+// Come selfAttentionIncremental(), ma le proiezioni Q/K/V/Out usano
+// matmulBf16() invece di matmul() (stessa relazione di
+// selfAttentionBf16() rispetto a selfAttention()): usata da
+// Model::forwardIncremental quando 'precision { compute bf16 }' e'
+// dichiarato, per coerenza con il resto della pipeline addestrata in
+// BF16.
+DeviceTensor selfAttentionIncrementalBf16(const DeviceTensor& newInput, const DeviceTensor& wq,
+                                           const DeviceTensor& wk, const DeviceTensor& wv, const DeviceTensor& wout,
+                                           std::size_t numHeads, KVCache& cache);
 
 // Layer lineare: input [..., inFeatures], weight [inFeatures, outFeatures],
 // bias [outFeatures] -> output [..., outFeatures]. Generalizzato a

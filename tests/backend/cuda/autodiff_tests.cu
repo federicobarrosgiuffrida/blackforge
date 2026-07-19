@@ -410,6 +410,142 @@ TEST(CudaAutodiffTest, SelfAttentionBackwardCorrispondeAllaVersioneCpu) {
     }
 }
 
+TEST(CudaAutodiffTest, SelfAttentionBf16BackwardCorrispondeApprossimativamenteAllaVersioneFp32) {
+    // Stessa formula analitica di selfAttentionBackward (le proiezioni
+    // Q/K/V/Out passano per matmulBf16/matmulBf16Backward, il nucleo
+    // dell'attention resta float32): tolleranza deliberatamente piu'
+    // larga della controparte FP32, stesso principio di
+    // MatmulBf16BackwardCorrispondeApprossimativamenteAMatmulBackwardFp32.
+    Tensor input({1, 3, 4}, {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F, 0.2F, -0.1F, 0.3F, 0.2F, -0.4F, 0.5F});
+    Tensor wq({4, 4}, {0.3F, -0.1F, 0.2F, 0.05F, 0.1F, 0.4F, -0.2F, 0.15F, -0.3F, 0.2F, 0.1F, -0.05F, 0.2F, -0.1F,
+                        0.3F, 0.1F});
+    Tensor wk({4, 4}, {0.1F, 0.2F, -0.1F, 0.3F, -0.2F, 0.1F, 0.4F, -0.1F, 0.3F, -0.3F, 0.1F, 0.2F, -0.1F, 0.2F,
+                        -0.2F, 0.1F});
+    Tensor wv({4, 4}, {0.2F, 0.1F, -0.1F, 0.3F, 0.1F, -0.2F, 0.3F, 0.1F, -0.1F, 0.3F, 0.2F, -0.1F, 0.3F, 0.1F, -0.2F,
+                        0.2F});
+    Tensor wout({4, 4}, {0.1F, -0.1F, 0.2F, 0.1F, 0.2F, 0.1F, -0.1F, 0.2F, -0.1F, 0.2F, 0.1F, -0.1F, 0.1F, 0.2F,
+                          -0.1F, 0.2F});
+    Tensor gradOutput({1, 3, 4}, {1.0F, -0.5F, 0.3F, -0.2F, 0.7F, -0.4F, 0.2F, -0.1F, -0.3F, 0.6F, 0.1F, -0.5F});
+
+    cuda::SelfAttentionGrad fp32Grad = cuda::selfAttentionBackward(
+        cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(wq), cuda::DeviceTensor::fromHost(wk),
+        cuda::DeviceTensor::fromHost(wv), cuda::DeviceTensor::fromHost(wout), /*numHeads=*/2,
+        cuda::DeviceTensor::fromHost(gradOutput));
+    cuda::SelfAttentionGrad bf16Grad = cuda::selfAttentionBf16Backward(
+        cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(wq), cuda::DeviceTensor::fromHost(wk),
+        cuda::DeviceTensor::fromHost(wv), cuda::DeviceTensor::fromHost(wout), /*numHeads=*/2,
+        cuda::DeviceTensor::fromHost(gradOutput));
+
+    Tensor fp32DWq = fp32Grad.dWq.toHost();
+    Tensor bf16DWq = bf16Grad.dWq.toHost();
+    Tensor fp32DWout = fp32Grad.dWout.toHost();
+    Tensor bf16DWout = bf16Grad.dWout.toHost();
+
+    for (std::size_t i = 0; i < fp32DWq.elementCount(); ++i) {
+        float tolerance = std::max(0.1F, std::abs(fp32DWq.at(i)) * 0.1F);
+        EXPECT_NEAR(bf16DWq.at(i), fp32DWq.at(i), tolerance) << "dWq indice " << i;
+    }
+    for (std::size_t i = 0; i < fp32DWout.elementCount(); ++i) {
+        float tolerance = std::max(0.1F, std::abs(fp32DWout.at(i)) * 0.1F);
+        EXPECT_NEAR(bf16DWout.at(i), fp32DWout.at(i), tolerance) << "dWout indice " << i;
+    }
+}
+
+TEST(CudaAutodiffTest, SelfAttentionBf16BackwardCorrispondeAllaDerivataNumerica) {
+    // Gradient check numerico diretto su dWq, usando selfAttentionBf16
+    // stesso come funzione forward (non un proxy FP32) — stesso
+    // principio e stesso eps allargato di
+    // MatmulBf16BackwardCorrispondeAllaDerivataNumerica (il passo di
+    // quantizzazione BF16 richiede una perturbazione piu' grande del
+    // default per non misurare solo rumore di arrotondamento).
+    Tensor input({1, 3, 4}, {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F, 0.2F, -0.1F, 0.3F, 0.2F, -0.4F, 0.5F});
+    Tensor wq({4, 4}, {0.3F, -0.1F, 0.2F, 0.05F, 0.1F, 0.4F, -0.2F, 0.15F, -0.3F, 0.2F, 0.1F, -0.05F, 0.2F, -0.1F,
+                        0.3F, 0.1F});
+    Tensor wk({4, 4}, {0.1F, 0.2F, -0.1F, 0.3F, -0.2F, 0.1F, 0.4F, -0.1F, 0.3F, -0.3F, 0.1F, 0.2F, -0.1F, 0.2F,
+                        -0.2F, 0.1F});
+    Tensor wv({4, 4}, {0.2F, 0.1F, -0.1F, 0.3F, 0.1F, -0.2F, 0.3F, 0.1F, -0.1F, 0.3F, 0.2F, -0.1F, 0.3F, 0.1F, -0.2F,
+                        0.2F});
+    Tensor wout({4, 4}, {0.1F, -0.1F, 0.2F, 0.1F, 0.2F, 0.1F, -0.1F, 0.2F, -0.1F, 0.2F, 0.1F, -0.1F, 0.1F, 0.2F,
+                          -0.1F, 0.2F});
+    Tensor gradOutput({1, 3, 4}, {1.0F, -0.5F, 0.3F, -0.2F, 0.7F, -0.4F, 0.2F, -0.1F, -0.3F, 0.6F, 0.1F, -0.5F});
+
+    cuda::SelfAttentionGrad analytic = cuda::selfAttentionBf16Backward(
+        cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(wq), cuda::DeviceTensor::fromHost(wk),
+        cuda::DeviceTensor::fromHost(wv), cuda::DeviceTensor::fromHost(wout), /*numHeads=*/2,
+        cuda::DeviceTensor::fromHost(gradOutput));
+    Tensor analyticDWq = analytic.dWq.toHost();
+
+    auto fWq = [&](const Tensor& wqVar) {
+        Tensor out = cuda::selfAttentionBf16(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(wqVar),
+                                              cuda::DeviceTensor::fromHost(wk), cuda::DeviceTensor::fromHost(wv),
+                                              cuda::DeviceTensor::fromHost(wout), /*numHeads=*/2)
+                          .toHost();
+        return dot(out, gradOutput);
+    };
+    for (std::size_t i = 0; i < wq.elementCount(); ++i) {
+        float numeric = numericalDerivative(fWq, wq, i, /*eps=*/0.1F);
+        float tolerance = std::max(0.15F, std::abs(numeric) * 0.15F);
+        EXPECT_NEAR(analyticDWq.at(i), numeric, tolerance) << "dWq indice " << i;
+    }
+}
+
+TEST(CudaAutodiffTest, FeedForwardBf16BackwardCorrispondeApprossimativamenteAllaVersioneFp32) {
+    Tensor input({1, 2, 3}, {0.3F, -0.6F, 0.2F, -0.4F, 0.5F, 0.1F});
+    Tensor w1({3, 4}, {0.2F, -0.1F, 0.3F, 0.1F, -0.2F, 0.4F, 0.1F, -0.3F, 0.3F, 0.2F, -0.1F, 0.2F});
+    Tensor b1({4}, {0.1F, -0.1F, 0.05F, 0.0F});
+    Tensor w2({4, 3}, {0.1F, -0.2F, 0.3F, 0.2F, 0.1F, -0.1F, -0.3F, 0.2F, 0.1F, 0.1F, -0.1F, 0.2F});
+    Tensor b2({3}, {0.05F, -0.05F, 0.1F});
+    Tensor gradOutput({1, 2, 3}, {1.0F, -0.5F, 0.3F, -0.2F, 0.7F, -0.4F});
+
+    cuda::FeedForwardGrad fp32Grad = cuda::feedForwardBackward(
+        cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(w1), cuda::DeviceTensor::fromHost(b1),
+        cuda::DeviceTensor::fromHost(w2), cuda::DeviceTensor::fromHost(b2), cuda::DeviceTensor::fromHost(gradOutput));
+    cuda::FeedForwardGrad bf16Grad = cuda::feedForwardBf16Backward(
+        cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(w1), cuda::DeviceTensor::fromHost(b1),
+        cuda::DeviceTensor::fromHost(w2), cuda::DeviceTensor::fromHost(b2), cuda::DeviceTensor::fromHost(gradOutput));
+
+    Tensor fp32DW1 = fp32Grad.dW1.toHost();
+    Tensor bf16DW1 = bf16Grad.dW1.toHost();
+    Tensor fp32DW2 = fp32Grad.dW2.toHost();
+    Tensor bf16DW2 = bf16Grad.dW2.toHost();
+
+    for (std::size_t i = 0; i < fp32DW1.elementCount(); ++i) {
+        float tolerance = std::max(0.1F, std::abs(fp32DW1.at(i)) * 0.1F);
+        EXPECT_NEAR(bf16DW1.at(i), fp32DW1.at(i), tolerance) << "dW1 indice " << i;
+    }
+    for (std::size_t i = 0; i < fp32DW2.elementCount(); ++i) {
+        float tolerance = std::max(0.1F, std::abs(fp32DW2.at(i)) * 0.1F);
+        EXPECT_NEAR(bf16DW2.at(i), fp32DW2.at(i), tolerance) << "dW2 indice " << i;
+    }
+}
+
+TEST(CudaAutodiffTest, FeedForwardBf16BackwardCorrispondeAllaDerivataNumerica) {
+    Tensor input({1, 2, 3}, {0.3F, -0.6F, 0.2F, -0.4F, 0.5F, 0.1F});
+    Tensor w1({3, 4}, {0.2F, -0.1F, 0.3F, 0.1F, -0.2F, 0.4F, 0.1F, -0.3F, 0.3F, 0.2F, -0.1F, 0.2F});
+    Tensor b1({4}, {0.1F, -0.1F, 0.05F, 0.0F});
+    Tensor w2({4, 3}, {0.1F, -0.2F, 0.3F, 0.2F, 0.1F, -0.1F, -0.3F, 0.2F, 0.1F, 0.1F, -0.1F, 0.2F});
+    Tensor b2({3}, {0.05F, -0.05F, 0.1F});
+    Tensor gradOutput({1, 2, 3}, {1.0F, -0.5F, 0.3F, -0.2F, 0.7F, -0.4F});
+
+    cuda::FeedForwardGrad analytic = cuda::feedForwardBf16Backward(
+        cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(w1), cuda::DeviceTensor::fromHost(b1),
+        cuda::DeviceTensor::fromHost(w2), cuda::DeviceTensor::fromHost(b2), cuda::DeviceTensor::fromHost(gradOutput));
+    Tensor analyticDW1 = analytic.dW1.toHost();
+
+    auto fW1 = [&](const Tensor& w1Var) {
+        Tensor out = cuda::feedForwardBf16(cuda::DeviceTensor::fromHost(input), cuda::DeviceTensor::fromHost(w1Var),
+                                            cuda::DeviceTensor::fromHost(b1), cuda::DeviceTensor::fromHost(w2),
+                                            cuda::DeviceTensor::fromHost(b2))
+                          .toHost();
+        return dot(out, gradOutput);
+    };
+    for (std::size_t i = 0; i < w1.elementCount(); ++i) {
+        float numeric = numericalDerivative(fW1, w1, i, /*eps=*/0.1F);
+        float tolerance = std::max(0.15F, std::abs(numeric) * 0.15F);
+        EXPECT_NEAR(analyticDW1.at(i), numeric, tolerance) << "dW1 indice " << i;
+    }
+}
+
 TEST(CudaAutodiffTest, RmsnormBackwardCorrispondeAllaDerivataNumerica) {
     Tensor input({2, 3}, {0.5F, -1.2F, 0.3F, 2.0F, 0.1F, -0.5F});
     Tensor gradOutput({2, 3}, {1.0F, -0.5F, 2.0F, 0.3F, -1.0F, 0.7F});

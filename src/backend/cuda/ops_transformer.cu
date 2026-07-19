@@ -1,5 +1,6 @@
 #include <cmath>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "blackforge/backend/cuda/attention_batched.hpp"
@@ -54,78 +55,104 @@ DeviceTensor concatSeq(const DeviceTensor& a, const DeviceTensor& b) {
     return result;
 }
 
-}  // namespace
+// Le proiezioni lineari (Q/K/V/Out di selfAttention, W1/W2 di
+// feedForward) passano per matmul()/linear() (SGEMM float32) o per
+// matmulBf16()/linearBf16() (Tensor Core) a seconda di 'useBf16': un
+// solo punto di scelta condiviso da tutte le proiezioni di questo
+// file, invece di duplicare interamente selfAttention/feedForward per
+// la variante BF16 (stesso principio gia' usato per causale/
+// bidirezionale in ops.hpp).
+DeviceTensor projectionMatmul(const DeviceTensor& a, const DeviceTensor& b, bool useBf16) {
+    return useBf16 ? matmulBf16(a, b) : matmul(a, b);
+}
 
-DeviceTensor feedForward(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
-                          const DeviceTensor& w2, const DeviceTensor& b2) {
+DeviceTensor projectionLinear(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias,
+                               bool useBf16) {
+    return useBf16 ? linearBf16(input, weight, bias) : linear(input, weight, bias);
+}
+
+DeviceTensor feedForwardImpl(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                              const DeviceTensor& w2, const DeviceTensor& b2, bool useBf16) {
     DeviceTensor normed = rmsnorm(input);
-    DeviceTensor hidden = silu(linear(normed, w1, b1));
-    DeviceTensor out = linear(hidden, w2, b2);
+    DeviceTensor hidden = silu(projectionLinear(normed, w1, b1, useBf16));
+    DeviceTensor out = projectionLinear(hidden, w2, b2, useBf16);
     return add(input, out);
 }
 
-DeviceTensor selfAttention(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
-                            const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads) {
+DeviceTensor selfAttentionImpl(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
+                                const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
+                                bool useBf16, const char* callerName) {
     if (input.rank() != 3) {
-        throw std::invalid_argument("selfAttention: richiede un input a rango 3 [batch, seq, dim] sul device");
+        throw std::invalid_argument(std::string(callerName) +
+                                     ": richiede un input a rango 3 [batch, seq, dim] sul device");
     }
     std::size_t batch = input.dim(0);
     std::size_t seq = input.dim(1);
     std::size_t dim = input.dim(2);
     if (numHeads == 0 || dim % numHeads != 0) {
-        throw std::invalid_argument("selfAttention: numHeads deve dividere esattamente dim");
+        throw std::invalid_argument(std::string(callerName) + ": numHeads deve dividere esattamente dim");
     }
     std::size_t headDim = dim / numHeads;
     float scaleFactor = 1.0F / std::sqrt(static_cast<float>(headDim));
 
     // Le proiezioni Q/K/V/Out non hanno bias (come in LLaMA e come la
-    // controparte CPU): matmul() diretto invece di linear(), su
-    // 'normed' appiattito a 2D (reshape senza copia via
+    // controparte CPU): matmul()/matmulBf16() diretto invece di
+    // linear(), su 'normed' appiattito a 2D (reshape senza copia via
     // DeviceTensor::reshaped, tranne il clone() necessario perche'
     // 'normed' serve tre volte mentre reshaped() consuma il tensore).
     DeviceTensor normed = rmsnorm(input);
-    DeviceTensor q = matmul(normed.clone().reshaped({batch * seq, dim}), wq).reshaped({batch, seq, dim});
-    DeviceTensor k = matmul(normed.clone().reshaped({batch * seq, dim}), wk).reshaped({batch, seq, dim});
-    DeviceTensor v = matmul(std::move(normed).reshaped({batch * seq, dim}), wv).reshaped({batch, seq, dim});
+    DeviceTensor q = projectionMatmul(normed.clone().reshaped({batch * seq, dim}), wq, useBf16)
+                          .reshaped({batch, seq, dim});
+    DeviceTensor k = projectionMatmul(normed.clone().reshaped({batch * seq, dim}), wk, useBf16)
+                          .reshaped({batch, seq, dim});
+    DeviceTensor v = projectionMatmul(std::move(normed).reshaped({batch * seq, dim}), wv, useBf16)
+                          .reshaped({batch, seq, dim});
 
     // Nucleo batchizzato (vedi attention_batched.hpp): Q@K^T, maschera
     // causale e probs@V per TUTTE le combinazioni (batch, testa) in
     // pochi lanci di kernel, invece di un lancio per ciascuna delle
-    // batch*numHeads combinazioni. softmax() e' gia' generica rispetto
-    // alle dimensioni iniziali (opera per "riga", l'ultima dimensione),
-    // quindi si applica direttamente a scores [batch,numHeads,seq,seq]
-    // senza bisogno di una versione batchizzata dedicata.
+    // batch*numHeads combinazioni. Resta sempre in float32 anche
+    // quando useBf16 e' attivo: solo le proiezioni lineari (la parte
+    // dominante del costo computazionale) passano per il Tensor Core.
+    // softmax() e' gia' generica rispetto alle dimensioni iniziali
+    // (opera per "riga", l'ultima dimensione), quindi si applica
+    // direttamente a scores [batch,numHeads,seq,seq] senza bisogno di
+    // una versione batchizzata dedicata.
     DeviceTensor scores = batchedQK(q, k, numHeads, scaleFactor);
     DeviceTensor maskedScores = batchedMask(scores, /*oldLen=*/0);
     DeviceTensor probs = softmax(maskedScores);
     DeviceTensor concatenated = batchedPV(probs, v, numHeads);
 
     DeviceTensor projected =
-        matmul(std::move(concatenated).reshaped({batch * seq, dim}), wout).reshaped({batch, seq, dim});
+        projectionMatmul(std::move(concatenated).reshaped({batch * seq, dim}), wout, useBf16).reshaped({batch, seq, dim});
     return add(input, projected);
 }
 
-DeviceTensor selfAttentionIncremental(const DeviceTensor& newInput, const DeviceTensor& wq, const DeviceTensor& wk,
-                                       const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
-                                       KVCache& cache) {
+DeviceTensor selfAttentionIncrementalImpl(const DeviceTensor& newInput, const DeviceTensor& wq,
+                                           const DeviceTensor& wk, const DeviceTensor& wv, const DeviceTensor& wout,
+                                           std::size_t numHeads, KVCache& cache, bool useBf16,
+                                           const char* callerName) {
     if (newInput.rank() != 3) {
-        throw std::invalid_argument("selfAttentionIncremental: richiede un input a rango 3 [batch, seq, dim] sul "
-                                     "device");
+        throw std::invalid_argument(std::string(callerName) +
+                                     ": richiede un input a rango 3 [batch, seq, dim] sul device");
     }
     std::size_t batch = newInput.dim(0);
     std::size_t newLen = newInput.dim(1);
     std::size_t dim = newInput.dim(2);
     if (numHeads == 0 || dim % numHeads != 0) {
-        throw std::invalid_argument("selfAttentionIncremental: numHeads deve dividere esattamente dim");
+        throw std::invalid_argument(std::string(callerName) + ": numHeads deve dividere esattamente dim");
     }
 
     // Pre-norm: e' per-posizione (nessuna dipendenza tra posizioni),
     // quindi applicarla solo ai token nuovi e' esatto, non
     // un'approssimazione (stesso ragionamento della controparte CPU).
     DeviceTensor normed = rmsnorm(newInput);
-    DeviceTensor qNew = matmul(normed.clone().reshaped({batch * newLen, dim}), wq).reshaped({batch, newLen, dim});
-    DeviceTensor kNew = matmul(normed.clone().reshaped({batch * newLen, dim}), wk).reshaped({batch, newLen, dim});
-    DeviceTensor vNew = matmul(std::move(normed).reshaped({batch * newLen, dim}), wv).reshaped({batch, newLen, dim});
+    DeviceTensor qNew = projectionMatmul(normed.clone().reshaped({batch * newLen, dim}), wq, useBf16)
+                             .reshaped({batch, newLen, dim});
+    DeviceTensor kNew = projectionMatmul(normed.clone().reshaped({batch * newLen, dim}), wk, useBf16)
+                             .reshaped({batch, newLen, dim});
+    DeviceTensor vNew = projectionMatmul(std::move(normed).reshaped({batch * newLen, dim}), wv, useBf16)
+                             .reshaped({batch, newLen, dim});
 
     std::size_t oldLen = cache.length;
     if (oldLen == 0) {
@@ -137,8 +164,8 @@ DeviceTensor selfAttentionIncremental(const DeviceTensor& newInput, const Device
     }
     cache.length = oldLen + newLen;
 
-    // Stesso nucleo batchizzato di selfAttention(): qui newLen (i token
-    // nuovi) e totalLen (l'intera cache K/V aggiornata) possono
+    // Stesso nucleo batchizzato di selfAttentionImpl(): qui newLen (i
+    // token nuovi) e totalLen (l'intera cache K/V aggiornata) possono
     // differire, e oldLen != 0 generalizza la maschera causale a
     // "posizioni gia' in cache sempre visibili" (vedi
     // attention_batched.hpp).
@@ -148,9 +175,45 @@ DeviceTensor selfAttentionIncremental(const DeviceTensor& newInput, const Device
     DeviceTensor probs = softmax(maskedScores);
     DeviceTensor concatenated = batchedPV(probs, cache.v, numHeads);
 
-    DeviceTensor projected =
-        matmul(std::move(concatenated).reshaped({batch * newLen, dim}), wout).reshaped({batch, newLen, dim});
+    DeviceTensor projected = projectionMatmul(std::move(concatenated).reshaped({batch * newLen, dim}), wout, useBf16)
+                                  .reshaped({batch, newLen, dim});
     return add(newInput, projected);
+}
+
+}  // namespace
+
+DeviceTensor feedForward(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                          const DeviceTensor& w2, const DeviceTensor& b2) {
+    return feedForwardImpl(input, w1, b1, w2, b2, /*useBf16=*/false);
+}
+
+DeviceTensor feedForwardBf16(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                              const DeviceTensor& w2, const DeviceTensor& b2) {
+    return feedForwardImpl(input, w1, b1, w2, b2, /*useBf16=*/true);
+}
+
+DeviceTensor selfAttention(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
+                            const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads) {
+    return selfAttentionImpl(input, wq, wk, wv, wout, numHeads, /*useBf16=*/false, "selfAttention");
+}
+
+DeviceTensor selfAttentionBf16(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
+                                const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads) {
+    return selfAttentionImpl(input, wq, wk, wv, wout, numHeads, /*useBf16=*/true, "selfAttentionBf16");
+}
+
+DeviceTensor selfAttentionIncremental(const DeviceTensor& newInput, const DeviceTensor& wq, const DeviceTensor& wk,
+                                       const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
+                                       KVCache& cache) {
+    return selfAttentionIncrementalImpl(newInput, wq, wk, wv, wout, numHeads, cache, /*useBf16=*/false,
+                                         "selfAttentionIncremental");
+}
+
+DeviceTensor selfAttentionIncrementalBf16(const DeviceTensor& newInput, const DeviceTensor& wq,
+                                           const DeviceTensor& wk, const DeviceTensor& wv, const DeviceTensor& wout,
+                                           std::size_t numHeads, KVCache& cache) {
+    return selfAttentionIncrementalImpl(newInput, wq, wk, wv, wout, numHeads, cache, /*useBf16=*/true,
+                                         "selfAttentionIncrementalBf16");
 }
 
 }  // namespace blackforge::backend::cuda

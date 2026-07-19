@@ -208,12 +208,17 @@ DeviceTensor Model::forward(const DeviceTensor& input) {
                 current = addPositionalEmbedding(current, layer.positionalTable->value);
                 break;
             case ir::OpKind::Attention:
-                current = selfAttention(current, layer.attnWq->value, layer.attnWk->value, layer.attnWv->value,
-                                         layer.attnWout->value, layer.attentionNumHeads);
+                current = useTensorCoreLinear_
+                              ? selfAttentionBf16(current, layer.attnWq->value, layer.attnWk->value,
+                                                  layer.attnWv->value, layer.attnWout->value, layer.attentionNumHeads)
+                              : selfAttention(current, layer.attnWq->value, layer.attnWk->value, layer.attnWv->value,
+                                              layer.attnWout->value, layer.attentionNumHeads);
                 break;
             case ir::OpKind::FeedForward:
-                current = feedForward(current, layer.ffW1->value, layer.ffB1->value, layer.ffW2->value,
-                                       layer.ffB2->value);
+                current = useTensorCoreLinear_ ? feedForwardBf16(current, layer.ffW1->value, layer.ffB1->value,
+                                                                  layer.ffW2->value, layer.ffB2->value)
+                                                : feedForward(current, layer.ffW1->value, layer.ffB1->value,
+                                                              layer.ffW2->value, layer.ffB2->value);
                 break;
         }
     }
@@ -262,10 +267,14 @@ void Model::backward(const DeviceTensor& outputGrad) {
                 break;
             }
             case ir::OpKind::Attention: {
-                SelfAttentionGrad g = selfAttentionBackward(layer.cachedInput, layer.attnWq->value,
-                                                             layer.attnWk->value, layer.attnWv->value,
-                                                             layer.attnWout->value, layer.attentionNumHeads,
-                                                             gradCurrent);
+                SelfAttentionGrad g =
+                    useTensorCoreLinear_
+                        ? selfAttentionBf16Backward(layer.cachedInput, layer.attnWq->value, layer.attnWk->value,
+                                                     layer.attnWv->value, layer.attnWout->value,
+                                                     layer.attentionNumHeads, gradCurrent)
+                        : selfAttentionBackward(layer.cachedInput, layer.attnWq->value, layer.attnWk->value,
+                                                 layer.attnWv->value, layer.attnWout->value, layer.attentionNumHeads,
+                                                 gradCurrent);
                 accumulate(layer.attnWq->grad, g.dWq);
                 accumulate(layer.attnWk->grad, g.dWk);
                 accumulate(layer.attnWv->grad, g.dWv);
@@ -274,8 +283,12 @@ void Model::backward(const DeviceTensor& outputGrad) {
                 break;
             }
             case ir::OpKind::FeedForward: {
-                FeedForwardGrad g = feedForwardBackward(layer.cachedInput, layer.ffW1->value, layer.ffB1->value,
-                                                         layer.ffW2->value, layer.ffB2->value, gradCurrent);
+                FeedForwardGrad g =
+                    useTensorCoreLinear_
+                        ? feedForwardBf16Backward(layer.cachedInput, layer.ffW1->value, layer.ffB1->value,
+                                                   layer.ffW2->value, layer.ffB2->value, gradCurrent)
+                        : feedForwardBackward(layer.cachedInput, layer.ffW1->value, layer.ffB1->value,
+                                               layer.ffW2->value, layer.ffB2->value, gradCurrent);
                 accumulate(layer.ffW1->grad, g.dW1);
                 accumulate(layer.ffB1->grad, g.dB1);
                 accumulate(layer.ffW2->grad, g.dW2);
@@ -307,13 +320,19 @@ DeviceTensor Model::forwardIncremental(const DeviceTensor& newTokenIds) {
                 current = addPositionalEmbeddingAt(current, layer.positionalTable->value, generationPosition_);
                 break;
             case ir::OpKind::Attention:
-                current = selfAttentionIncremental(current, layer.attnWq->value, layer.attnWk->value,
-                                                    layer.attnWv->value, layer.attnWout->value,
-                                                    layer.attentionNumHeads, layer.kvCache);
+                current = useTensorCoreLinear_
+                              ? selfAttentionIncrementalBf16(current, layer.attnWq->value, layer.attnWk->value,
+                                                              layer.attnWv->value, layer.attnWout->value,
+                                                              layer.attentionNumHeads, layer.kvCache)
+                              : selfAttentionIncremental(current, layer.attnWq->value, layer.attnWk->value,
+                                                          layer.attnWv->value, layer.attnWout->value,
+                                                          layer.attentionNumHeads, layer.kvCache);
                 break;
             case ir::OpKind::FeedForward:
-                current = feedForward(current, layer.ffW1->value, layer.ffB1->value, layer.ffW2->value,
-                                       layer.ffB2->value);
+                current = useTensorCoreLinear_ ? feedForwardBf16(current, layer.ffW1->value, layer.ffB1->value,
+                                                                  layer.ffW2->value, layer.ffB2->value)
+                                                : feedForward(current, layer.ffW1->value, layer.ffB1->value,
+                                                              layer.ffW2->value, layer.ffB2->value);
                 break;
         }
     }

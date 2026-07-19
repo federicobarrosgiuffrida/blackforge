@@ -489,20 +489,24 @@ model TinyLM {
 ```
 
 `cuda::Model` applica Tensor Core BF16 a ogni layer **`linear`** della
-pipeline (sia in `forward()` sia in `backward()`), sia per `blackforge
-train --device cuda` sia per `blackforge run --device cuda
---from-checkpoint`. Verificato con gradient checking numerico
-(`CudaAutodiffTest.MatmulBf16Backward...`), confronto diretto con la
-controparte FP32 e un training loop end-to-end sull'intera pipeline di
-un modello linguistico (stessa traiettoria di loss della versione
+pipeline **e** alle proiezioni Q/K/V/Out interne ad `attention` e ai
+due layer interni a `feedforward` (`selfAttentionBf16`/
+`feedForwardBf16`, vedi la sezione successiva) — sia in `forward()` sia
+in `backward()`, sia per `blackforge train --device cuda` sia per
+`blackforge run --device cuda --from-checkpoint`. Il nucleo
+dell'attention vera e propria (Q@K^T scalato, maschera, softmax,
+probs@V) resta sempre float32: solo le proiezioni lineari (la parte
+dominante del costo computazionale) passano per il Tensor Core.
+Verificato con gradient checking numerico
+(`CudaAutodiffTest.MatmulBf16Backward...`,
+`CudaAutodiffTest.SelfAttentionBf16Backward...`,
+`CudaAutodiffTest.FeedForwardBf16Backward...`), confronto diretto con
+la controparte FP32 e un training loop end-to-end sull'intera pipeline
+di un modello linguistico (stessa traiettoria di loss della versione
 FP32).
 
 Limitazioni esplicite di questa prima versione:
 
-- Si applica solo a `linear`: le proiezioni Q/K/V/Out interne ad
-  `attention` e i due layer interni a `feedforward` calcolano ancora in
-  float32 pieno (SGEMM). Estendere Tensor Core BF16 anche lì è lavoro
-  futuro.
 - Solo **BF16**: `FP8` (e4m3/e5m2) richiederebbe fattori di scala per
   vivere nel suo range dinamico molto più limitato (tipico
   dell'addestramento a bassa precisione reale, es. Transformer Engine
@@ -513,10 +517,52 @@ Limitazioni esplicite di questa prima versione:
   `--from-checkpoint`, pesi casuali di sola ispezione) non applica
   ancora Tensor Core: solo `Model` (pesi reali, allenabili o caricati
   da checkpoint) lo fa.
-- Nessun supporto multi-GPU, stream CUDA o esecuzione asincrona ancora.
 - Testato solo per l'architettura configurata in
   `BLACKFORGE_CUDA_ARCHITECTURES` (120, Blackwell consumer); altre
   architetture non sono state verificate.
+
+### Prestazioni del backend CUDA: pool di memoria, attention batchizzata, Tensor Core esteso
+
+Allenare un modello reale (~23M parametri, `TinyStories`, `batch_size
+8`) con la versione iniziale del backend CUDA — corretta, verificata,
+ma mai ottimizzata per throughput — risultava stimato in **ore** per
+un addestramento completo. Tre interventi mirati, ciascuno verificato
+con l'intera suite di test prima di passare al successivo, hanno
+ridotto il tempo per step di **circa 7-8 volte** (misurato: 150 step a
+`batch_size 8` da 73,9s a 9,5s):
+
+1. **Pool di memoria device per-device** (`device_pool.hpp`/`.cu`):
+   quasi ogni operazione allocava un `DeviceTensor` intermedio con
+   `cudaMalloc` e lo liberava subito dopo con `cudaFree` — operazioni
+   relativamente costose e sincronizzanti, ripetute migliaia di volte
+   per singolo step. Sostituito con una free list a bucket esatti,
+   indicizzata per device CUDA (essenziale per il training multi-GPU) e
+   dimensione in byte: un buffer liberato resta pronto per la prossima
+   richiesta della stessa dimensione sullo stesso device, invece di
+   tornare al driver. Guadagno modesto da solo (~20%): non era il collo
+   di bottiglia dominante.
+2. **Attention batchizzata** (`attention_batched.hpp`/`.cu`):
+   `selfAttention`/`selfAttentionIncremental`/`selfAttentionBackward`
+   calcolavano Q@K^T/maschera/softmax/probs@V con un doppio loop
+   host-side `for batch: for testa:`, lanciando ~9 kernel separati per
+   OGNI combinazione (batch,testa) — con `batch_size=8` e 8 teste, 64
+   iterazioni per singolo layer. Sostituito con `batchedQK`/
+   `batchedMask`/`batchedPV` (e le loro controparti di backward), un
+   kernel ciascuno per TUTTE le combinazioni, indicizzazione strided
+   diretta sul layout `[batch,seq,dim]`. Guadagno reale ma anch'esso
+   modesto (~20-25%): misurato che il collo di bottiglia dominante non
+   era il numero di lanci di kernel.
+3. **Tensor Core BF16 esteso ad attention/feedforward** (vedi sopra):
+   le proiezioni Q/K/V/Out/W1/W2 giravano ancora in FP32 su cuBLAS
+   classico. Estendere `matmulBf16` anche lì (non solo a `linear`) ha
+   dato il guadagno decisivo — conferma che il collo di bottiglia
+   dominante era il calcolo stesso, non l'allocazione né il numero di
+   lanci di kernel.
+
+Le tre ottimizzazioni sono puramente di **strategia di esecuzione**:
+nessun cambiamento alla matematica, verificato dall'intera suite CUDA
+(391 test) rimasta verde ad ogni passo, inclusi gradient checking e
+parità CPU/GPU per attention e feedforward.
 
 ## Training (pretraining, fine-tuning, LoRA, forecasting)
 

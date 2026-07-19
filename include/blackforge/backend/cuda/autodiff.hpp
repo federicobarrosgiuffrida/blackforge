@@ -80,6 +80,14 @@ struct FeedForwardGrad {
 FeedForwardGrad feedForwardBackward(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
                                      const DeviceTensor& w2, const DeviceTensor& b2, const DeviceTensor& gradOutput);
 
+// feedForwardBf16 (vedi ops.hpp): stessa formula analitica di
+// feedForwardBackward, ma usa matmulBf16Backward invece di
+// matmulBackward per i due prodotti matriciali interni — coerente con
+// l'uso di feedForwardBf16 nel forward corrispondente.
+FeedForwardGrad feedForwardBf16Backward(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
+                                         const DeviceTensor& w2, const DeviceTensor& b2,
+                                         const DeviceTensor& gradOutput);
+
 struct SelfAttentionGrad {
     DeviceTensor dInput;
     DeviceTensor dWq;
@@ -92,5 +100,17 @@ struct SelfAttentionGrad {
 SelfAttentionGrad selfAttentionBackward(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
                                          const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
                                          const DeviceTensor& gradOutput);
+
+// selfAttentionBf16 (vedi ops.hpp): stessa formula analitica di
+// selfAttentionBackward, ma usa matmulBf16Backward invece di
+// matmulBackward per le proiezioni Q/K/V/Out — coerente con l'uso di
+// selfAttentionBf16 nel forward corrispondente. Il nucleo dell'attention
+// (batchedQK/batchedMask/softmax/batchedPV, vedi attention_batched.hpp)
+// resta invariato: solo le proiezioni lineari passano per il Tensor
+// Core.
+SelfAttentionGrad selfAttentionBf16Backward(const DeviceTensor& input, const DeviceTensor& wq,
+                                             const DeviceTensor& wk, const DeviceTensor& wv,
+                                             const DeviceTensor& wout, std::size_t numHeads,
+                                             const DeviceTensor& gradOutput);
 
 }  // namespace blackforge::backend::cuda
