@@ -257,6 +257,19 @@ void IRBuilder::buildPipeline(const ast::PipelineStmt& stmt, ModelIR& model, std
             }
             attentionNumHeads = *numHeads;
             // Pre-norm + residual interni all'operazione: forma invariata.
+        } else if (*kind == OpKind::BidirectionalAttention) {
+            if (stage.args.size() != 1) {
+                diagnostics_.addError(stage.location, "'bidirectional_attention' richiede un singolo argomento "
+                                                        "intero (numero di teste)");
+                return;
+            }
+            std::optional<long long> numHeads = readPositiveIntArg(stage, 0, diagnostics_);
+            if (!numHeads.has_value()) {
+                return;
+            }
+            attentionNumHeads = *numHeads;
+            // Pre-norm + residual interni all'operazione: forma invariata
+            // (identico ad Attention, solo senza maschera causale).
         } else if (*kind == OpKind::FeedForward) {
             if (stage.args.size() != 1) {
                 diagnostics_.addError(stage.location, "'feedforward' richiede un singolo argomento intero "

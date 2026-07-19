@@ -103,4 +103,12 @@ struct SelfAttentionGrad {
 SelfAttentionGrad selfAttentionBackward(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv,
                                          const Tensor& wout, std::size_t numHeads, const Tensor& gradOutput);
 
+// Backward di bidirectionalSelfAttention (vedi ops.hpp): stessa formula
+// analitica di selfAttentionBackward, ma ricalcola il forward SENZA
+// maschera causale (deve corrispondere esattamente a quale delle due
+// varianti e' stata usata nel forward originale).
+SelfAttentionGrad bidirectionalSelfAttentionBackward(const Tensor& input, const Tensor& wq, const Tensor& wk,
+                                                       const Tensor& wv, const Tensor& wout, std::size_t numHeads,
+                                                       const Tensor& gradOutput);
+
 }  // namespace blackforge::backend::cpu

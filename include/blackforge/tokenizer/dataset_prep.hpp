@@ -36,4 +36,26 @@ namespace blackforge::tokenizer {
 std::size_t buildLanguageModelDataset(const Tokenizer& tok, const std::string& corpus, std::size_t seqLen,
                                        const std::string& outputPath);
 
+// Costruisce un dataset .bfdata pronto per l'addestramento di un
+// modello linguistico MASCHERATO (MLM, stile BERT) a partire da un
+// corpus di testo grezzo: tokenizza con 'tok', affetta lo stream di id
+// risultante in finestre non sovrapposte di 'seqLen' token (nessuno
+// shift-by-one, a differenza di buildLanguageModelDataset: qui il
+// compito e' ricostruire i token ORIGINALI di UNA sequenza, non
+// predire il token successivo), poi per ogni posizione di ogni finestra
+// decide, con probabilita' 'maskProb' e seminato deterministicamente da
+// 'seed', se mascherarla: se si', l'input in quella posizione diventa
+// l'id di pad del tokenizer (Tokenizer::kPadId, riusato come token
+// <mask> — encode() non lo produce mai su testo reale, quindi non c'e'
+// ambiguita') e il target e' l'id del token ORIGINALE; se no, l'input
+// resta il token originale e il target e' -1 (ignora questa posizione,
+// vedi backend::cpu::softmaxCrossEntropyMasked). Pensato per essere
+// allenato con `loss cross_entropy_masked`.
+//
+// Ritorna il numero di esempi scritti. Lancia std::invalid_argument se
+// il corpus tokenizzato non produce nemmeno una finestra completa (serve
+// almeno seqLen token) o se maskProb non e' in (0, 1].
+std::size_t buildMaskedLanguageModelDataset(const Tokenizer& tok, const std::string& corpus, std::size_t seqLen,
+                                             float maskProb, unsigned int seed, const std::string& outputPath);
+
 }  // namespace blackforge::tokenizer

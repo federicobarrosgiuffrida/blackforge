@@ -431,17 +431,28 @@ Tensor feedForward(const Tensor& input, const Tensor& w1, const Tensor& b1, cons
     return add(input, out);
 }
 
-Tensor selfAttention(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv, const Tensor& wout,
-                      std::size_t numHeads) {
+namespace {
+
+// Nucleo condiviso di selfAttention()/bidirectionalSelfAttention():
+// identico in tutto tranne se la maschera causale viene applicata o
+// meno. 'causal' == true riproduce esattamente selfAttention()
+// (autoregressiva: ogni posizione vede solo se' stessa e le
+// precedenti); 'causal' == false produce attention bidirezionale
+// (ogni posizione vede l'intera sequenza, stile BERT/encoder — serve
+// per un modello linguistico mascherato, dove non c'e' generazione
+// autoregressiva da proteggere dal "vedere il futuro").
+Tensor selfAttentionImpl(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv,
+                          const Tensor& wout, std::size_t numHeads, bool causal, const char* callerName) {
     if (input.rank() != 3) {
-        throw std::invalid_argument("selfAttention: richiede un input a rango 3 [batch, seq, dim], trovato " +
+        throw std::invalid_argument(std::string(callerName) + ": richiede un input a rango 3 [batch, seq, dim], "
+                                                                "trovato " +
                                      input.shapeToString());
     }
     std::size_t batch = input.dim(0);
     std::size_t seq = input.dim(1);
     std::size_t dim = input.dim(2);
     if (numHeads == 0 || dim % numHeads != 0) {
-        throw std::invalid_argument("selfAttention: numHeads (" + std::to_string(numHeads) +
+        throw std::invalid_argument(std::string(callerName) + ": numHeads (" + std::to_string(numHeads) +
                                      ") deve dividere esattamente dim (" + std::to_string(dim) + ")");
     }
     std::size_t headDim = dim / numHeads;
@@ -467,7 +478,7 @@ Tensor selfAttention(const Tensor& input, const Tensor& wq, const Tensor& wk, co
             Tensor vHead = extractHead(v, b, h, seq, dim, headDim);
 
             Tensor scores = scale(matmulTransposeB(qHead, kHead), scaleFactor);
-            Tensor maskedScores = applyCausalMask(scores);
+            Tensor maskedScores = causal ? applyCausalMask(scores) : scores;
             Tensor probs = softmax(maskedScores);
             Tensor headOut = matmul(probs, vHead);
 
@@ -481,6 +492,18 @@ Tensor selfAttention(const Tensor& input, const Tensor& wq, const Tensor& wk, co
     Tensor projected({batch, seq, dim}, std::move(projectedFlat.data()));
 
     return add(input, projected);
+}
+
+}  // namespace
+
+Tensor selfAttention(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv, const Tensor& wout,
+                      std::size_t numHeads) {
+    return selfAttentionImpl(input, wq, wk, wv, wout, numHeads, /*causal=*/true, "selfAttention");
+}
+
+Tensor bidirectionalSelfAttention(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv,
+                                   const Tensor& wout, std::size_t numHeads) {
+    return selfAttentionImpl(input, wq, wk, wv, wout, numHeads, /*causal=*/false, "bidirectionalSelfAttention");
 }
 
 Tensor selfAttentionIncremental(const Tensor& newInput, const Tensor& wq, const Tensor& wk, const Tensor& wv,

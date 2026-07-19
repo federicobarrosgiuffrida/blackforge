@@ -356,6 +356,40 @@ TEST(CpuOpsTest, SelfAttentionLanciaSeNumHeadsNonDivideDim) {
     EXPECT_THROW((void)cpu::selfAttention(input, w, w, w, w, /*numHeads=*/2), std::invalid_argument);
 }
 
+TEST(CpuOpsTest, BidirectionalSelfAttentionNonRispettaLaMascheraCausale) {
+    // L'esatto opposto di SelfAttentionRispettaLaMascheraCausale: qui
+    // cambiare il token FUTURO (posizione 2) DEVE cambiare l'uscita
+    // alle posizioni precedenti (0 e 1), perche' l'attention
+    // bidirezionale le fa dipendere anche dal contesto a destra — se
+    // non cambiasse, la maschera causale sarebbe ancora attiva per
+    // errore.
+    Tensor wq({4, 4}, {0.3F, -0.1F, 0.2F, 0.05F, 0.1F, 0.4F, -0.2F, 0.15F, -0.3F, 0.2F, 0.1F, -0.05F, 0.2F, -0.1F,
+                        0.3F, 0.1F});
+    Tensor wk({4, 4}, {0.1F, 0.2F, -0.1F, 0.3F, -0.2F, 0.1F, 0.4F, -0.1F, 0.3F, -0.3F, 0.1F, 0.2F, -0.1F, 0.2F,
+                        -0.2F, 0.1F});
+    Tensor wv({4, 4}, {0.2F, 0.1F, -0.1F, 0.3F, 0.1F, -0.2F, 0.3F, 0.1F, -0.1F, 0.3F, 0.2F, -0.1F, 0.3F, 0.1F, -0.2F,
+                        0.2F});
+    Tensor wout({4, 4}, {0.1F, -0.1F, 0.2F, 0.1F, 0.2F, 0.1F, -0.1F, 0.2F, -0.1F, 0.2F, 0.1F, -0.1F, 0.1F, 0.2F,
+                          -0.1F, 0.2F});
+
+    Tensor inputA({1, 3, 4}, {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F, 0.2F, -0.1F, 0.3F, 0.2F, -0.4F, 0.5F});
+    Tensor inputB = inputA;
+    inputB.at(8) = 99.0F;  // token 2 (futuro per 0 e 1), primo elemento
+
+    Tensor resultA = cpu::bidirectionalSelfAttention(inputA, wq, wk, wv, wout, /*numHeads=*/2);
+    Tensor resultB = cpu::bidirectionalSelfAttention(inputB, wq, wk, wv, wout, /*numHeads=*/2);
+
+    bool anyDifferenceInPastPositions = false;
+    for (std::size_t i = 0; i < 8; ++i) {
+        if (std::abs(resultA.at(i) - resultB.at(i)) > 1e-4F) {
+            anyDifferenceInPastPositions = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(anyDifferenceInPastPositions)
+        << "l'attention bidirezionale dovrebbe far dipendere le posizioni passate anche dal futuro";
+}
+
 TEST(CpuOpsTest, SelfAttentionIncrementaleCorrispondeASelfAttentionSuTutteLePosizioni) {
     // Stessi pesi di SelfAttentionRispettaLaMascheraCausale: alimenta
     // l'intera sequenza [1,3,4] a selfAttention() in un colpo solo, poi

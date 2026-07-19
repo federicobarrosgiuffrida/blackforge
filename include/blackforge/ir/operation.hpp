@@ -9,7 +9,7 @@ namespace blackforge::ir {
 // Operazioni tensoriali riconosciute dalla IR. L'insieme cresce insieme
 // al backend che le implementa davvero (milestone CPU/CUDA).
 enum class OpKind { Linear, Silu, Relu, Gelu, RmsNorm, Softmax, Embedding, PositionalEmbedding, Attention,
-                     FeedForward };
+                     FeedForward, BidirectionalAttention };
 
 // Risolve il nome testuale di una fase di pipeline (gia' validato
 // dall'analisi semantica) nel corrispondente OpKind della IR.
@@ -28,7 +28,7 @@ struct Operation {
     long long embeddingVocabSize = 0;    // valido solo se kind == OpKind::Embedding
     long long embeddingDim = 0;          // valido solo se kind == OpKind::Embedding
     long long positionalMaxSeqLen = 0;   // valido solo se kind == OpKind::PositionalEmbedding
-    long long attentionNumHeads = 0;     // valido solo se kind == OpKind::Attention
+    long long attentionNumHeads = 0;     // valido se kind == OpKind::Attention o OpKind::BidirectionalAttention
     long long feedForwardHiddenDim = 0;  // valido solo se kind == OpKind::FeedForward
 };
 

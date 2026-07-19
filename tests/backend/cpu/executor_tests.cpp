@@ -162,6 +162,22 @@ TEST(CpuExecutorTest, EseguePipelineDaModelloLinguisticoConInputSinteticoDiToken
     EXPECT_EQ(output.shape(), (std::vector<std::size_t>{3, 5, 10}));
 }
 
+TEST(CpuExecutorTest, EseguePipelineMlmConBidirectionalAttention) {
+    ir::Module module = buildModule(
+        "model TinyMLM {\n"
+        "    input bf16[batch, 5]\n"
+        "    input |> embedding(10, 4) |> positional_embedding(5) |> bidirectional_attention(2) |> "
+        "feedforward(8) |> linear(10)\n"
+        "}\n");
+
+    const ir::ModelIR& model = module.models.front();
+    backend::cpu::Executor executor;
+    runtime::Tensor input = executor.makeSyntheticInput(model, /*batchSize=*/3);
+
+    runtime::Tensor output = executor.run(model, input);
+    EXPECT_EQ(output.shape(), (std::vector<std::size_t>{3, 5, 10}));
+}
+
 TEST(CpuExecutorTest, LanciaSeIlModelloNonHaPipeline) {
     ir::Module module = buildModule(
         "model M {\n"

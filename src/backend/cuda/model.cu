@@ -86,6 +86,17 @@ Model::Model(const ir::ModelIR& modelIR, unsigned int seed, std::optional<ir::Pr
         LayerState layer;
         layer.kind = op.kind;
 
+        if (op.kind == ir::OpKind::BidirectionalAttention) {
+            // Non ancora implementato su CUDA (vedi backend::cpu::Model
+            // per bidirectional_attention/MLM): errore esplicito invece
+            // di ignorare silenziosamente il layer (che produrrebbe un
+            // risultato quietamente sbagliato, l'input passerebbe
+            // attraverso senza alcuna trasformazione).
+            throw std::invalid_argument(
+                "cuda::Model: 'bidirectional_attention' non e' ancora implementato sul backend CUDA "
+                "(solo su CPU). Usa '--device cpu' per un modello linguistico mascherato (MLM).");
+        }
+
         if (op.kind == ir::OpKind::Linear) {
             const ir::Value& inputValue = modelIR.valueById(op.input);
             std::size_t inFeatures = concreteLastDim(inputValue, "linear#", op.output);

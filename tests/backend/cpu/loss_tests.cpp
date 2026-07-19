@@ -139,6 +139,83 @@ TEST(LossTest, CrossEntropySparseLanciaSeIlNumeroDiRigheNonCorrisponde) {
     EXPECT_THROW((void)cpu::softmaxCrossEntropySparse(logits, targetIndices), std::invalid_argument);
 }
 
+TEST(LossTest, CrossEntropyMaskedCorrispondeASparseQuandoTutteLeRigheSonoMascherate) {
+    // Nessuna riga con -1: deve comportarsi esattamente come
+    // softmaxCrossEntropySparse (la media e' su tutte le righe in
+    // entrambi i casi, dato che tutte contribuiscono).
+    Tensor logits({2, 3}, {0.5F, -1.2F, 0.3F, 2.0F, 0.1F, -0.5F});
+    Tensor targetIndices({2}, {1.0F, 0.0F});
+
+    cpu::LossResult sparse = cpu::softmaxCrossEntropySparse(logits, targetIndices);
+    cpu::LossResult masked = cpu::softmaxCrossEntropyMasked(logits, targetIndices);
+
+    EXPECT_NEAR(masked.value, sparse.value, 1e-6F);
+    for (std::size_t i = 0; i < sparse.grad.elementCount(); ++i) {
+        EXPECT_NEAR(masked.grad.at(i), sparse.grad.at(i), 1e-6F) << "indice " << i;
+    }
+}
+
+TEST(LossTest, CrossEntropyMaskedIgnoraLeRigheConIndiceMenoUno) {
+    // 3 righe, solo la riga 1 e' mascherata (indice 2): la loss deve
+    // dipendere SOLO da quella riga, e il gradiente delle righe 0 e 2
+    // deve essere esattamente zero (nessun contributo).
+    Tensor logits({3, 3}, {1.0F, 2.0F, 3.0F, 0.5F, -1.0F, 0.2F, -0.3F, 0.1F, 0.4F});
+    Tensor targetIndices({3}, {-1.0F, 2.0F, -1.0F});
+
+    cpu::LossResult masked = cpu::softmaxCrossEntropyMasked(logits, targetIndices);
+
+    // Righe ignorate: gradiente tutto zero.
+    for (std::size_t c = 0; c < 3; ++c) {
+        EXPECT_FLOAT_EQ(masked.grad.at(0 * 3 + c), 0.0F) << "riga 0 (ignorata), colonna " << c;
+        EXPECT_FLOAT_EQ(masked.grad.at(2 * 3 + c), 0.0F) << "riga 2 (ignorata), colonna " << c;
+    }
+
+    // La loss deve coincidere con quella di un batch di UNA sola riga
+    // (solo la riga mascherata), non con la media su tutte e 3.
+    Tensor singleRowLogits({1, 3}, {0.5F, -1.0F, 0.2F});
+    Tensor singleRowTarget({1}, {2.0F});
+    cpu::LossResult singleRowResult = cpu::softmaxCrossEntropySparse(singleRowLogits, singleRowTarget);
+    EXPECT_NEAR(masked.value, singleRowResult.value, 1e-5F);
+}
+
+TEST(LossTest, CrossEntropyMaskedRestituisceLossZeroSeNessunaRigaEMascherata) {
+    Tensor logits({2, 3}, {1.0F, 2.0F, 3.0F, 0.5F, -1.0F, 0.2F});
+    Tensor targetIndices({2}, {-1.0F, -1.0F});
+
+    cpu::LossResult masked = cpu::softmaxCrossEntropyMasked(logits, targetIndices);
+    EXPECT_FLOAT_EQ(masked.value, 0.0F);
+    for (std::size_t i = 0; i < masked.grad.elementCount(); ++i) {
+        EXPECT_FLOAT_EQ(masked.grad.at(i), 0.0F) << "indice " << i;
+    }
+}
+
+TEST(LossTest, CrossEntropyMaskedLanciaSeUnIndiceEFuoriRangeENonEMenoUno) {
+    Tensor logits({1, 3}, {0.1F, 0.2F, 0.3F});
+    Tensor targetIndices({1}, {7.0F});
+    EXPECT_THROW((void)cpu::softmaxCrossEntropyMasked(logits, targetIndices), std::invalid_argument);
+}
+
+TEST(LossTest, CrossEntropyMaskedGradienteCorrispondeAllaDerivataNumerica) {
+    Tensor logits({3, 4}, {0.3F, -0.8F, 1.1F, 0.2F, -0.5F, 0.9F, 0.1F, -1.3F, 0.4F, -0.2F, 0.6F, 0.1F});
+    Tensor targetIndices({3}, {2.0F, -1.0F, 0.0F});  // riga 1 mascherata
+
+    cpu::LossResult result = cpu::softmaxCrossEntropyMasked(logits, targetIndices);
+
+    float eps = 1e-3F;
+    for (std::size_t i = 0; i < logits.elementCount(); ++i) {
+        Tensor plusLogits = logits;
+        plusLogits.at(i) += eps;
+        Tensor minusLogits = logits;
+        minusLogits.at(i) -= eps;
+
+        float plus = cpu::softmaxCrossEntropyMasked(plusLogits, targetIndices).value;
+        float minus = cpu::softmaxCrossEntropyMasked(minusLogits, targetIndices).value;
+        float numeric = (plus - minus) / (2.0F * eps);
+
+        EXPECT_NEAR(result.grad.at(i), numeric, 1e-3F) << "indice " << i;
+    }
+}
+
 TEST(LossTest, CrossEntropySparseGradienteCorrispondeAllaDerivataNumerica) {
     Tensor logits({2, 4}, {0.3F, -0.8F, 1.1F, 0.2F, -0.5F, 0.9F, 0.1F, -1.3F});
     Tensor targetIndices({2}, {2.0F, 0.0F});

@@ -53,8 +53,9 @@ void printUsage() {
               << "                                  (richiede --vocab-size e --output)\n"
               << "  tokenizer-encode <tok.bftok> <testo.txt>   Codifica un file di testo, stampa gli id di token\n"
               << "  dataset-build <corpus.txt> <tok.bftok>   Tokenizza un corpus e costruisce un dataset .bfdata\n"
-              << "                                  per l'addestramento di un modello linguistico (richiede\n"
-              << "                                  --seq-len e --output)\n"
+              << "                                  per l'addestramento di un modello linguistico causale\n"
+              << "                                  (richiede --seq-len e --output; aggiungi --mlm per un\n"
+              << "                                  dataset mascherato stile BERT invece, con --mask-prob)\n"
               << "  generate <file>     Genera testo autoregressivamente con cache K/V (CPU, greedy/argmax,\n"
               << "                                  richiede --from-checkpoint, --tokenizer, --prompt)\n"
               << "  --help, -h         Mostra questo messaggio\n"
@@ -79,7 +80,11 @@ void printUsage() {
               << "  --output <file>    Percorso di output (solo 'tokenizer-train'/'dataset-build')\n"
               << "  --tokenizer <file> Tokenizer .bftok da usare (solo 'generate')\n"
               << "  --prompt <testo>   Testo iniziale da cui continuare la generazione (solo 'generate')\n"
-              << "  --max-new-tokens N Numero massimo di token da generare (solo 'generate', default 50)\n";
+              << "  --max-new-tokens N Numero massimo di token da generare (solo 'generate', default 50)\n"
+              << "  --mlm              Costruisce un dataset mascherato (MLM) invece che causale (solo "
+                 "'dataset-build')\n"
+              << "  --mask-prob P      Probabilita' di mascherare ogni posizione, 0 < P <= 1 (solo 'dataset-build "
+                 "--mlm', default 0.15)\n";
 }
 
 void printDevices() {
@@ -556,7 +561,7 @@ int runTokenizerEncode(const std::string& tokenizerPath, const std::string& text
 }
 
 int runDatasetBuild(const std::string& corpusPath, const std::string& tokenizerPath, std::size_t seqLen,
-                     const std::string& outputPath) {
+                     const std::string& outputPath, bool mlm, float maskProb) {
     std::string corpus;
     if (!readFile(corpusPath, corpus)) {
         std::cerr << "errore: impossibile leggere il corpus '" << corpusPath << "'\n";
@@ -573,9 +578,19 @@ int runDatasetBuild(const std::string& corpusPath, const std::string& tokenizerP
 
     try {
         blackforge::tokenizer::Tokenizer tok = blackforge::tokenizer::loadTokenizer(tokenizerPath);
-        std::size_t numExamples = blackforge::tokenizer::buildLanguageModelDataset(tok, corpus, seqLen, outputPath);
-        std::cout << "Dataset costruito: " << numExamples << " esempi (seqLen=" << seqLen
-                   << ", vocabolario=" << tok.vocabSize() << ")\n";
+        std::size_t numExamples;
+        if (mlm) {
+            numExamples = blackforge::tokenizer::buildMaskedLanguageModelDataset(tok, corpus, seqLen, maskProb,
+                                                                                   /*seed=*/42, outputPath);
+            std::cout << "Dataset MLM costruito: " << numExamples << " esempi (seqLen=" << seqLen
+                       << ", maskProb=" << maskProb << ", vocabolario=" << tok.vocabSize()
+                       << "). Allena con 'loss cross_entropy_masked' e 'bidirectional_attention' nella "
+                          "pipeline.\n";
+        } else {
+            numExamples = blackforge::tokenizer::buildLanguageModelDataset(tok, corpus, seqLen, outputPath);
+            std::cout << "Dataset costruito: " << numExamples << " esempi (seqLen=" << seqLen
+                       << ", vocabolario=" << tok.vocabSize() << ")\n";
+        }
         std::cout << "Salvato in '" << outputPath << "'\n";
     } catch (const std::exception& e) {
         std::cerr << "errore di costruzione del dataset: " << e.what() << "\n";
@@ -835,6 +850,8 @@ int main(int argc, char** argv) {
     std::string tokenizerPath;
     std::string prompt;
     std::size_t maxNewTokens = 50;
+    bool mlm = false;
+    float maskProb = 0.15F;
     std::vector<std::string> positional;
     std::string command = args.front();
 
@@ -925,6 +942,14 @@ int main(int argc, char** argv) {
                 return 2;
             }
             maxNewTokens = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--mlm") {
+            mlm = true;
+        } else if (args[i] == "--mask-prob") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--mask-prob' richiede un valore\n";
+                return 2;
+            }
+            maskProb = std::strtof(args[++i].c_str(), nullptr);
         } else {
             positional.push_back(args[i]);
         }
@@ -1010,7 +1035,7 @@ int main(int argc, char** argv) {
             std::cerr << "errore: comando 'dataset-build' richiede '<corpus.txt> <tokenizer.bftok>'\n";
             return 2;
         }
-        return runDatasetBuild(positional[0], positional[1], seqLen, outputPath);
+        return runDatasetBuild(positional[0], positional[1], seqLen, outputPath, mlm, maskProb);
     }
     if (command == "generate") {
         if (positional.empty()) {

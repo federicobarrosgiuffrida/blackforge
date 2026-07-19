@@ -129,6 +129,8 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
         lossFn = softmaxCrossEntropy;
     } else if (lossField->name == "cross_entropy_sparse") {
         lossFn = softmaxCrossEntropySparse;
+    } else if (lossField->name == "cross_entropy_masked") {
+        lossFn = softmaxCrossEntropyMasked;
     } else {
         lossFn = meanSquaredError;
     }

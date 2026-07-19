@@ -791,6 +791,88 @@ generazione incrementale — mirrorarlo su CUDA (stessi
 `addPositionalEmbeddingAt`/`selfAttentionIncremental`/`KVCache`, ma con
 `DeviceTensor`) è lavoro futuro esplicito, non un'omissione nascosta.
 
+### Modello linguistico mascherato — MLM (`bidirectional_attention`, `loss cross_entropy_masked`)
+
+Tutto quanto visto finora (`attention`, `forecast`, `generate`) è
+pensato per la next-token-prediction **causale** (autoregressiva): ogni
+posizione vede solo se stessa e le precedenti. Un modello linguistico
+**mascherato** (MLM, stile BERT) è diverso: alcune posizioni
+dell'ingresso vengono sostituite con un token `<mask>`, e il compito è
+ricostruire il token originale usando il contesto **sia a sinistra sia
+a destra** — richiede quindi un'attention che veda l'**intera
+sequenza**, non solo il passato.
+
+```blackforge
+model TinyMLM {
+    input bf16[batch, 8]
+    input |> embedding(300, 16) |> positional_embedding(8) |> bidirectional_attention(2) |> feedforward(32) |> linear(300)
+}
+
+dataset MaskedCorpus {
+    path "corpus_mlm.bfdata"
+    input bf16[batch, 8]
+    labels bf16[batch, 8]
+}
+
+train {
+    model TinyMLM
+    dataset MaskedCorpus
+    loss cross_entropy_masked
+    optimizer adamw
+    epochs 150
+    batch_size 8
+    learning_rate 0.05
+}
+```
+
+- **`bidirectional_attention(numHeads)`**: stessa firma, stessi
+  parametri (Wq/Wk/Wv/Wout, `[dim, dim]`, senza bias), stesso residual
+  e pre-norm di `attention` — l'UNICA differenza è che la maschera
+  causale non viene applicata: ogni posizione attende all'intera
+  sequenza. Internamente, CPU condivide lo stesso nucleo di calcolo di
+  `attention` (`selfAttentionImpl`/`selfAttentionBackwardImpl` in
+  `ops.cpp`/`autodiff.cpp`), parametrizzato da un flag `causal`, cosi'
+  le due varianti non possono divergere per un bug di copia-incolla.
+- **`loss cross_entropy_masked`**: come `cross_entropy_sparse` (target
+  sparso, un indice di classe per posizione), ma con un significato
+  speciale per l'indice **-1**: "ignora questa posizione" (nessun
+  contributo alla loss né al gradiente). Solo le posizioni
+  effettivamente mascherate durante la preparazione del dataset
+  contribuiscono all'addestramento — esattamente il compito MLM, non
+  next-token-prediction su ogni posizione.
+- **`blackforge dataset-build ... --mlm --mask-prob P`**: costruisce un
+  dataset MLM invece che causale. Ogni posizione di ogni finestra viene
+  mascherata con probabilità `P` (`0 < P <= 1`, default `0.15`, lo
+  stesso valore usato dal BERT originale): se mascherata, l'input in
+  quella posizione diventa `Tokenizer::kPadId` (id 256, riusato come
+  token `<mask>` — `encode()` non lo produce mai su testo reale, quindi
+  non c'è ambiguità con un token "vero") e il target è l'id del token
+  ORIGINALE; se non mascherata, l'input resta il token originale e il
+  target è `-1`.
+
+Verificato end-to-end con la CLI reale (non solo unit test): un
+corpus tokenizzato di questa sessione, dataset MLM costruito con
+`--mlm --mask-prob 0.25`, modello allenato con `cross_entropy_masked` —
+loss da 5.62 a 0.0017 in 150 epoche, a dimostrazione che il modello
+impara davvero a ricostruire i token mascherati dal contesto
+bidirezionale.
+
+**Limitazioni esplicite**:
+
+- `bidirectional_attention` esiste solo sul backend **CPU** per ora.
+  `cuda::Model`/`cuda::Executor` **rifiutano esplicitamente** (errore
+  chiaro, non un risultato quietamente sbagliato) una pipeline che la
+  contiene: `bidirectional_attention non e' ancora implementato sul
+  backend CUDA (solo su CPU)`.
+- Nessuna generazione (`blackforge generate`) per un modello MLM: non
+  ha senso, un modello bidirezionale non genera autoregressivamente
+  (`Model::forwardIncremental` rifiuta esplicitamente una pipeline con
+  `bidirectional_attention`, stesso principio).
+- Il token `<mask>` riusa `Tokenizer::kPadId` invece di un id dedicato:
+  una semplificazione pragmatica (evita di cambiare il layout del
+  vocabolario, quindi la compatibilità di ogni `.bftok`/dataset già
+  generato), documentata esplicitamente, non un'omissione nascosta.
+
 ### Addestramento su GPU (`blackforge train --device cuda`)
 
 `blackforge::backend::cuda` include ora un motore di addestramento

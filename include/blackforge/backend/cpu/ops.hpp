@@ -110,6 +110,18 @@ Tensor feedForward(const Tensor& input, const Tensor& w1, const Tensor& b1, cons
 Tensor selfAttention(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv, const Tensor& wout,
                       std::size_t numHeads);
 
+// Come selfAttention, ma SENZA maschera causale: ogni posizione vede
+// l'intera sequenza (attention bidirezionale, stile BERT/encoder),
+// invece di solo se' stessa e le posizioni precedenti. Pensata per un
+// modello linguistico MASCHERATO (MLM: alcuni token dell'ingresso sono
+// sostituiti con un token <mask>, e il compito e' predire il token
+// originale usando il contesto SIA a sinistra SIA a destra — a
+// differenza della next-token-prediction causale, dove solo il
+// contesto a sinistra è disponibile). Stessi parametri, stesso residual
+// e pre-norm, stessi vincoli su dim/numHeads di selfAttention.
+Tensor bidirectionalSelfAttention(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv,
+                                   const Tensor& wout, std::size_t numHeads);
+
 // Chiavi/valori accumulati di un layer 'attention' attraverso una
 // sessione di generazione autoregressiva incrementale (vedi
 // selfAttentionIncremental): 'k'/'v' hanno forma [batch, length, dim],

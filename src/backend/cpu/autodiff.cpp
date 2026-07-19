@@ -368,18 +368,26 @@ FeedForwardGrad feedForwardBackward(const Tensor& input, const Tensor& w1, const
     return FeedForwardGrad{dInput, matGrad1.dB, addGrad1.dBias, matGrad2.dB, addGrad2.dBias};
 }
 
-SelfAttentionGrad selfAttentionBackward(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv,
-                                         const Tensor& wout, std::size_t numHeads, const Tensor& gradOutput) {
+namespace {
+
+// Nucleo condiviso di selfAttentionBackward()/
+// bidirectionalSelfAttentionBackward(): ricalcola lo stesso forward
+// (causale o bidirezionale a seconda di 'causal', deve corrispondere
+// esattamente a quale delle due e' stata usata nel forward originale)
+// per ricostruire gli stati intermedi necessari, poi applica la stessa
+// formula analitica in entrambi i casi (la maschera causale, quando
+// presente, non richiede un passaggio di backward dedicato: le
+// posizioni mascherate hanno probs == 0, quindi softmaxBackward da'
+// loro gradiente esattamente zero).
+SelfAttentionGrad selfAttentionBackwardImpl(const Tensor& input, const Tensor& wq, const Tensor& wk,
+                                             const Tensor& wv, const Tensor& wout, std::size_t numHeads,
+                                             const Tensor& gradOutput, bool causal) {
     std::size_t batch = input.dim(0);
     std::size_t seq = input.dim(1);
     std::size_t dim = input.dim(2);
     std::size_t headDim = dim / numHeads;
     float scaleFactor = 1.0F / std::sqrt(static_cast<float>(headDim));
 
-    // Ricalcola lo stesso forward di ops.cpp/selfAttention (normed,
-    // Q/K/V, score mascherati per ogni testa, concatenazione), serve
-    // per ricostruire tutti gli stati intermedi di cui il backward ha
-    // bisogno.
     Tensor normed = rmsnorm(input);
     Tensor normedFlat({batch * seq, dim}, normed.data());
     Tensor qFlat = matmul(normedFlat, wq);
@@ -405,7 +413,7 @@ SelfAttentionGrad selfAttentionBackward(const Tensor& input, const Tensor& wq, c
             Tensor vHead = extractHead(v, b, h, seq, dim, headDim);
 
             Tensor scores = scale(matmulTransposeB(qHead, kHead), scaleFactor);
-            Tensor maskedScores = applyCausalMask(scores);
+            Tensor maskedScores = causal ? applyCausalMask(scores) : scores;
             Tensor probs = softmax(maskedScores);
             Tensor headOut = matmul(probs, vHead);
 
@@ -472,6 +480,19 @@ SelfAttentionGrad selfAttentionBackward(const Tensor& input, const Tensor& wq, c
     Tensor dInput = add(gradOutput, dInputFromBranch);
 
     return SelfAttentionGrad{dInput, qBackward.dB, kBackward.dB, vBackward.dB, woutGrad.dB};
+}
+
+}  // namespace
+
+SelfAttentionGrad selfAttentionBackward(const Tensor& input, const Tensor& wq, const Tensor& wk, const Tensor& wv,
+                                         const Tensor& wout, std::size_t numHeads, const Tensor& gradOutput) {
+    return selfAttentionBackwardImpl(input, wq, wk, wv, wout, numHeads, gradOutput, /*causal=*/true);
+}
+
+SelfAttentionGrad bidirectionalSelfAttentionBackward(const Tensor& input, const Tensor& wq, const Tensor& wk,
+                                                       const Tensor& wv, const Tensor& wout, std::size_t numHeads,
+                                                       const Tensor& gradOutput) {
+    return selfAttentionBackwardImpl(input, wq, wk, wv, wout, numHeads, gradOutput, /*causal=*/false);
 }
 
 }  // namespace blackforge::backend::cpu

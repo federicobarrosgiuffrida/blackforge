@@ -46,4 +46,21 @@ LossResult softmaxCrossEntropy(const runtime::Tensor& logits, const runtime::Ten
 // corrispondono o se un indice e' fuori da [0, classi).
 LossResult softmaxCrossEntropySparse(const runtime::Tensor& logits, const runtime::Tensor& targetIndices);
 
+// Variante MASCHERATA di softmaxCrossEntropySparse, pensata per
+// l'addestramento di un modello linguistico mascherato (MLM: alcuni
+// token dell'ingresso sono sostituiti con un token <mask>, e solo QUEI
+// token contribuiscono alla loss — non l'intera sequenza, a differenza
+// della next-token-prediction causale). 'targetIndices' ha la stessa
+// semantica di softmaxCrossEntropySparse (indice di classe per riga),
+// ma il valore sentinella **-1** in una riga significa "ignora questa
+// riga": nessun contributo alla loss ne' al gradiente (gradiente
+// esattamente zero per tutte le classi di quella riga). La loss finale
+// e' la media SOLO sulle righe non ignorate. Se NESSUNA riga e'
+// mascherata (puo' capitare per caso con un mascheramento casuale su
+// batch piccoli), la loss e' 0 e il gradiente e' tutto zero — non e'
+// un errore, solo un batch senza nulla da imparare. Lancia
+// std::invalid_argument se le forme non corrispondono o se un indice
+// (diverso da -1) e' fuori da [0, classi).
+LossResult softmaxCrossEntropyMasked(const runtime::Tensor& logits, const runtime::Tensor& targetIndices);
+
 }  // namespace blackforge::backend::cpu

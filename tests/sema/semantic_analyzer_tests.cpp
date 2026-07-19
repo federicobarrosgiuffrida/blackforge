@@ -176,6 +176,47 @@ TEST(SemanticAnalyzerTest, AccettaPipelineDaModelloLinguistico) {
     EXPECT_FALSE(analyzer.diagnostics().hasErrors());
 }
 
+TEST(SemanticAnalyzerTest, AccettaPipelineDaModelloLinguisticoMascherato) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> embedding(100, 16) |> positional_embedding(8) |> bidirectional_attention(4) |> "
+        "feedforward(32) |> linear(100)\n"
+        "}\n");
+    EXPECT_FALSE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, RifiutaBidirectionalAttentionConNumeroArgomentiErrato) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> bidirectional_attention\n"
+        "}\n");
+    EXPECT_TRUE(analyzer.diagnostics().hasErrors());
+}
+
+TEST(SemanticAnalyzerTest, AccettaLossCrossEntropyMasked) {
+    auto analyzer = analyze(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(2)\n"
+        "}\n"
+        "dataset D {\n"
+        "    path \"d.bfdata\"\n"
+        "    input bf16[batch, 4]\n"
+        "    labels bf16[batch, 2]\n"
+        "}\n"
+        "train {\n"
+        "    model M\n"
+        "    dataset D\n"
+        "    loss cross_entropy_masked\n"
+        "    optimizer adamw\n"
+        "    epochs 1\n"
+        "    batch_size 1\n"
+        "}\n");
+    EXPECT_FALSE(analyzer.diagnostics().hasErrors());
+}
+
 TEST(SemanticAnalyzerTest, RifiutaEmbeddingConNumeroArgomentiErrato) {
     auto analyzer = analyze(
         "model M {\n"

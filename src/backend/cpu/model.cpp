@@ -121,16 +121,23 @@ Model::Model(const ir::ModelIR& modelIR, unsigned int seed, std::optional<LoraOp
             layer.positionalTable =
                 Parameter{base + ".table", randomTensor({maxSeqLen, dim}, seedFor(seed, op.output, kPositionalSalt)),
                           runtime::Tensor::zeros({maxSeqLen, dim})};
-        } else if (op.kind == ir::OpKind::Attention) {
+        } else if (op.kind == ir::OpKind::Attention || op.kind == ir::OpKind::BidirectionalAttention) {
+            // Attention e BidirectionalAttention condividono esattamente
+            // la stessa forma dei parametri (Wq/Wk/Wv/Wout, [dim,dim]):
+            // differiscono solo in forward()/backward() (maschera
+            // causale si'/no), non nell'allocazione. ir::opKindName
+            // fornisce il prefisso di nome corretto per entrambe
+            // ("attention"/"bidirectional_attention").
             const ir::Value& inputValue = modelIR.valueById(op.input);
-            std::size_t dim = concreteLastDim(inputValue, "attention#", op.output);
+            std::string opLabel = ir::opKindName(op.kind);
+            std::size_t dim = concreteLastDim(inputValue, opLabel + "#", op.output);
             auto numHeads = static_cast<std::size_t>(op.attentionNumHeads);
             if (numHeads == 0 || dim % numHeads != 0) {
-                throw std::invalid_argument("Model: 'attention#" + std::to_string(op.output) + "' richiede che " +
-                                             std::to_string(numHeads) + " teste dividano esattamente dim=" +
-                                             std::to_string(dim));
+                throw std::invalid_argument("Model: '" + opLabel + "#" + std::to_string(op.output) +
+                                             "' richiede che " + std::to_string(numHeads) +
+                                             " teste dividano esattamente dim=" + std::to_string(dim));
             }
-            std::string base = "attention" + std::to_string(op.output);
+            std::string base = opLabel + std::to_string(op.output);
 
             layer.attentionNumHeads = numHeads;
             // Nessun bias per le proiezioni Q/K/V/Out (come in LLaMA, vedi
@@ -211,6 +218,11 @@ runtime::Tensor Model::forward(const runtime::Tensor& input) {
             case ir::OpKind::Attention:
                 current = selfAttention(current, layer.attnWq->value, layer.attnWk->value, layer.attnWv->value,
                                          layer.attnWout->value, layer.attentionNumHeads);
+                break;
+            case ir::OpKind::BidirectionalAttention:
+                current = bidirectionalSelfAttention(current, layer.attnWq->value, layer.attnWk->value,
+                                                      layer.attnWv->value, layer.attnWout->value,
+                                                      layer.attentionNumHeads);
                 break;
             case ir::OpKind::FeedForward:
                 current = feedForward(current, layer.ffW1->value, layer.ffB1->value, layer.ffW2->value,
@@ -303,6 +315,18 @@ void Model::backward(const runtime::Tensor& outputGrad) {
                 gradCurrent = g.dInput;
                 break;
             }
+            case ir::OpKind::BidirectionalAttention: {
+                SelfAttentionGrad g = bidirectionalSelfAttentionBackward(layer.cachedInput, layer.attnWq->value,
+                                                                          layer.attnWk->value, layer.attnWv->value,
+                                                                          layer.attnWout->value,
+                                                                          layer.attentionNumHeads, gradCurrent);
+                accumulate(layer.attnWq->grad, g.dWq);
+                accumulate(layer.attnWk->grad, g.dWk);
+                accumulate(layer.attnWv->grad, g.dWv);
+                accumulate(layer.attnWout->grad, g.dWout);
+                gradCurrent = g.dInput;
+                break;
+            }
             case ir::OpKind::FeedForward: {
                 FeedForwardGrad g = feedForwardBackward(layer.cachedInput, layer.ffW1->value, layer.ffB1->value,
                                                          layer.ffW2->value, layer.ffB2->value, gradCurrent);
@@ -338,6 +362,15 @@ runtime::Tensor Model::forwardIncremental(const runtime::Tensor& newTokenIds) {
                                                     layer.attnWv->value, layer.attnWout->value,
                                                     layer.attentionNumHeads, layer.kvCache);
                 break;
+            case ir::OpKind::BidirectionalAttention:
+                // La generazione autoregressiva incrementale non ha senso
+                // per un layer bidirezionale (stile BERT/MLM): non esiste
+                // un "prossimo token" da generare per un modello che vede
+                // l'intera sequenza in un colpo solo. Errore esplicito
+                // invece di un comportamento silenziosamente sbagliato.
+                throw std::invalid_argument("Model::forwardIncremental: la pipeline contiene "
+                                             "'bidirectional_attention', che non supporta la generazione "
+                                             "incrementale");
             case ir::OpKind::FeedForward:
                 current = feedForward(current, layer.ffW1->value, layer.ffB1->value, layer.ffW2->value,
                                        layer.ffB2->value);

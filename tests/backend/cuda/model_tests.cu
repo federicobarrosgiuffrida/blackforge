@@ -82,6 +82,19 @@ TEST(CudaModelTest, LanciaSeLaDimensioneDelleFeatureENonConcreta) {
     EXPECT_THROW((cuda::Model(module.models.front())), std::invalid_argument);
 }
 
+TEST(CudaModelTest, LanciaUnErroreEsplicitoSeLaPipelineContieneBidirectionalAttention) {
+    // 'bidirectional_attention' (MLM) non e' ancora implementato su
+    // CUDA: la costruzione deve fallire con un errore chiaro, non
+    // ignorare silenziosamente il layer (che produrrebbe un risultato
+    // quietamente sbagliato — l'input passerebbe attraverso invariato).
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> bidirectional_attention(2)\n"
+        "}\n");
+    EXPECT_THROW((cuda::Model(module.models.front())), std::invalid_argument);
+}
+
 TEST(CudaModelTest, BackwardCorrispondeAllaDerivataNumericaDelLoss) {
     ir::Module module = buildModule(
         "model M {\n"

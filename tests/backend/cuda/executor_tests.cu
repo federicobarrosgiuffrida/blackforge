@@ -93,3 +93,17 @@ TEST(CudaExecutorTest, LanciaSeIlModelloNonHaPipeline) {
 
     EXPECT_THROW((void)executor.run(model, input), std::invalid_argument);
 }
+
+TEST(CudaExecutorTest, LanciaUnErroreEsplicitoSeLaPipelineContieneBidirectionalAttention) {
+    ir::Module module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> bidirectional_attention(2)\n"
+        "}\n");
+
+    const ir::ModelIR& model = module.models.front();
+    backend::cuda::Executor executor;
+    runtime::Tensor input = executor.makeSyntheticInput(model, 1);
+
+    EXPECT_THROW((void)executor.run(model, input), std::invalid_argument);
+}

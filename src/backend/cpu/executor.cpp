@@ -108,6 +108,19 @@ runtime::Tensor Executor::run(const ir::ModelIR& model, const runtime::Tensor& i
                 current = selfAttention(current, wq, wk, wv, wout, numHeads);
                 break;
             }
+            case ir::OpKind::BidirectionalAttention: {
+                // Stessa allocazione di pesi casuali di Attention (stessa
+                // forma dei parametri): differisce solo la funzione di
+                // forward chiamata (nessuna maschera causale).
+                std::size_t dim = current.shape().back();
+                auto numHeads = static_cast<std::size_t>(op.attentionNumHeads);
+                runtime::Tensor wq = randomTensor({dim, dim}, seedFor(seed_, op.output, kAttnWqSalt));
+                runtime::Tensor wk = randomTensor({dim, dim}, seedFor(seed_, op.output, kAttnWkSalt));
+                runtime::Tensor wv = randomTensor({dim, dim}, seedFor(seed_, op.output, kAttnWvSalt));
+                runtime::Tensor wout = randomTensor({dim, dim}, seedFor(seed_, op.output, kAttnWoutSalt));
+                current = bidirectionalSelfAttention(current, wq, wk, wv, wout, numHeads);
+                break;
+            }
             case ir::OpKind::FeedForward: {
                 std::size_t dim = current.shape().back();
                 auto hiddenDim = static_cast<std::size_t>(op.feedForwardHiddenDim);

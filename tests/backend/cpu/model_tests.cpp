@@ -594,6 +594,78 @@ TEST(ModelTest, ResetGenerationStateAzzeraLaCacheELaPosizione) {
     }
 }
 
+// --- Modello linguistico mascherato (bidirectional_attention + cross_entropy_masked) ---
+
+namespace {
+
+ir::Module buildTinyMlmModule() {
+    return buildModule(
+        "model TinyMLM {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> embedding(8, 4) |> positional_embedding(4) |> bidirectional_attention(2) |> "
+        "feedforward(8) |> linear(8)\n"
+        "}\n");
+}
+
+}  // namespace
+
+TEST(ModelTest, CostruisceIParametriDiUnaPipelineMlmConBidirectionalAttention) {
+    ir::Module module = buildTinyMlmModule();
+    backend::cpu::Model model(module.models.front());
+
+    auto params = model.parameters();
+    // embedding: 1. positional_embedding: 1. bidirectional_attention: 4
+    // (wq/wk/wv/wout, stessa forma di attention). feedforward: 4. linear
+    // finale: 2. Totale 12 — identico a un modello 'attention' comune,
+    // solo il tipo di layer (e quindi il forward/backward usato) cambia.
+    ASSERT_EQ(params.size(), 12u);
+
+    bool foundBidirectional = false;
+    for (const auto* param : params) {
+        if (param->name.rfind("bidirectional_attention", 0) == 0) {
+            foundBidirectional = true;
+        }
+    }
+    EXPECT_TRUE(foundBidirectional) << "nessun parametro con prefisso 'bidirectional_attention' trovato";
+}
+
+TEST(ModelTest, TrainingLoopMlmRiduceLaLossConCrossEntropyMasked) {
+    // Esercita l'intera catena MLM: Embedding -> PositionalEmbedding ->
+    // BidirectionalAttention (nessuna maschera causale) -> FeedForward ->
+    // Linear, allenata con AdamW e softmaxCrossEntropyMasked. Compito:
+    // ricostruire, a partire da una sequenza con ALCUNE posizioni
+    // mascherate (sostituite con l'id 6, un placeholder arbitrario nel
+    // vocabolario di 8 — non serve che sia kPadId qui, e' solo un test
+    // C++ diretto su Model, non passa dal tokenizer/dataset-build), i
+    // token originali di QUELLE posizioni soltanto.
+    ir::Module module = buildTinyMlmModule();
+    backend::cpu::Model model(module.models.front());
+    backend::cpu::AdamW optimizer(/*learningRate=*/0.05F);
+
+    // Sequenza originale: [1, 2, 3, 4]. Posizioni 1 e 3 mascherate
+    // (sostituite con l'id placeholder 6): input = [1, 6, 3, 6].
+    runtime::Tensor input({1, 4}, {1.0F, 6.0F, 3.0F, 6.0F});
+    // Target: -1 per le posizioni non mascherate, id originale per
+    // quelle mascherate.
+    runtime::Tensor targetIndices({1, 4}, {-1.0F, 2.0F, -1.0F, 4.0F});
+
+    float firstLoss = 0.0F;
+    float lastLoss = 0.0F;
+    for (int step = 0; step < 200; ++step) {
+        model.zeroGrad();
+        runtime::Tensor output = model.forward(input);
+        backend::cpu::LossResult loss = backend::cpu::softmaxCrossEntropyMasked(output, targetIndices);
+        if (step == 0) {
+            firstLoss = loss.value;
+        }
+        lastLoss = loss.value;
+        model.backward(loss.grad);
+        optimizer.step(model.parameters());
+    }
+
+    EXPECT_LT(lastLoss, firstLoss * 0.5F);
+}
+
 // --- Precisione numerica (quantizzazione simulata) ---
 
 TEST(ModelPrecisionTest, SenzaPrecisionPolicyIlForwardENonQuantizzato) {

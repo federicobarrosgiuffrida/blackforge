@@ -18,6 +18,7 @@ const std::unordered_map<std::string, OpKind>& opKindTable() {
         {"positional_embedding", OpKind::PositionalEmbedding},
         {"attention", OpKind::Attention},
         {"feedforward", OpKind::FeedForward},
+        {"bidirectional_attention", OpKind::BidirectionalAttention},
     };
     return table;
 }
@@ -44,6 +45,7 @@ std::string opKindName(OpKind kind) {
         case OpKind::PositionalEmbedding: return "positional_embedding";
         case OpKind::Attention: return "attention";
         case OpKind::FeedForward: return "feedforward";
+        case OpKind::BidirectionalAttention: return "bidirectional_attention";
     }
     return "?";
 }

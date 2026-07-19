@@ -162,6 +162,33 @@ TEST(IRBuilderTest, PropagaLaFormaAttraversoUnaPipelineDaModelloLinguistico) {
     EXPECT_EQ(afterLinear.shape[2].literalValue, 100);
 }
 
+TEST(IRBuilderTest, BidirectionalAttentionNonAlteraFormaEHaIlProprioOpKind) {
+    // Stesso principio di 'attention': forma invariata, residual/pre-norm
+    // interni — ma OpKind distinto (BidirectionalAttention, non
+    // Attention), cosi' backend::cpu::Model sa quale forward/backward
+    // (con o senza maschera causale) dispatchare.
+    BuildResult result = buildIR(
+        "model TinyMLM {\n"
+        "    input bf16[batch, 8]\n"
+        "    input |> embedding(100, 16) |> bidirectional_attention(4)\n"
+        "}\n");
+
+    ASSERT_FALSE(result.diagnostics.hasErrors());
+    const ir::ModelIR& model = result.module.models[0];
+    const ir::Pipeline& pipeline = model.pipelines[0];
+    ASSERT_EQ(pipeline.operations.size(), 2u);
+
+    const ir::Operation& bidiOp = pipeline.operations[1];
+    EXPECT_EQ(bidiOp.kind, ir::OpKind::BidirectionalAttention);
+    EXPECT_EQ(bidiOp.attentionNumHeads, 4);
+
+    const ir::Value& afterEmbedding = model.valueById(pipeline.operations[0].output);
+    const ir::Value& afterBidi = model.valueById(bidiOp.output);
+    ASSERT_EQ(afterBidi.shape.size(), 3u);
+    EXPECT_EQ(afterBidi.shape[1].literalValue, afterEmbedding.shape[1].literalValue);
+    EXPECT_EQ(afterBidi.shape[2].literalValue, afterEmbedding.shape[2].literalValue);
+}
+
 TEST(IRBuilderTest, RmsnormNonAlteraFormaNeFormato) {
     BuildResult result = buildIR(
         "model TinyModel {\n"

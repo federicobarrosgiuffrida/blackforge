@@ -146,4 +146,80 @@ LossResult softmaxCrossEntropySparse(const runtime::Tensor& logits, const runtim
     return LossResult{value, runtime::Tensor(logits.shape(), std::move(grad))};
 }
 
+LossResult softmaxCrossEntropyMasked(const runtime::Tensor& logits, const runtime::Tensor& targetIndices) {
+    if (logits.rank() < 2) {
+        throw std::invalid_argument(
+            "softmaxCrossEntropyMasked: richiede logits a rango >= 2 [..., classi], trovato " +
+            logits.shapeToString());
+    }
+    std::size_t numClasses = logits.shape().back();
+    std::size_t batch = logits.elementCount() / numClasses;
+
+    if (targetIndices.elementCount() != batch) {
+        throw std::invalid_argument("softmaxCrossEntropyMasked: targetIndices ha " +
+                                     std::to_string(targetIndices.elementCount()) + " elementi, ne servono " +
+                                     std::to_string(batch));
+    }
+
+    std::vector<float> grad(logits.elementCount(), 0.0F);
+    double totalLoss = 0.0;
+    std::size_t numMaskedRows = 0;
+    std::vector<double> probs(numClasses);
+
+    for (std::size_t b = 0; b < batch; ++b) {
+        auto rawIndex = static_cast<long long>(std::lround(targetIndices.at(b)));
+        if (rawIndex == -1) {
+            continue;  // Riga non mascherata: nessun contributo, gradiente resta a zero.
+        }
+        if (rawIndex < 0 || static_cast<std::size_t>(rawIndex) >= numClasses) {
+            throw std::invalid_argument("softmaxCrossEntropyMasked: indice di classe " + std::to_string(rawIndex) +
+                                         " fuori da [0, " + std::to_string(numClasses) + ") (o -1 per ignorare)");
+        }
+        auto targetClass = static_cast<std::size_t>(rawIndex);
+        ++numMaskedRows;
+
+        std::size_t rowOffset = b * numClasses;
+        float maxLogit = logits.at(rowOffset);
+        for (std::size_t c = 1; c < numClasses; ++c) {
+            maxLogit = std::max(maxLogit, logits.at(rowOffset + c));
+        }
+
+        double sumExp = 0.0;
+        for (std::size_t c = 0; c < numClasses; ++c) {
+            probs[c] = std::exp(static_cast<double>(logits.at(rowOffset + c) - maxLogit));
+            sumExp += probs[c];
+        }
+        for (std::size_t c = 0; c < numClasses; ++c) {
+            probs[c] /= sumExp;
+        }
+        totalLoss += -std::log(std::max(probs[targetClass], 1e-12));
+
+        // Il gradiente per riga viene diviso per numMaskedRows, non per
+        // 'batch': ogni riga mascherata pesa 1/numMaskedRows sulla loss
+        // media, esattamente come nella versione non mascherata ogni
+        // riga pesa 1/batch. numMaskedRows non e' ancora noto per
+        // intero a questo punto del ciclo (si scopre solo alla fine),
+        // quindi si scrive qui il gradiente NON normalizzato (prob -
+        // target) e si normalizza in un secondo passaggio sotto.
+        for (std::size_t c = 0; c < numClasses; ++c) {
+            float t = (c == targetClass) ? 1.0F : 0.0F;
+            grad[rowOffset + c] = static_cast<float>(probs[c]) - t;
+        }
+    }
+
+    float value = 0.0F;
+    if (numMaskedRows > 0) {
+        value = static_cast<float>(totalLoss / static_cast<double>(numMaskedRows));
+        float invMaskedRows = 1.0F / static_cast<float>(numMaskedRows);
+        for (float& g : grad) {
+            g *= invMaskedRows;
+        }
+    }
+    // Se numMaskedRows == 0, 'grad' e' gia' tutto zero (mai scritto) e
+    // 'value' resta 0.0F: un batch senza righe mascherate non ha nulla
+    // da imparare, non e' un errore.
+
+    return LossResult{value, runtime::Tensor(logits.shape(), std::move(grad))};
+}
+
 }  // namespace blackforge::backend::cpu

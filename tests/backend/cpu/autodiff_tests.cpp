@@ -327,3 +327,45 @@ TEST(AutodiffTest, SelfAttentionBackwardFunzionaAncheConUnaSolaTesta) {
         EXPECT_NEAR(analytic.dInput.at(i), numericalDerivative(f, input, i), 3e-2F) << "indice " << i;
     }
 }
+
+TEST(AutodiffTest, BidirectionalSelfAttentionBackwardCorrispondeAllaDerivataNumerica) {
+    // Stessi dati di SelfAttentionBackwardCorrispondeAllaDerivataNumerica,
+    // ma sulla variante bidirezionale (nessuna maschera causale):
+    // verifica che il backward condiviso (selfAttentionBackwardImpl con
+    // causal=false) sia corretto anche nel ramo non mascherato, non solo
+    // in quello causale gia' testato altrove.
+    Tensor input({1, 3, 4}, {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F, 0.2F, -0.1F, 0.3F, 0.2F, -0.4F, 0.5F});
+    Tensor wq({4, 4}, {0.3F, -0.1F, 0.2F, 0.05F, 0.1F, 0.4F, -0.2F, 0.15F, -0.3F, 0.2F, 0.1F, -0.05F, 0.2F, -0.1F,
+                        0.3F, 0.1F});
+    Tensor wk({4, 4}, {0.1F, 0.2F, -0.1F, 0.3F, -0.2F, 0.1F, 0.4F, -0.1F, 0.3F, -0.3F, 0.1F, 0.2F, -0.1F, 0.2F,
+                        -0.2F, 0.1F});
+    Tensor wv({4, 4}, {0.2F, 0.1F, -0.1F, 0.3F, 0.1F, -0.2F, 0.3F, 0.1F, -0.1F, 0.3F, 0.2F, -0.1F, 0.3F, 0.1F, -0.2F,
+                        0.2F});
+    Tensor wout({4, 4}, {0.1F, -0.1F, 0.2F, 0.1F, 0.2F, 0.1F, -0.1F, 0.2F, -0.1F, 0.2F, 0.1F, -0.1F, 0.1F, 0.2F,
+                          -0.1F, 0.2F});
+    Tensor gradOutput({1, 3, 4}, {1.0F, -0.5F, 0.3F, -0.2F, 0.7F, -0.4F, 0.2F, -0.1F, -0.3F, 0.6F, 0.1F, -0.5F});
+
+    cpu::SelfAttentionGrad analytic =
+        cpu::bidirectionalSelfAttentionBackward(input, wq, wk, wv, wout, /*numHeads=*/2, gradOutput);
+
+    auto fInput = [&](const Tensor& x) {
+        return dot(cpu::bidirectionalSelfAttention(x, wq, wk, wv, wout, 2), gradOutput);
+    };
+    for (std::size_t i = 0; i < input.elementCount(); ++i) {
+        EXPECT_NEAR(analytic.dInput.at(i), numericalDerivative(fInput, input, i), 3e-2F) << "dInput indice " << i;
+    }
+
+    auto fWq = [&](const Tensor& w) {
+        return dot(cpu::bidirectionalSelfAttention(input, w, wk, wv, wout, 2), gradOutput);
+    };
+    for (std::size_t i = 0; i < wq.elementCount(); ++i) {
+        EXPECT_NEAR(analytic.dWq.at(i), numericalDerivative(fWq, wq, i), 3e-2F) << "dWq indice " << i;
+    }
+
+    auto fWout = [&](const Tensor& w) {
+        return dot(cpu::bidirectionalSelfAttention(input, wq, wk, wv, w, 2), gradOutput);
+    };
+    for (std::size_t i = 0; i < wout.elementCount(); ++i) {
+        EXPECT_NEAR(analytic.dWout.at(i), numericalDerivative(fWout, wout, i), 3e-2F) << "dWout indice " << i;
+    }
+}

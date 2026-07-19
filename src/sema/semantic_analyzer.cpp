@@ -32,16 +32,18 @@ const std::unordered_map<std::string, int>& knownOperations() {
         {"positional_embedding", 1},
         {"attention", 1},
         {"feedforward", 1},
+        {"bidirectional_attention", 1},
     };
     return operations;
 }
 
 // Vero per le operazioni che richiedono TUTTI i loro argomenti come
-// interi positivi (embedding/positional_embedding/attention/feedforward,
-// come 'linear'): evita di ripetere lo stesso controllo quattro volte.
+// interi positivi (embedding/positional_embedding/attention/feedforward/
+// bidirectional_attention, come 'linear'): evita di ripetere lo stesso
+// controllo per ognuna.
 bool requiresPositiveIntegerArgs(const std::string& opName) {
     return opName == "linear" || opName == "embedding" || opName == "positional_embedding" ||
-           opName == "attention" || opName == "feedforward";
+           opName == "attention" || opName == "feedforward" || opName == "bidirectional_attention";
 }
 
 std::string precisionFieldName(ast::PrecisionFieldKind kind) {
@@ -69,9 +71,16 @@ bool isStorageField(ast::PrecisionFieldKind kind) {
 // di un vettore one-hot denso (una dimensione in meno rispetto
 // all'uscita del modello) — essenziale per vocabolari grandi, dove il
 // target denso sprecherebbe memoria proporzionale al vocabolario (vedi
-// backend::cpu::softmaxCrossEntropySparse).
+// backend::cpu::softmaxCrossEntropySparse); 'cross_entropy_masked' e'
+// la variante pensata per un modello linguistico MASCHERATO (MLM): come
+// 'cross_entropy_sparse', ma un indice -1 in una riga significa
+// "ignora questa riga" (nessun contributo alla loss), cosi' solo i
+// token effettivamente mascherati durante la preparazione del dataset
+// contribuiscono all'addestramento (vedi
+// backend::cpu::softmaxCrossEntropyMasked).
 const std::unordered_set<std::string>& knownLossNames() {
-    static const std::unordered_set<std::string> names = {"mse", "cross_entropy", "cross_entropy_sparse"};
+    static const std::unordered_set<std::string> names = {"mse", "cross_entropy", "cross_entropy_sparse",
+                                                            "cross_entropy_masked"};
     return names;
 }
 
@@ -191,7 +200,7 @@ void SemanticAnalyzer::analyzeStage(const ast::PipelineStage& stage) {
         diagnostics_.addError(stage.location, "operazione sconosciuta '" + stage.name +
                                                    "'. Operazioni supportate: linear, silu, relu, gelu, rmsnorm, "
                                                    "softmax, embedding, positional_embedding, attention, "
-                                                   "feedforward");
+                                                   "feedforward, bidirectional_attention");
         return;
     }
 
@@ -366,7 +375,8 @@ void SemanticAnalyzer::analyzeTrain(const ast::TrainDecl& decl) {
                         diagnostics_.addError(
                             node.location,
                             "loss sconosciuta '" + node.name +
-                                "'. Loss supportate: mse, cross_entropy, cross_entropy_sparse");
+                                "'. Loss supportate: mse, cross_entropy, cross_entropy_sparse, "
+                                "cross_entropy_masked");
                     }
                 } else if constexpr (std::is_same_v<T, ast::TrainOptimizerField>) {
                     ++optimizerCount;

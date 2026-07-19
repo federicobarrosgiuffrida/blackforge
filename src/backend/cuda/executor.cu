@@ -106,6 +106,11 @@ runtime::Tensor Executor::run(const ir::ModelIR& model, const runtime::Tensor& i
                 current = selfAttention(current, wq, wk, wv, wout, numHeads);
                 break;
             }
+            case ir::OpKind::BidirectionalAttention:
+                // Non ancora implementato su CUDA (solo su CPU): errore
+                // esplicito invece di ignorare silenziosamente il layer.
+                throw std::invalid_argument(
+                    "bidirectional_attention non e' ancora implementato sul backend CUDA (solo su CPU)");
             case ir::OpKind::FeedForward: {
                 std::size_t dim = current.shape().back();
                 auto hiddenDim = static_cast<std::size_t>(op.feedForwardHiddenDim);
