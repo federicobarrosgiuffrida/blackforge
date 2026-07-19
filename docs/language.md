@@ -621,6 +621,40 @@ Le cinque ottimizzazioni sono puramente di **strategia di
 esecuzione**: nessun cambiamento alla matematica, verificato
 dall'intera suite CUDA (391 test) rimasta verde ad ogni passo, inclusi
 gradient checking e parità CPU/GPU per attention e feedforward.
+
+#### Audit completo e cache dei piani cuBLASLt: un risultato nullo, riportato onestamente
+
+Dopo il punto 5, un audit sistematico dell'intero repository (non solo
+dell'attention) ha classificato ogni fonte di overhead individuata per
+impatto atteso. La più promettente sulla carta: `bf16Gemm`
+(`ops_tensorcore.cu`) ricreava da zero, ad **ogni singola chiamata**,
+l'intero stato cuBLASLt — descrittore dell'operazione, tre layout di
+matrice, preferenze, ricerca euristica dell'algoritmo
+(`cublasLtMatmulAlgoGetHeuristic`) e allocazione/deallocazione del
+workspace — nonostante la forma (M,K,N, trasposizioni) sia identica ad
+ogni step per la stragrande maggioranza delle chiamate (proiezioni
+Q/K/V/Out/W1/W2, sempre sulle stesse dimensioni). Sostituito con una
+cache per-device (`GemmPlan`, chiave = tutte e sei le dimensioni grezze
+più i flag di trasposizione, per non confondere le forme usate da
+`matmulBf16Backward` per `dA`/`dB`): la prima chiamata con una
+combinazione di forma crea e salva descrittore/layout/algoritmo/
+workspace (quest'ultimo tramite il pool di memoria del punto 1, non più
+`cudaMalloc` diretto), le successive fanno solo lookup e chiamano
+`cublasLtMatmul`.
+
+Risultato misurato (stesso benchmark a regime, 1000 step,
+`batch_size 8`): **nessun miglioramento misurabile** — 43,84s prima,
+43,88-43,98s dopo (tre run, differenza dentro il rumore di misura).
+L'overhead per-chiamata di cuBLASLt non è quindi il collo di bottiglia
+dominante a questa scala di problema (batch=8, seq=128, dim=512):
+probabilmente il tempo speso nel kernel GEMM stesso, o overhead altrove
+nella pipeline (sincronizzazioni host, un lancio di kernel per
+parametro nell'optimizer), domina abbastanza da nascondere il costo
+host-side rimosso qui. La modifica resta comunque corretta e a costo
+zero (nessuna regressione sui 391 test CUDA né sui 282 test CPU) e
+verrà mantenuta: a batch size più grandi, con più chiamate GEMM per
+step, il beneficio potrebbe diventare misurabile — ma non era, come
+stimato inizialmente, il singolo intervento a più alto impatto.
 `batchedQK`/`batchedMask`/`batchedPV` (punto 2) sono stati rimossi dal
 codice dopo essere stati superati dal nucleo fuso del punto 4, non
 lasciati come codice morto.

@@ -1,7 +1,9 @@
 #include <cuda_bf16.h>
 #include <cublasLt.h>
 
+#include <map>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 
 #include "blackforge/backend/cuda/autodiff.hpp"
@@ -102,6 +104,132 @@ cublasLtHandle_t sharedLtHandle() {
     return h;
 }
 
+// Un "piano" di esecuzione GEMM completamente risolto: descrittore
+// dell'operazione, i tre layout (A/B/C), l'algoritmo scelto
+// dall'euristica cuBLASLt e il workspace device gia' allocato — tutto
+// cio' che serve per lanciare cublasLtMatmul() senza ricalcolare o
+// riallocare nulla.
+struct GemmPlan {
+    cublasLtMatmulDesc_t opDesc = nullptr;
+    cublasLtMatrixLayout_t aLayout = nullptr;
+    cublasLtMatrixLayout_t bLayout = nullptr;
+    cublasLtMatrixLayout_t cLayout = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+    void* workspace = nullptr;
+    std::size_t workspaceBytes = 0;
+};
+
+// Chiave di cache: le SEI dimensioni (cosi' come memorizzate, prima di
+// un'eventuale trasposizione logica) piu' le due direzioni di
+// trasposizione determinano univocamente i tre layout e la scelta
+// dell'algoritmo — non e' sufficiente un sottoinsieme (M,K,N), perche'
+// aRows/bRows/bCols dipendono da COME l'operando e' memorizzato, non
+// solo dalla forma logica del prodotto (vedi matmulBf16Backward: la
+// stessa tripletta (M,K,N) logica puo' corrispondere a operandi
+// memorizzati con dimensioni diverse a seconda di quale side viene
+// trasposto).
+using GemmPlanKey =
+    std::tuple<std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, int, int>;
+
+// Un piano per DEVICE CUDA e per forma: le forme di un training loop
+// (stesso modello, stesso batch_size) si ripetono IDENTICHE ad ogni
+// step, quindi calcolare/allocare tutto questo una sola volta invece di
+// farlo ad ogni singola chiamata a matmulBf16/matmulBf16Backward (fino
+// a ~150 volte per step in un modello con 8 layer attention+feedforward)
+// e' il guadagno principale di questa cache — la ricerca euristica
+// dell'algoritmo (cublasLtMatmulAlgoGetHeuristic) e soprattutto il
+// cudaMalloc/cudaFree diretto del workspace (che PRIMA bypassava
+// interamente il pool di device_pool.hpp) erano il costo dominante per
+// chiamata, misurato essere la causa principale del gap di prestazioni
+// residuo rispetto a un training loop PyTorch equivalente. Mai
+// invalidata/liberata esplicitamente (stessa scelta degli handle
+// cuBLAS/cuBLASLt condivisi): le forme di un modello non cambiano mai
+// dopo la costruzione.
+std::unordered_map<int, std::map<GemmPlanKey, GemmPlan>>& gemmPlanRegistry() {
+    static std::unordered_map<int, std::map<GemmPlanKey, GemmPlan>> registry;
+    return registry;
+}
+
+GemmPlan& getOrCreateGemmPlan(cublasOperation_t transA, cublasOperation_t transB, std::size_t aRows,
+                               std::size_t aCols, std::size_t bRows, std::size_t bCols, std::size_t resultRows,
+                               std::size_t resultCols) {
+    int device = 0;
+    BLACKFORGE_CUDA_CHECK(cudaGetDevice(&device));
+    GemmPlanKey key{aRows, aCols, bRows, bCols, resultRows, resultCols, static_cast<int>(transA),
+                     static_cast<int>(transB)};
+
+    std::map<GemmPlanKey, GemmPlan>& perDevice = gemmPlanRegistry()[device];
+    auto it = perDevice.find(key);
+    if (it != perDevice.end()) {
+        return it->second;
+    }
+
+    cublasLtHandle_t handle = sharedLtHandle();
+    GemmPlan plan;
+
+    BLACKFORGE_CUBLAS_CHECK(cublasLtMatmulDescCreate(&plan.opDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    BLACKFORGE_CUBLAS_CHECK(
+        cublasLtMatmulDescSetAttribute(plan.opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
+    BLACKFORGE_CUBLAS_CHECK(
+        cublasLtMatmulDescSetAttribute(plan.opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
+
+    cublasLtOrder_t rowOrder = CUBLASLT_ORDER_ROW;
+
+    BLACKFORGE_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.aLayout, CUDA_R_16BF, static_cast<std::uint64_t>(aRows),
+                                                        static_cast<std::uint64_t>(aCols),
+                                                        static_cast<std::int64_t>(aCols)));
+    BLACKFORGE_CUBLAS_CHECK(
+        cublasLtMatrixLayoutSetAttribute(plan.aLayout, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder)));
+
+    BLACKFORGE_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.bLayout, CUDA_R_16BF, static_cast<std::uint64_t>(bRows),
+                                                        static_cast<std::uint64_t>(bCols),
+                                                        static_cast<std::int64_t>(bCols)));
+    BLACKFORGE_CUBLAS_CHECK(
+        cublasLtMatrixLayoutSetAttribute(plan.bLayout, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder)));
+
+    BLACKFORGE_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.cLayout, CUDA_R_32F,
+                                                        static_cast<std::uint64_t>(resultRows),
+                                                        static_cast<std::uint64_t>(resultCols),
+                                                        static_cast<std::int64_t>(resultCols)));
+    BLACKFORGE_CUBLAS_CHECK(
+        cublasLtMatrixLayoutSetAttribute(plan.cLayout, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder)));
+
+    cublasLtMatmulPreference_t preference = nullptr;
+    BLACKFORGE_CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
+    std::size_t maxWorkspaceBytes = 4 * 1024 * 1024;
+    BLACKFORGE_CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &maxWorkspaceBytes, sizeof(maxWorkspaceBytes)));
+
+    cublasLtMatmulHeuristicResult_t heuristicResult = {};
+    int returnedResults = 0;
+    cublasStatus_t heurStatus =
+        cublasLtMatmulAlgoGetHeuristic(handle, plan.opDesc, plan.aLayout, plan.bLayout, plan.cLayout, plan.cLayout,
+                                        preference, 1, &heuristicResult, &returnedResults);
+    cublasLtMatmulPreferenceDestroy(preference);  // non serve piu' dopo la ricerca dell'algoritmo
+
+    if (heurStatus != CUBLAS_STATUS_SUCCESS || returnedResults == 0) {
+        cublasLtMatrixLayoutDestroy(plan.aLayout);
+        cublasLtMatrixLayoutDestroy(plan.bLayout);
+        cublasLtMatrixLayoutDestroy(plan.cLayout);
+        cublasLtMatmulDescDestroy(plan.opDesc);
+        throw std::runtime_error("bf16Gemm: nessun algoritmo Tensor Core disponibile per questa forma/architettura");
+    }
+
+    plan.algo = heuristicResult.algo;
+    plan.workspaceBytes = heuristicResult.workspaceSize;
+    if (plan.workspaceBytes > 0) {
+        // Workspace persistente per questa forma (mai liberato
+        // esplicitamente, come il resto del piano): un cudaMalloc unico
+        // invece di uno per chiamata, e passa dal pool di
+        // device_pool.hpp invece di un cudaMalloc/cudaFree diretto come
+        // in precedenza.
+        plan.workspace = devicePoolAcquire(plan.workspaceBytes);
+    }
+
+    auto [insertedIt, inserted] = perDevice.emplace(key, plan);
+    return insertedIt->second;
+}
+
 // Esegue C[resultRows, resultCols] = op(A) @ op(B) in row-major, con A
 // e B gia' in BF16 (Tensor Core) e accumulo/uscita in FP32 (lo schema
 // di "mixed precision" standard: attivazioni/pesi in BF16 per il
@@ -114,86 +242,21 @@ cublasLtHandle_t sharedLtHandle() {
 // cuBLAS classico), cuBLASLt supporta nativamente CUBLASLT_ORDER_ROW,
 // quindi qui non serve scambiare operandi/dimensioni.
 //
-// Crea e distrugge i descrittori (e alloca/libera il workspace) ad
-// ogni chiamata invece di metterli in cache per riusarli su forme
-// ripetute: correttezza-prima-che-prestazioni, come altrove nel
-// progetto — un'ottimizzazione futura, non una scorciatoia rischiosa
-// per la correttezza.
+// Il piano (descrittori, layout, algoritmo, workspace) viene calcolato
+// una sola volta per forma e riusato da ogni chiamata successiva con la
+// stessa forma (vedi getOrCreateGemmPlan/GemmPlan sopra): le forme di
+// un training loop si ripetono identiche ad ogni step.
 void bf16Gemm(cublasOperation_t transA, cublasOperation_t transB, const __nv_bfloat16* a, std::size_t aRows,
               std::size_t aCols, const __nv_bfloat16* b, std::size_t bRows, std::size_t bCols, float* c,
               std::size_t resultRows, std::size_t resultCols) {
     cublasLtHandle_t handle = sharedLtHandle();
-
-    cublasLtMatmulDesc_t opDesc = nullptr;
-    BLACKFORGE_CUBLAS_CHECK(cublasLtMatmulDescCreate(&opDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    BLACKFORGE_CUBLAS_CHECK(
-        cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
-    BLACKFORGE_CUBLAS_CHECK(
-        cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
-
-    cublasLtOrder_t rowOrder = CUBLASLT_ORDER_ROW;
-
-    cublasLtMatrixLayout_t aLayout = nullptr;
-    BLACKFORGE_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&aLayout, CUDA_R_16BF, static_cast<std::uint64_t>(aRows),
-                                                        static_cast<std::uint64_t>(aCols),
-                                                        static_cast<std::int64_t>(aCols)));
-    BLACKFORGE_CUBLAS_CHECK(
-        cublasLtMatrixLayoutSetAttribute(aLayout, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder)));
-
-    cublasLtMatrixLayout_t bLayout = nullptr;
-    BLACKFORGE_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&bLayout, CUDA_R_16BF, static_cast<std::uint64_t>(bRows),
-                                                        static_cast<std::uint64_t>(bCols),
-                                                        static_cast<std::int64_t>(bCols)));
-    BLACKFORGE_CUBLAS_CHECK(
-        cublasLtMatrixLayoutSetAttribute(bLayout, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder)));
-
-    cublasLtMatrixLayout_t cLayout = nullptr;
-    BLACKFORGE_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&cLayout, CUDA_R_32F, static_cast<std::uint64_t>(resultRows),
-                                                        static_cast<std::uint64_t>(resultCols),
-                                                        static_cast<std::int64_t>(resultCols)));
-    BLACKFORGE_CUBLAS_CHECK(
-        cublasLtMatrixLayoutSetAttribute(cLayout, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowOrder, sizeof(rowOrder)));
-
-    cublasLtMatmulPreference_t preference = nullptr;
-    BLACKFORGE_CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
-    std::size_t workspaceBytes = 4 * 1024 * 1024;
-    BLACKFORGE_CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
-        preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceBytes, sizeof(workspaceBytes)));
-
-    cublasLtMatmulHeuristicResult_t heuristicResult = {};
-    int returnedResults = 0;
-    BLACKFORGE_CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(handle, opDesc, aLayout, bLayout, cLayout, cLayout,
-                                                            preference, 1, &heuristicResult, &returnedResults));
-    if (returnedResults == 0) {
-        cublasLtMatmulPreferenceDestroy(preference);
-        cublasLtMatrixLayoutDestroy(aLayout);
-        cublasLtMatrixLayoutDestroy(bLayout);
-        cublasLtMatrixLayoutDestroy(cLayout);
-        cublasLtMatmulDescDestroy(opDesc);
-        throw std::runtime_error("bf16Gemm: nessun algoritmo Tensor Core disponibile per questa forma/architettura");
-    }
-
-    void* workspace = nullptr;
-    if (heuristicResult.workspaceSize > 0) {
-        BLACKFORGE_CUDA_CHECK(cudaMalloc(&workspace, heuristicResult.workspaceSize));
-    }
+    GemmPlan& plan = getOrCreateGemmPlan(transA, transB, aRows, aCols, bRows, bCols, resultRows, resultCols);
 
     float alpha = 1.0F;
     float beta = 0.0F;
-    cublasStatus_t status =
-        cublasLtMatmul(handle, opDesc, &alpha, a, aLayout, b, bLayout, &beta, c, cLayout, c, cLayout,
-                        &heuristicResult.algo, workspace, heuristicResult.workspaceSize, /*stream=*/nullptr);
-
-    if (workspace != nullptr) {
-        cudaFree(workspace);
-    }
-    cublasLtMatmulPreferenceDestroy(preference);
-    cublasLtMatrixLayoutDestroy(aLayout);
-    cublasLtMatrixLayoutDestroy(bLayout);
-    cublasLtMatrixLayoutDestroy(cLayout);
-    cublasLtMatmulDescDestroy(opDesc);
-
-    BLACKFORGE_CUBLAS_CHECK(status);
+    BLACKFORGE_CUBLAS_CHECK(cublasLtMatmul(handle, plan.opDesc, &alpha, a, plan.aLayout, b, plan.bLayout, &beta, c,
+                                            plan.cLayout, c, plan.cLayout, &plan.algo, plan.workspace,
+                                            plan.workspaceBytes, /*stream=*/nullptr));
 }
 
 }  // namespace
