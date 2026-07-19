@@ -887,13 +887,59 @@ parità bit-per-bit tra le due implementazioni conferma che la cache non
 ha introdotto alcuna differenza numerica) e il test di parità
 multi-GPU.
 
-**Conclusione aggiornata**: il gap rispetto a PyTorch è ora **~1,4x più
-lento** (22,3ms/step vs 16,08ms/step), sceso da ~2,5x iniziale
-attraverso sei interventi verificati. I prossimi in coda (cache pesi
-BF16 a livello di Model con invalidazione affidabile dopo
-`optimizer->step()`, proiezione QKV fusa, epilogo bias di cuBLASLt,
-CUDA graph sull'intero step) restano il percorso più diretto verso la
-parità o il sorpasso.
+**Conclusione aggiornata**: il gap rispetto a PyTorch è sceso a **~1,4x
+più lento** (22,3ms/step vs 16,08ms/step) dopo sei interventi
+verificati.
+
+#### Cache dei pesi BF16 a livello di Model: implementata correttamente, misura inconcludente
+
+Settimo intervento: `matmulBf16`/`matmulBf16Backward` riconvertono
+l'operando peso da FP32 a BF16 ad ogni chiamata, anche se un peso
+cambia una sola volta per step. Un primo tentativo ha cachato la
+conversione direttamente dentro `matmulBf16`/`matmulBf16Backward`
+(le funzioni pubbliche) — la suite di test ha **subito** rivelato il
+problema previsto nell'analisi del punto precedente (vedi sopra, "Cache
+pesi BF16 + clone in flatten2D: investigati, non implementati"): 4 test
+falliti, tra cui i gradient check di `selfAttentionBf16Backward`/
+`feedForwardBf16Backward`, che perturbano un peso in-place (stesso
+puntatore, valore diverso) senza sapere nulla di una cache — esattamente
+lo scenario di correttezza silenziosa temuto.
+
+Corretto separando nettamente i due percorsi: `matmulBf16`/
+`matmulBf16Backward`/`linearBf16` restano ESATTAMENTE come prima (mai
+cachati, usati da `blackforge run`/`executor.cu` e da tutti i test).
+Aggiunte varianti nuove e distinte — `matmulBf16CachedWeight`/
+`matmulBf16BackwardCachedWeight`/`linearBf16CachedWeight`
+(`ops_tensorcore.cu`) — usate SOLO dalle funzioni `*ForwardCached`/
+`*BackwardCached` del punto precedente, con una cache per-device
+(`unordered_map<puntatore, {generazione, buffer BF16}>`) invalidata
+tramite un contatore globale (`invalidateBf16WeightCache()`, chiamato
+esplicitamente da `train_runner.cu`/`multi_gpu_train_runner.cu` dopo
+ogni `optimizer->step()` e dopo ogni caricamento di checkpoint — il
+pool di memoria puo' restituire lo stesso puntatore per un buffer
+riallocato, quindi la sola identita' del puntatore non basta come
+chiave di validita'). Con questa separazione, tutti i 391 test CUDA
+tornano verdi.
+
+Misura: qui la sessione ha incontrato un problema di metodo, non di
+codice — il carico GPU esterno (altri processi desktop, confermato con
+`nvidia-smi`: 45% di utilizzo e attività GPU non nulla a
+`blackforge.exe` fermo) è cambiato a metà delle misure, rendendo il
+confronto rumoroso: sei run consecutive dello stesso identico
+eseguibile (task 48) hanno dato tra 25,1s e 32,0s (una singola
+metrica, non affidabile a questa scala di rumore, per rilevare un
+effetto atteso del ~4-5%). Un esperimento precedente e indipendente in
+questa stessa sessione — la cache "mai invalidata" usata per stimare il
+tetto massimo di guadagno prima di implementare questa versione
+corretta — aveva misurato **~4-5%** in un ambiente più tranquillo.
+Modifica mantenuta: corretta (391 test CUDA verdi, incluso il gradient
+checking BF16 che aveva inizialmente scoperto il problema), a costo
+zero quando il chiamante rispetta il contratto di invalidazione (solo
+`cuda::Model`, gia' verificato), con un guadagno atteso positivo ma non
+confermato con certezza in questa sessione per via del rumore di
+misura — stessa scelta gia' fatta per la cache dei piani cuBLASLt
+(mantenuta nonostante lo 0% misurato, perche' corretta e potenzialmente
+utile a scala diversa).
 
 ## Training (pretraining, fine-tuning, LoRA, forecasting)
 

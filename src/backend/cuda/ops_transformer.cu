@@ -71,6 +71,23 @@ DeviceTensor projectionLinear(const DeviceTensor& input, const DeviceTensor& wei
     return useBf16 ? linearBf16(input, weight, bias) : linear(input, weight, bias);
 }
 
+// Come projectionMatmul(), ma usa matmulBf16CachedWeight() al posto di
+// matmulBf16() quando useBf16 e' attivo: solo per le varianti
+// *ForwardCached, il cui contratto di invalidazione e' gestito
+// interamente da cuda::Model (vedi il commento su matmulBf16CachedWeight
+// in ops.hpp).
+DeviceTensor projectionMatmulCached(const DeviceTensor& a, const DeviceTensor& b, bool useBf16) {
+    return useBf16 ? matmulBf16CachedWeight(a, b) : matmul(a, b);
+}
+
+// Come projectionLinear(), ma usa linearBf16CachedWeight() al posto di
+// linearBf16() quando useBf16 e' attivo — stessa relazione di
+// projectionMatmulCached() rispetto a projectionMatmul().
+DeviceTensor projectionLinearCached(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias,
+                                     bool useBf16) {
+    return useBf16 ? linearBf16CachedWeight(input, weight, bias) : linear(input, weight, bias);
+}
+
 DeviceTensor feedForwardImpl(const DeviceTensor& input, const DeviceTensor& w1, const DeviceTensor& b1,
                               const DeviceTensor& w2, const DeviceTensor& b2, bool useBf16) {
     DeviceTensor normed = rmsnorm(input);
@@ -174,9 +191,9 @@ DeviceTensor feedForwardForwardCachedImpl(const DeviceTensor& input, const Devic
                                            const DeviceTensor& w2, const DeviceTensor& b2, bool useBf16,
                                            FeedForwardCache& cache) {
     cache.normed = rmsnorm(input);
-    cache.preActivation = projectionLinear(cache.normed, w1, b1, useBf16);
+    cache.preActivation = projectionLinearCached(cache.normed, w1, b1, useBf16);
     cache.hidden = silu(cache.preActivation);
-    DeviceTensor out = projectionLinear(cache.hidden, w2, b2, useBf16);
+    DeviceTensor out = projectionLinearCached(cache.hidden, w2, b2, useBf16);
     return add(input, out);
 }
 
@@ -203,9 +220,9 @@ DeviceTensor selfAttentionForwardCachedImpl(const DeviceTensor& input, const Dev
     // qui invece serve solo la forma appiattita, riusata per
     // riferimento costante da tutte e tre le proiezioni).
     cache.normedFlat = rmsnorm(input).reshaped({batch * seq, dim});
-    cache.q = projectionMatmul(cache.normedFlat, wq, useBf16).reshaped({batch, seq, dim});
-    cache.k = projectionMatmul(cache.normedFlat, wk, useBf16).reshaped({batch, seq, dim});
-    cache.v = projectionMatmul(cache.normedFlat, wv, useBf16).reshaped({batch, seq, dim});
+    cache.q = projectionMatmulCached(cache.normedFlat, wq, useBf16).reshaped({batch, seq, dim});
+    cache.k = projectionMatmulCached(cache.normedFlat, wk, useBf16).reshaped({batch, seq, dim});
+    cache.v = projectionMatmulCached(cache.normedFlat, wv, useBf16).reshaped({batch, seq, dim});
 
     FusedAttentionForwardResult attn = fusedAttentionForward(cache.q, cache.k, cache.v, numHeads, scaleFactor,
                                                                /*oldLen=*/0);
@@ -216,8 +233,9 @@ DeviceTensor selfAttentionForwardCachedImpl(const DeviceTensor& input, const Dev
     // cache.attnOutput deve restare valido (rango 3) per il backward:
     // un clone qui, a differenza di selfAttentionImpl che puo' consumare
     // 'attn.output' direttamente dato che non lo riusa dopo.
-    DeviceTensor projected = projectionMatmul(cache.attnOutput.clone().reshaped({batch * seq, dim}), wout, useBf16)
-                                  .reshaped({batch, seq, dim});
+    DeviceTensor projected =
+        projectionMatmulCached(cache.attnOutput.clone().reshaped({batch * seq, dim}), wout, useBf16)
+            .reshaped({batch, seq, dim});
     return add(input, projected);
 }
 

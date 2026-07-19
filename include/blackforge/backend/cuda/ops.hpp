@@ -36,6 +36,33 @@ DeviceTensor matmulTransposeB(const DeviceTensor& a, const DeviceTensor& b);
 // modulo): la conversione a BF16 e' un dettaglio interno.
 DeviceTensor matmulBf16(const DeviceTensor& a, const DeviceTensor& b);
 
+// Come matmulBf16(), ma la conversione BF16 dell'operando 'b' (il peso)
+// viene CACHATA per puntatore invece di essere ricalcolata ad ogni
+// chiamata — 'a' (l'attivazione, che cambia davvero ad ogni chiamata)
+// non e' mai cachata. PRECONDIZIONE, responsabilita' del chiamante:
+// serve chiamare invalidateBf16WeightCache() ogni volta che i VALORI di
+// un peso passato qui possono essere cambiati (dopo optimizer->step(),
+// dopo il caricamento di un checkpoint) — altrimenti si rischia di usare
+// silenziosamente pesi non aggiornati. Per questo NON e' una sostituzione
+// generale di matmulBf16(): e' pensata solo per l'uso interno di
+// cuda::Model durante l'addestramento (vedi selfAttentionForwardCached/
+// feedForwardForwardCached sotto, che la usano tramite un helper interno
+// non esposto), dove il chiamante (train_runner.cu/
+// multi_gpu_train_runner.cu) gia' invalida esplicitamente dopo ogni
+// optimizer->step()/caricamento di checkpoint. Il resto del codice (test
+// di gradient checking, blackforge run/executor.cu, ecc.) deve continuare
+// a usare matmulBf16() semplice, che non ha questa precondizione.
+DeviceTensor matmulBf16CachedWeight(const DeviceTensor& a, const DeviceTensor& b);
+
+// Invalida la cache dei pesi convertiti in BF16 usata da
+// matmulBf16CachedWeight()/matmulBf16BackwardCachedWeight() (vedi
+// ops_tensorcore.cu, e il commento sopra su matmulBf16CachedWeight per
+// il contratto completo). Il pool di memoria puo' restituire lo STESSO
+// puntatore per un buffer riallocato (vedi device_pool.hpp): la sola
+// identita' del puntatore non basta come chiave di validita', serve
+// questo segnale esplicito.
+void invalidateBf16WeightCache();
+
 DeviceTensor silu(const DeviceTensor& input);
 DeviceTensor relu(const DeviceTensor& input);
 DeviceTensor gelu(const DeviceTensor& input);
@@ -207,5 +234,10 @@ DeviceTensor linear(const DeviceTensor& input, const DeviceTensor& weight, const
 // a rango >= 2, stesso bias in float32 pieno (solo il prodotto matriciale
 // passa per il Tensor Core, non l'addizione del bias).
 DeviceTensor linearBf16(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias);
+
+// Come linearBf16(), ma usa matmulBf16CachedWeight() al posto di
+// matmulBf16(): stessa precondizione/contratto di matmulBf16CachedWeight()
+// sopra, pensata solo per l'uso interno di feedForwardForwardCached().
+DeviceTensor linearBf16CachedWeight(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias);
 
 }  // namespace blackforge::backend::cuda

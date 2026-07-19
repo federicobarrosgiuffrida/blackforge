@@ -151,9 +151,15 @@ TrainRunResult runMultiGpuTraining(const ast::Program& program, const ir::Module
             loadCheckpoint(models[i], fromCheckpointPath);
         }
     }
-    if (!fromCheckpointPath.empty() && progressOutput != nullptr) {
-        *progressOutput << "Pesi caricati da '" << fromCheckpointPath << "' su " << numDevices
-                         << " GPU (fine-tuning)\n";
+    if (!fromCheckpointPath.empty()) {
+        // Vedi il commento su invalidateBf16WeightCache() in ops.hpp: il
+        // pool di memoria puo' restituire lo stesso puntatore per un
+        // buffer riallocato con valori diversi.
+        invalidateBf16WeightCache();
+        if (progressOutput != nullptr) {
+            *progressOutput << "Pesi caricati da '" << fromCheckpointPath << "' su " << numDevices
+                             << " GPU (fine-tuning)\n";
+        }
     }
 
     // Vedi il commento equivalente in train_runner.cu: le varianti
@@ -300,7 +306,9 @@ TrainRunResult runMultiGpuTraining(const ast::Program& program, const ir::Module
                 setActiveDevice(deviceIndices[i]);
                 optimizers[i]->step(models[i].parameters());
             }
-
+            // I pesi di ogni replica sono appena cambiati: vedi il
+            // commento su invalidateBf16WeightCache() in ops.hpp.
+            invalidateBf16WeightCache();
         }
 
         // Somma delle loss accumulate su ogni GPU: una cudaMemcpy per

@@ -86,6 +86,50 @@ DeviceBf16Buffer toBf16(const DeviceTensor& t) {
     return buffer;
 }
 
+// Cache dei pesi convertiti in BF16, per device (stessa esigenza di
+// gemmPlanRegistry() sotto: repliche multi-GPU hanno buffer di pesi
+// indipendenti, un puntatore da solo non e' univoco tra device diversi).
+// Chiave: il puntatore device del peso FP32; valore: la generazione in
+// cui e' stata calcolata la conversione, piu' il buffer BF16 stesso. Un
+// hit e' valido solo se la generazione salvata coincide con quella
+// corrente (vedi invalidateBf16WeightCache() sotto) — necessario perche'
+// il pool di memoria (device_pool.hpp) puo' restituire lo stesso
+// puntatore per un buffer riallocato con valori diversi.
+struct CachedBf16Weight {
+    std::size_t generation;
+    DeviceBf16Buffer buffer;
+};
+
+std::size_t& bf16WeightGeneration() {
+    static std::size_t generation = 0;
+    return generation;
+}
+
+std::unordered_map<int, std::unordered_map<const float*, CachedBf16Weight>>& bf16WeightCacheRegistry() {
+    static std::unordered_map<int, std::unordered_map<const float*, CachedBf16Weight>> registry;
+    return registry;
+}
+
+// Come toBf16(), ma pensata SOLO per l'operando "peso" di matmulBf16()/
+// matmulBf16Backward() (mai per l'attivazione, che cambia davvero ad
+// ogni chiamata): riusa la conversione BF16 dell'ultima chiamata con lo
+// stesso puntatore, se calcolata nella generazione corrente.
+const DeviceBf16Buffer& toBf16Weight(const DeviceTensor& t) {
+    int device = 0;
+    BLACKFORGE_CUDA_CHECK(cudaGetDevice(&device));
+    std::unordered_map<const float*, CachedBf16Weight>& perDevice = bf16WeightCacheRegistry()[device];
+    std::size_t currentGeneration = bf16WeightGeneration();
+
+    auto it = perDevice.find(t.data());
+    if (it != perDevice.end() && it->second.generation == currentGeneration) {
+        return it->second.buffer;
+    }
+
+    CachedBf16Weight entry{currentGeneration, toBf16(t)};
+    auto [insertedIt, inserted] = perDevice.insert_or_assign(t.data(), std::move(entry));
+    return insertedIt->second.buffer;
+}
+
 // Un handle cuBLASLt per DISPOSITIVO CUDA, stessa scelta e stesso
 // motivo di sharedHandle() in ops_gemm.cu per il cuBLAS classico
 // (essenziale per il training multi-GPU: un handle creato mentre e'
@@ -282,6 +326,27 @@ DeviceTensor matmulBf16(const DeviceTensor& a, const DeviceTensor& b) {
     return result;
 }
 
+DeviceTensor matmulBf16CachedWeight(const DeviceTensor& a, const DeviceTensor& b) {
+    if (a.rank() != 2 || b.rank() != 2 || a.dim(1) != b.dim(0)) {
+        throw std::invalid_argument("matmulBf16CachedWeight: forme incompatibili sul device");
+    }
+    std::size_t m = a.dim(0);
+    std::size_t k = a.dim(1);
+    std::size_t n = b.dim(1);
+
+    DeviceBf16Buffer aBf16 = toBf16(a);
+    const DeviceBf16Buffer& bBf16 = toBf16Weight(b);
+    DeviceTensor result({m, n});
+
+    if (m > 0 && k > 0 && n > 0) {
+        bf16Gemm(CUBLAS_OP_N, CUBLAS_OP_N, aBf16.data(), m, k, bBf16.data(), k, n, result.data(), m, n);
+    } else {
+        BLACKFORGE_CUDA_CHECK(cudaMemset(result.data(), 0, result.elementCount() * sizeof(float)));
+    }
+
+    return result;
+}
+
 DeviceTensor linearBf16(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias) {
     if (input.rank() == 2) {
         return addBias(matmulBf16(input, weight), bias);
@@ -293,6 +358,28 @@ DeviceTensor linearBf16(const DeviceTensor& input, const DeviceTensor& weight, c
     std::size_t inFeatures = input.shape().back();
     std::size_t rows = input.elementCount() / inFeatures;
     DeviceTensor flatOutput = addBias(matmulBf16(input.clone().reshaped({rows, inFeatures}), weight), bias);
+
+    std::vector<std::size_t> outputShape = input.shape();
+    outputShape.back() = weight.dim(1);
+    return std::move(flatOutput).reshaped(std::move(outputShape));
+}
+
+// Come linearBf16(), ma usa matmulBf16CachedWeight() al posto di
+// matmulBf16(): stessa precondizione/contratto di matmulBf16CachedWeight()
+// (vedi ops.hpp), pensata solo per l'uso interno di
+// feedForwardForwardCached().
+DeviceTensor linearBf16CachedWeight(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias) {
+    if (input.rank() == 2) {
+        return addBias(matmulBf16CachedWeight(input, weight), bias);
+    }
+    if (input.rank() < 2) {
+        throw std::invalid_argument("linearBf16CachedWeight: richiede un tensore a rango >= 2 sul device");
+    }
+
+    std::size_t inFeatures = input.shape().back();
+    std::size_t rows = input.elementCount() / inFeatures;
+    DeviceTensor flatOutput =
+        addBias(matmulBf16CachedWeight(input.clone().reshaped({rows, inFeatures}), weight), bias);
 
     std::vector<std::size_t> outputShape = input.shape();
     outputShape.back() = weight.dim(1);
@@ -329,5 +416,35 @@ MatmulGrad matmulBf16Backward(const DeviceTensor& a, const DeviceTensor& b, cons
 
     return MatmulGrad{std::move(dA), std::move(dB)};
 }
+
+MatmulGrad matmulBf16BackwardCachedWeight(const DeviceTensor& a, const DeviceTensor& b,
+                                           const DeviceTensor& gradOutput) {
+    if (a.rank() != 2 || b.rank() != 2 || gradOutput.rank() != 2 || a.dim(1) != b.dim(0) ||
+        gradOutput.dim(0) != a.dim(0) || gradOutput.dim(1) != b.dim(1)) {
+        throw std::invalid_argument("matmulBf16BackwardCachedWeight: forme incompatibili sul device");
+    }
+    std::size_t m = a.dim(0);
+    std::size_t k = a.dim(1);
+    std::size_t n = b.dim(1);
+
+    DeviceBf16Buffer aBf16 = toBf16(a);
+    const DeviceBf16Buffer& bBf16 = toBf16Weight(b);
+    DeviceBf16Buffer gradBf16 = toBf16(gradOutput);
+
+    DeviceTensor dA({m, k});
+    DeviceTensor dB({k, n});
+
+    if (m > 0 && k > 0 && n > 0) {
+        bf16Gemm(CUBLAS_OP_N, CUBLAS_OP_T, gradBf16.data(), m, n, bBf16.data(), k, n, dA.data(), m, k);
+        bf16Gemm(CUBLAS_OP_T, CUBLAS_OP_N, aBf16.data(), m, k, gradBf16.data(), m, n, dB.data(), k, n);
+    } else {
+        BLACKFORGE_CUDA_CHECK(cudaMemset(dA.data(), 0, dA.elementCount() * sizeof(float)));
+        BLACKFORGE_CUDA_CHECK(cudaMemset(dB.data(), 0, dB.elementCount() * sizeof(float)));
+    }
+
+    return MatmulGrad{std::move(dA), std::move(dB)};
+}
+
+void invalidateBf16WeightCache() { ++bf16WeightGeneration(); }
 
 }  // namespace blackforge::backend::cuda

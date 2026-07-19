@@ -28,6 +28,14 @@ MatmulGrad matmulBackward(const DeviceTensor& a, const DeviceTensor& b, const De
 // float32 — coerente con l'uso di matmulBf16 nel forward corrispondente.
 MatmulGrad matmulBf16Backward(const DeviceTensor& a, const DeviceTensor& b, const DeviceTensor& gradOutput);
 
+// Come matmulBf16Backward(), ma usa matmulBf16CachedWeight() al posto
+// di matmulBf16 per il peso 'b' — stessa precondizione/contratto di
+// matmulBf16CachedWeight() (vedi ops.hpp): pensata solo per l'uso
+// interno di selfAttentionBackwardCached()/feedForwardBackwardCached(),
+// non per uso generico.
+MatmulGrad matmulBf16BackwardCachedWeight(const DeviceTensor& a, const DeviceTensor& b,
+                                           const DeviceTensor& gradOutput);
+
 struct MatmulTransposeBGrad {
     DeviceTensor dA;
     DeviceTensor dB;

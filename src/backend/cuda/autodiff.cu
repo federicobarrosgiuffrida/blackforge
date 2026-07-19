@@ -544,6 +544,15 @@ MatmulGrad projectionMatmulBackward(const DeviceTensor& a, const DeviceTensor& b
     return useBf16 ? matmulBf16Backward(a, b, gradOutput) : matmulBackward(a, b, gradOutput);
 }
 
+// Come projectionMatmulBackward(), ma usa matmulBf16BackwardCachedWeight()
+// al posto di matmulBf16Backward(): solo per le varianti *BackwardCached,
+// il cui contratto di invalidazione e' gestito interamente da
+// cuda::Model (vedi il commento su matmulBf16CachedWeight in ops.hpp).
+MatmulGrad projectionMatmulBackwardCached(const DeviceTensor& a, const DeviceTensor& b,
+                                           const DeviceTensor& gradOutput, bool useBf16) {
+    return useBf16 ? matmulBf16BackwardCachedWeight(a, b, gradOutput) : matmulBackward(a, b, gradOutput);
+}
+
 DeviceTensor projectionLinear(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias,
                                bool useBf16) {
     return useBf16 ? linearBf16(input, weight, bias) : linear(input, weight, bias);
@@ -652,13 +661,15 @@ FeedForwardGrad feedForwardBackwardCachedImpl(const DeviceTensor& input, const D
     (void)b2;
 
     AddBiasGrad addGrad2 = addBiasBackward(gradOutput);
-    MatmulGrad matGrad2 = projectionMatmulBackward(flatten2D(cache.hidden), w2, flatten2D(addGrad2.dInput), useBf16);
+    MatmulGrad matGrad2 =
+        projectionMatmulBackwardCached(flatten2D(cache.hidden), w2, flatten2D(addGrad2.dInput), useBf16);
     DeviceTensor dHidden = std::move(matGrad2.dA).reshaped(cache.hidden.shape());
 
     DeviceTensor dPreActivation = siluBackward(cache.preActivation, dHidden);
 
     AddBiasGrad addGrad1 = addBiasBackward(dPreActivation);
-    MatmulGrad matGrad1 = projectionMatmulBackward(flatten2D(cache.normed), w1, flatten2D(addGrad1.dInput), useBf16);
+    MatmulGrad matGrad1 =
+        projectionMatmulBackwardCached(flatten2D(cache.normed), w1, flatten2D(addGrad1.dInput), useBf16);
     DeviceTensor dNormed = std::move(matGrad1.dA).reshaped(cache.normed.shape());
 
     DeviceTensor dInputFromBranch = rmsnormBackward(input, dNormed);
@@ -684,7 +695,8 @@ SelfAttentionGrad selfAttentionBackwardCachedImpl(const DeviceTensor& input, con
     float scaleFactor = 1.0F / std::sqrt(static_cast<float>(headDim));
 
     // --- backward attraverso la proiezione Wout ---
-    MatmulGrad woutGrad = projectionMatmulBackward(flatten2D(cache.attnOutput), wout, flatten2D(gradOutput), useBf16);
+    MatmulGrad woutGrad =
+        projectionMatmulBackwardCached(flatten2D(cache.attnOutput), wout, flatten2D(gradOutput), useBf16);
     DeviceTensor dOutput = std::move(woutGrad.dA).reshaped({batch, seq, dim});
 
     // --- backward attraverso il nucleo fuso dell'attention: q/k/v e le
@@ -700,9 +712,9 @@ SelfAttentionGrad selfAttentionBackwardCachedImpl(const DeviceTensor& input, con
 
     // --- backward attraverso le proiezioni Q/K/V: normedFlat viene
     // dalla cache. ---
-    MatmulGrad qBackward = projectionMatmulBackward(cache.normedFlat, wq, flatten2D(dQ), useBf16);
-    MatmulGrad kBackward = projectionMatmulBackward(cache.normedFlat, wk, flatten2D(dK), useBf16);
-    MatmulGrad vBackward = projectionMatmulBackward(cache.normedFlat, wv, flatten2D(dV), useBf16);
+    MatmulGrad qBackward = projectionMatmulBackwardCached(cache.normedFlat, wq, flatten2D(dQ), useBf16);
+    MatmulGrad kBackward = projectionMatmulBackwardCached(cache.normedFlat, wk, flatten2D(dK), useBf16);
+    MatmulGrad vBackward = projectionMatmulBackwardCached(cache.normedFlat, wv, flatten2D(dV), useBf16);
 
     DeviceTensor dNormedFlat = add(add(qBackward.dA, kBackward.dA), vBackward.dA);
     DeviceTensor dNormed = std::move(dNormedFlat).reshaped({batch, seq, dim});
