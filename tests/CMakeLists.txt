@@ -33,6 +33,8 @@ set(
     backend/cpu/benchmark_tests.cpp
     backend/cpu/quantize_tests.cpp
     data/dataset_tests.cpp
+    tokenizer/tokenizer_tests.cpp
+    tokenizer/dataset_prep_tests.cpp
 )
 
 if(BLACKFORGE_ENABLE_CUDA)

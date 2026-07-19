@@ -532,15 +532,73 @@ finite centrali).
 (`blackforge::data`, magic `BFDATA1`, non compatibile con formati
 esterni come safetensors/numpy): numero di esempi, forma di un singolo
 esempio di input e di labels, poi tutti gli input concatenati seguiti
-da tutti i target concatenati, come float32. Non esiste ancora uno
-strumento BlackForge per generare questo file da sorgenti reali (CSV,
-immagini, ...): va scritto con `blackforge::data::saveDataset()` da
-codice C++ (vedi `examples/tiny_regression.bf` e il dataset che lo
-accompagna per un esempio minimo completo).
+da tutti i target concatenati, come float32. Per dataset generici (CSV,
+immagini, ...) va ancora scritto con `blackforge::data::saveDataset()`
+da codice C++ (vedi `examples/tiny_regression.bf` e il dataset che lo
+accompagna per un esempio minimo completo); per un **corpus di testo**,
+`blackforge dataset-build` genera questo file automaticamente a partire
+da un tokenizer addestrato (vedi la sezione "Tokenizer" più sotto).
 
 Nota sui letterali stringa: come in C/C++/Python, `\` in una stringa
 BlackForge introduce un escape. Un percorso Windows con backslash va
 scritto con `/` (es. `"C:/dati/train.bfdata"`) o con `\\` raddoppiati.
+
+### Tokenizer (`blackforge tokenizer-train`, `blackforge dataset-build`)
+
+`blackforge::tokenizer` implementa un tokenizer **BPE byte-level**
+(Byte Pair Encoding, Sennrich et al. 2016), nello stile di GPT-2: il
+vocabolario di base sono i 256 valori di byte possibili — quindi
+qualunque testo UTF-8 (o dato binario arbitrario) è rappresentabile
+senza bisogno di un token `<unk>` — esteso con token appresi fondendo
+iterativamente le coppie adiacenti più frequenti in un corpus di
+training. Tre id di token speciali (`pad`=256, `bos`=257, `eos`=258)
+sono riservati subito dopo i 256 byte base, con id fissi indipendenti
+dalla dimensione del vocabolario allenato; i merge appresi partono
+sempre da id 259 in su.
+
+```bash
+# Addestra un tokenizer BPE su un corpus di testo, vocabolario di 4096 token
+blackforge tokenizer-train corpus.txt --vocab-size 4096 --output tok.bftok
+
+# Ispeziona la tokenizzazione di un file (stampa gli id prodotti)
+blackforge tokenizer-encode tok.bftok testo.txt
+
+# Tokenizza il corpus e costruisce un dataset .bfdata pronto per
+# 'blackforge train': finestre non sovrapposte di 'seq-len' token,
+# target one-hot shift-by-one (next-token-prediction causale) — la
+# stessa forma [seqLen, vocabSize] attesa da 'loss cross_entropy'
+blackforge dataset-build corpus.txt tok.bftok --seq-len 128 --output corpus.bfdata
+```
+
+Il file `.bftok` (`blackforge::tokenizer::saveTokenizer`/`loadTokenizer`,
+magic `BFTOKN1`, formato proprietario non compatibile con
+tiktoken/sentencepiece/HuggingFace tokenizers) salva solo la lista dei
+merge appresi, nell'ordine di apprendimento: l'intero stato del
+tokenizer (vocabolario, priorità di fusione) è interamente
+ricostruibile da quella lista.
+
+Limitazioni esplicite dell'implementazione attuale:
+
+- **Pre-tokenizzazione semplificata**: il corpus viene diviso in chunk
+  su run di byte "parola" (lettere ASCII/cifre/byte >= 0x80, così le
+  sequenze UTF-8 multi-byte restano raggruppate) e run di spazi
+  (attaccati come prefisso alla parola successiva, convenzione stile
+  GPT-2); niente regex Unicode-aware sofisticata come le implementazioni
+  di riferimento — sufficiente per un round-trip `encode`/`decode`
+  sempre esatto (proprietà verificata nei test), non ottimale per la
+  qualità linguistica dei confini tra token.
+- **Training O(numMerge × numChunkUnici)** per iterazione, non la
+  struttura a coda di priorità + lista concatenata delle implementazioni
+  ottimizzate per corpora da gigabyte: correttezza prima delle
+  prestazioni, adeguata alla scala di corpora che questo linguaggio può
+  oggi caricare in memoria (vedi sopra: `dataset-build`, come
+  `data::Dataset` in generale, costruisce l'intero dataset in RAM prima
+  di scriverlo su disco).
+- `dataset-build` produce sempre target **one-hot densi** `[seqLen,
+  vocabSize]` (coerenti con `loss cross_entropy`): per vocabolari molto
+  grandi (decine di migliaia di token) questo è memoria sprecata
+  rispetto a un target sparso (un solo intero per posizione); non
+  ancora ottimizzato.
 
 ### Cosa fa `blackforge train`
 
@@ -725,14 +783,17 @@ train {
 ## CLI: comandi completi
 
 ```
-blackforge check <file>      Analizza (lessico, sintassi, semantica); --verbose, --print-ast, --print-ir
-blackforge build <file>      Compila e costruisce ogni modello (alloca i parametri) senza eseguirlo
-blackforge run <file>        Esegue il primo modello; --batch N, --device cpu|cuda|cuda:N
-blackforge train <file>      Addestra (CPU o CUDA); --device, --from-checkpoint/--save-checkpoint (solo CPU)
-blackforge forecast <file>   Rollout autoregressivo (CPU); --from-checkpoint (obbligatorio), --batch N
-blackforge benchmark <file>  Tempo/throughput/memoria; --device, --batch, --warmup, --iterations
-blackforge inspect <file>    Riepilogo: input, pipeline, numero di parametri per ogni modello
-blackforge devices           Elenca i dispositivi disponibili (CPU e GPU CUDA rilevate)
+blackforge check <file>       Analizza (lessico, sintassi, semantica); --verbose, --print-ast, --print-ir
+blackforge build <file>       Compila e costruisce ogni modello (alloca i parametri) senza eseguirlo
+blackforge run <file>         Esegue il primo modello; --batch N, --device cpu|cuda|cuda:N
+blackforge train <file>       Addestra (CPU o CUDA); --device, --from-checkpoint/--save-checkpoint (entrambi i device)
+blackforge forecast <file>    Rollout autoregressivo (CPU); --from-checkpoint (obbligatorio), --batch N
+blackforge benchmark <file>   Tempo/throughput/memoria; --device, --batch, --warmup, --iterations
+blackforge inspect <file>     Riepilogo: input, pipeline, numero di parametri per ogni modello
+blackforge devices            Elenca i dispositivi disponibili (CPU e GPU CUDA rilevate)
+blackforge tokenizer-train <corpus.txt>            Addestra un tokenizer BPE; --vocab-size, --output
+blackforge tokenizer-encode <tok.bftok> <testo.txt> Codifica un file di testo, stampa gli id
+blackforge dataset-build <corpus.txt> <tok.bftok>  Costruisce un dataset .bfdata da un corpus; --seq-len, --output
 ```
 
 Tutti i comandi restituiscono un codice di uscita coerente: `0` se

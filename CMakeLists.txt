@@ -129,6 +129,8 @@ set(
     src/backend/cpu/benchmark.cpp
     src/backend/cpu/quantize.cpp
     src/data/dataset.cpp
+    src/tokenizer/tokenizer.cpp
+    src/tokenizer/dataset_prep.cpp
 )
 
 if(BLACKFORGE_ENABLE_CUDA)

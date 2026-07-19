@@ -25,6 +25,8 @@
 #include "blackforge/runtime/tensor.hpp"
 #include "blackforge/sema/dtype.hpp"
 #include "blackforge/sema/semantic_analyzer.hpp"
+#include "blackforge/tokenizer/dataset_prep.hpp"
+#include "blackforge/tokenizer/tokenizer.hpp"
 
 #if BLACKFORGE_HAS_CUDA
 #include "blackforge/backend/cuda/checkpoint.hpp"
@@ -47,6 +49,12 @@ void printUsage() {
               << "  benchmark <file>   Misura tempo/throughput/memoria del primo modello del file\n"
               << "  inspect <file>     Mostra un riepilogo dei modelli (input, pipeline, numero di parametri)\n"
               << "  devices            Elenca i dispositivi di calcolo disponibili (CPU e GPU CUDA)\n"
+              << "  tokenizer-train <corpus.txt>   Addestra un tokenizer BPE byte-level sul corpus dato\n"
+              << "                                  (richiede --vocab-size e --output)\n"
+              << "  tokenizer-encode <tok.bftok> <testo.txt>   Codifica un file di testo, stampa gli id di token\n"
+              << "  dataset-build <corpus.txt> <tok.bftok>   Tokenizza un corpus e costruisce un dataset .bfdata\n"
+              << "                                  per l'addestramento di un modello linguistico (richiede\n"
+              << "                                  --seq-len e --output)\n"
               << "  --help, -h         Mostra questo messaggio\n"
               << "  --version, -v      Mostra la versione del compilatore\n\n"
               << "Opzioni:\n"
@@ -56,13 +64,17 @@ void printUsage() {
               << "  --batch N          Dimensione di batch usata per risolvere le dimensioni simboliche "
                  "dell'input (default 1)\n"
               << "  --device cpu|cuda|cuda:N  Dispositivo su cui eseguire ('run'/'train'/'benchmark', default "
-                 "cpu). Su 'train', il backend CUDA supporta solo loss 'mse' e nessun 'lora' per ora (errore "
-                 "esplicito se richiesti); checkpoint supportati su entrambi i device, stesso formato\n"
+                 "cpu). Su 'train', il backend CUDA supporta 'loss mse' e 'cross_entropy' ma non ancora 'lora' "
+                 "(errore esplicito se richiesto); checkpoint supportati su entrambi i device, stesso formato\n"
               << "  --from-checkpoint <file>  Pesi da caricare: esecuzione con pesi allenati per 'run', "
                  "fine-tuning/LoRA per 'train' (LoRA solo CPU), obbligatorio per 'forecast' (solo CPU)\n"
               << "  --save-checkpoint <file>  Dove salvare i pesi al termine dell'addestramento (solo 'train')\n"
               << "  --warmup N         Iterazioni di riscaldamento scartate (solo 'benchmark', default 5)\n"
-              << "  --iterations N     Iterazioni misurate (solo 'benchmark', default 20)\n";
+              << "  --iterations N     Iterazioni misurate (solo 'benchmark', default 20)\n"
+              << "  --vocab-size N     Dimensione del vocabolario da apprendere (solo 'tokenizer-train'; deve "
+                 "superare " << blackforge::tokenizer::Tokenizer::kFirstMergeId << ")\n"
+              << "  --seq-len N        Lunghezza di sequenza di ogni esempio (solo 'dataset-build')\n"
+              << "  --output <file>    Percorso di output (solo 'tokenizer-train'/'dataset-build')\n";
 }
 
 void printDevices() {
@@ -385,6 +397,97 @@ int runForecast(const std::string& path, const std::string& fromCheckpoint, std:
     return 0;
 }
 
+int runTokenizerTrain(const std::string& corpusPath, std::size_t vocabSize, const std::string& outputPath) {
+    std::string corpus;
+    if (!readFile(corpusPath, corpus)) {
+        std::cerr << "errore: impossibile leggere il corpus '" << corpusPath << "'\n";
+        return 2;
+    }
+    if (vocabSize == 0) {
+        std::cerr << "errore: '--vocab-size' richiede un intero positivo (deve superare "
+                   << blackforge::tokenizer::Tokenizer::kFirstMergeId << ", i token base + speciali)\n";
+        return 2;
+    }
+    if (outputPath.empty()) {
+        std::cerr << "errore: comando 'tokenizer-train' richiede '--output <file.bftok>'\n";
+        return 2;
+    }
+
+    try {
+        blackforge::tokenizer::Tokenizer tok;
+        tok.train(corpus, vocabSize);
+        blackforge::tokenizer::saveTokenizer(tok, outputPath);
+        std::cout << "Tokenizer addestrato: " << tok.vocabSize() << " token totali (" << tok.merges().size()
+                   << " merge appresi da un corpus di " << corpus.size() << " byte)\n";
+        std::cout << "Salvato in '" << outputPath << "'\n";
+    } catch (const std::exception& e) {
+        std::cerr << "errore di training del tokenizer: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
+int runTokenizerEncode(const std::string& tokenizerPath, const std::string& textPath) {
+    std::string text;
+    if (!readFile(textPath, text)) {
+        std::cerr << "errore: impossibile leggere il file di testo '" << textPath << "'\n";
+        return 2;
+    }
+
+    try {
+        blackforge::tokenizer::Tokenizer tok = blackforge::tokenizer::loadTokenizer(tokenizerPath);
+        std::vector<std::uint32_t> ids = tok.encode(text);
+
+        std::cout << ids.size() << " token (da " << text.size() << " byte, vocabolario " << tok.vocabSize()
+                   << "):\n";
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            std::cout << ids[i] << (i + 1 < ids.size() ? " " : "\n");
+        }
+
+        std::string roundTrip = tok.decode(ids);
+        if (roundTrip != text) {
+            std::cerr << "attenzione: decode(encode(testo)) non coincide con il testo originale (non dovrebbe mai "
+                         "accadere per un tokenizer byte-level corretto: possibile bug)\n";
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "errore di codifica: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
+int runDatasetBuild(const std::string& corpusPath, const std::string& tokenizerPath, std::size_t seqLen,
+                     const std::string& outputPath) {
+    std::string corpus;
+    if (!readFile(corpusPath, corpus)) {
+        std::cerr << "errore: impossibile leggere il corpus '" << corpusPath << "'\n";
+        return 2;
+    }
+    if (seqLen == 0) {
+        std::cerr << "errore: '--seq-len' richiede un intero positivo\n";
+        return 2;
+    }
+    if (outputPath.empty()) {
+        std::cerr << "errore: comando 'dataset-build' richiede '--output <file.bfdata>'\n";
+        return 2;
+    }
+
+    try {
+        blackforge::tokenizer::Tokenizer tok = blackforge::tokenizer::loadTokenizer(tokenizerPath);
+        std::size_t numExamples = blackforge::tokenizer::buildLanguageModelDataset(tok, corpus, seqLen, outputPath);
+        std::cout << "Dataset costruito: " << numExamples << " esempi (seqLen=" << seqLen
+                   << ", vocabolario=" << tok.vocabSize() << ")\n";
+        std::cout << "Salvato in '" << outputPath << "'\n";
+    } catch (const std::exception& e) {
+        std::cerr << "errore di costruzione del dataset: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
 std::string formatShape(const std::vector<std::size_t>& shape) {
     std::ostringstream out;
     out << "[";
@@ -629,6 +732,9 @@ int main(int argc, char** argv) {
     std::string saveCheckpointPath;
     std::size_t warmupIterations = 5;
     std::size_t measuredIterations = 20;
+    std::size_t vocabSize = 0;
+    std::size_t seqLen = 0;
+    std::string outputPath;
     std::vector<std::string> positional;
     std::string command = args.front();
 
@@ -683,6 +789,24 @@ int main(int argc, char** argv) {
                 std::cerr << "errore: '--iterations' richiede un intero positivo\n";
                 return 2;
             }
+        } else if (args[i] == "--vocab-size") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--vocab-size' richiede un valore\n";
+                return 2;
+            }
+            vocabSize = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--seq-len") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--seq-len' richiede un valore\n";
+                return 2;
+            }
+            seqLen = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--output") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--output' richiede un percorso\n";
+                return 2;
+            }
+            outputPath = args[++i];
         } else {
             positional.push_back(args[i]);
         }
@@ -748,6 +872,27 @@ int main(int argc, char** argv) {
     if (command == "devices") {
         printDevices();
         return 0;
+    }
+    if (command == "tokenizer-train") {
+        if (positional.empty()) {
+            std::cerr << "errore: comando 'tokenizer-train' richiede il percorso di un corpus di testo\n";
+            return 2;
+        }
+        return runTokenizerTrain(positional.front(), vocabSize, outputPath);
+    }
+    if (command == "tokenizer-encode") {
+        if (positional.size() < 2) {
+            std::cerr << "errore: comando 'tokenizer-encode' richiede '<tokenizer.bftok> <testo.txt>'\n";
+            return 2;
+        }
+        return runTokenizerEncode(positional[0], positional[1]);
+    }
+    if (command == "dataset-build") {
+        if (positional.size() < 2) {
+            std::cerr << "errore: comando 'dataset-build' richiede '<corpus.txt> <tokenizer.bftok>'\n";
+            return 2;
+        }
+        return runDatasetBuild(positional[0], positional[1], seqLen, outputPath);
     }
 
     std::cerr << "errore: comando sconosciuto '" << command << "'\n";
