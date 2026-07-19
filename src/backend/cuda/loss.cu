@@ -191,6 +191,34 @@ __global__ void softmaxCrossEntropySparseKernel(float* grad, float* rowLoss, con
     }
 }
 
+// Riduzione ad albero identica a sumReduceKernel, ma ACCUMULA (atomicAdd)
+// nell'accumulatore persistente del chiamante invece di sovrascrivere un
+// buffer temporaneo — vedi le varianti "Accumulate" in loss.hpp per il
+// razionale completo: permette all'hot loop di addestramento di
+// rimandare la sincronizzazione con l'host da una volta per step a una
+// volta per epoca.
+__global__ void sumReduceAccumulateKernel(float* accumulator, const float* data, std::size_t n) {
+    extern __shared__ float shared[];
+
+    float localSum = 0.0F;
+    for (std::size_t i = threadIdx.x; i < n; i += blockDim.x) {
+        localSum += data[i];
+    }
+    shared[threadIdx.x] = localSum;
+    __syncthreads();
+
+    for (std::size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        atomicAdd(accumulator, shared[0]);
+    }
+}
+
 }  // namespace
 
 LossResult meanSquaredError(const DeviceTensor& prediction, const DeviceTensor& target) {
@@ -297,6 +325,89 @@ LossResult softmaxCrossEntropySparse(const DeviceTensor& logits, const DeviceTen
     }
 
     return LossResult{value, std::move(grad)};
+}
+
+DeviceTensor meanSquaredErrorAccumulate(const DeviceTensor& prediction, const DeviceTensor& target,
+                                         DeviceTensor& lossAccumulator) {
+    if (prediction.shape() != target.shape()) {
+        throw std::invalid_argument("meanSquaredErrorAccumulate: forme incompatibili sul device");
+    }
+
+    std::size_t n = prediction.elementCount();
+    DeviceTensor grad(prediction.shape());
+
+    if (n > 0) {
+        DeviceTensor squaredDiff({n});
+        mseGradKernel<<<gridSizeFor(n), kBlockSize>>>(grad.data(), squaredDiff.data(), prediction.data(),
+                                                       target.data(), n);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+
+        sumReduceAccumulateKernel<<<1, kBlockSize, kBlockSize * sizeof(float)>>>(lossAccumulator.data(),
+                                                                                  squaredDiff.data(), n);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+
+    return grad;
+}
+
+DeviceTensor softmaxCrossEntropyAccumulate(const DeviceTensor& logits, const DeviceTensor& target,
+                                            DeviceTensor& lossAccumulator) {
+    if (logits.shape() != target.shape()) {
+        throw std::invalid_argument("softmaxCrossEntropyAccumulate: forme incompatibili sul device");
+    }
+    if (logits.rank() < 2) {
+        throw std::invalid_argument("softmaxCrossEntropyAccumulate: richiede un tensore a rango >= 2 sul device");
+    }
+
+    std::size_t numClasses = logits.shape().back();
+    std::size_t rows = logits.elementCount() / numClasses;
+
+    DeviceTensor grad(logits.shape());
+    if (rows > 0 && numClasses > 0) {
+        DeviceTensor rowLoss({rows});
+        std::size_t sharedBytes = kBlockSize * sizeof(float);
+        softmaxCrossEntropyKernel<<<static_cast<int>(rows), kBlockSize, sharedBytes>>>(
+            grad.data(), rowLoss.data(), logits.data(), target.data(), rows, numClasses);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+
+        sumReduceAccumulateKernel<<<1, kBlockSize, kBlockSize * sizeof(float)>>>(lossAccumulator.data(),
+                                                                                  rowLoss.data(), rows);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+
+    return grad;
+}
+
+DeviceTensor softmaxCrossEntropySparseAccumulate(const DeviceTensor& logits, const DeviceTensor& targetIndices,
+                                                  DeviceTensor& lossAccumulator) {
+    if (logits.rank() < 2) {
+        throw std::invalid_argument("softmaxCrossEntropySparseAccumulate: richiede logits a rango >= 2 sul device");
+    }
+    std::size_t numClasses = logits.shape().back();
+    std::size_t rows = logits.elementCount() / numClasses;
+
+    if (targetIndices.elementCount() != rows) {
+        throw std::invalid_argument("softmaxCrossEntropySparseAccumulate: targetIndices ha un numero di elementi "
+                                     "incompatibile con le righe di logits sul device");
+    }
+
+    // Nessuna validazione del range qui: precondizione del chiamante,
+    // vedi il commento in loss.hpp.
+
+    DeviceTensor grad(logits.shape());
+    if (rows > 0 && numClasses > 0) {
+        DeviceTensor rowLoss({rows});
+        std::size_t sharedBytes = kBlockSize * sizeof(float);
+        softmaxCrossEntropySparseKernel<<<static_cast<int>(rows), kBlockSize, sharedBytes>>>(
+            grad.data(), rowLoss.data(), logits.data(), targetIndices.data(), rows, numClasses);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+
+        sumReduceAccumulateKernel<<<1, kBlockSize, kBlockSize * sizeof(float)>>>(lossAccumulator.data(),
+                                                                                  rowLoss.data(), rows);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+
+    return grad;
 }
 
 }  // namespace blackforge::backend::cuda

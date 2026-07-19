@@ -61,6 +61,14 @@ DeviceTensor softmaxBackward(const DeviceTensor& input, const DeviceTensor& grad
 DeviceTensor embeddingLookupBackward(const DeviceTensor& tokenIds, const DeviceTensor& gradOutput,
                                       std::size_t vocabSize);
 
+// Come embeddingLookupBackward(), ma senza validare il range di
+// 'tokenIds' sull'host: precondizione del chiamante, vedi il commento in
+// ops_elementwise.cu su embeddingLookupPreValidated (stessa idea, qui per
+// il backward). Pensata per l'hot loop di addestramento
+// (cuda::Model::backward()), non per uso generico.
+DeviceTensor embeddingLookupBackwardPreValidated(const DeviceTensor& tokenIds, const DeviceTensor& gradOutput,
+                                                  std::size_t vocabSize);
+
 struct PositionalEmbeddingGrad {
     DeviceTensor dInput;
     DeviceTensor dTable;

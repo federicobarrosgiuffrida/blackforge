@@ -60,6 +60,12 @@ DeviceTensor softmax(const DeviceTensor& input);
 // token id e' fuori da [0, vocabSize).
 DeviceTensor embeddingLookup(const DeviceTensor& tokenIds, const DeviceTensor& table);
 
+// Come embeddingLookup(), ma senza validare il range di 'tokenIds'
+// sull'host: precondizione del chiamante, vedi il commento in
+// ops_elementwise.cu. Pensata per l'hot loop di addestramento
+// (cuda::Model::forward/backward), non per uso generico.
+DeviceTensor embeddingLookupPreValidated(const DeviceTensor& tokenIds, const DeviceTensor& table);
+
 // Aggiunge un embedding posizionale allenabile: input [batch, seq, dim],
 // table [maxSeqLen, dim] -> output[b,s,d] = input[b,s,d] + table[s,d]
 // (vedi backend::cpu::addPositionalEmbedding, stessa semantica).

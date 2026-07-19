@@ -475,6 +475,30 @@ DeviceTensor embeddingLookupBackward(const DeviceTensor& tokenIds, const DeviceT
     return dTable;
 }
 
+// Come embeddingLookupBackward(), ma senza validare il range di
+// 'tokenIds' sull'host: stessa precondizione/uso di
+// embeddingLookupPreValidated (vedi ops_elementwise.cu), qui per il
+// backward — usata da cuda::Model::backward() nello stesso caso.
+DeviceTensor embeddingLookupBackwardPreValidated(const DeviceTensor& tokenIds, const DeviceTensor& gradOutput,
+                                                  std::size_t vocabSize) {
+    if (tokenIds.rank() != 2 || gradOutput.rank() != 3 || tokenIds.dim(0) != gradOutput.dim(0) ||
+        tokenIds.dim(1) != gradOutput.dim(1)) {
+        throw std::invalid_argument("embeddingLookupBackwardPreValidated: forme incompatibili sul device");
+    }
+
+    std::size_t dim = gradOutput.dim(2);
+
+    DeviceTensor dTable = DeviceTensor::zeros({vocabSize, dim});
+    std::size_t totalTokens = tokenIds.elementCount();
+    std::size_t total = totalTokens * dim;
+    if (total > 0) {
+        embeddingLookupBackwardKernel<<<gridSizeFor(total), kBlockSize>>>(dTable.data(), tokenIds.data(),
+                                                                           gradOutput.data(), totalTokens, dim);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return dTable;
+}
+
 PositionalEmbeddingGrad addPositionalEmbeddingBackward(const DeviceTensor& gradOutput, std::size_t maxSeqLen) {
     if (gradOutput.rank() != 3) {
         throw std::invalid_argument("addPositionalEmbeddingBackward: atteso un gradiente a rango 3 sul device");

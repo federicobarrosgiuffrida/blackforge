@@ -1,8 +1,11 @@
 #include "blackforge/backend/cuda/multi_gpu_train_runner.hpp"
 
+#include <cmath>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <variant>
 
 #include "blackforge/backend/cpu/ops.hpp"
@@ -51,6 +54,18 @@ const ast::DatasetDecl* findDatasetDecl(const ast::Program& program, const std::
         }
     }
     return nullptr;
+}
+
+// Duplicata deliberatamente da train_runner.cu (stessa idea, diversa
+// unita' di traduzione): vedi il commento li' per il razionale completo.
+void validateHostIndexRange(const runtime::Tensor& hostTensor, std::size_t bound, const char* errorLabel) {
+    for (std::size_t i = 0; i < hostTensor.elementCount(); ++i) {
+        auto index = static_cast<long long>(std::lround(hostTensor.at(i)));
+        if (index < 0 || static_cast<std::size_t>(index) >= bound) {
+            throw std::invalid_argument(std::string(errorLabel) + ": indice " + std::to_string(index) +
+                                         " fuori da [0, " + std::to_string(bound) + ")");
+        }
+    }
 }
 
 }  // namespace
@@ -141,14 +156,21 @@ TrainRunResult runMultiGpuTraining(const ast::Program& program, const ir::Module
                          << " GPU (fine-tuning)\n";
     }
 
-    std::function<LossResult(const DeviceTensor&, const DeviceTensor&)> lossFn;
+    // Vedi il commento equivalente in train_runner.cu: le varianti
+    // "Accumulate" evitano una cudaMemcpy per ogni replica ad ogni step.
+    bool isSparseCrossEntropy = (lossField->name == "cross_entropy_sparse");
+    std::function<DeviceTensor(const DeviceTensor&, const DeviceTensor&, DeviceTensor&)> lossAccumulateFn;
     if (lossField->name == "cross_entropy") {
-        lossFn = softmaxCrossEntropy;
-    } else if (lossField->name == "cross_entropy_sparse") {
-        lossFn = softmaxCrossEntropySparse;
+        lossAccumulateFn = softmaxCrossEntropyAccumulate;
+    } else if (isSparseCrossEntropy) {
+        lossAccumulateFn = softmaxCrossEntropySparseAccumulate;
     } else {
-        lossFn = meanSquaredError;
+        lossAccumulateFn = meanSquaredErrorAccumulate;
     }
+
+    // Stesso vocabolario per tutte le repliche (stesso modelIR): basta
+    // interrogare la prima.
+    std::optional<std::size_t> firstLayerVocabSize = models[0].firstLayerEmbeddingVocabSize();
 
     double learningRate = (learningRateField != nullptr) ? learningRateField->value : 1e-3;
     std::vector<std::unique_ptr<Optimizer>> optimizers;
@@ -195,10 +217,20 @@ TrainRunResult runMultiGpuTraining(const ast::Program& program, const ir::Module
             }
         }
 
-        double epochLossSum = 0.0;
+        // Un accumulatore device della loss dell'epoca per replica (vedi
+        // il commento equivalente in train_runner.cu): una singola
+        // cudaMemcpy per GPU dopo l'ultimo batch, invece di sincronizzare
+        // ogni replica una volta per step.
+        std::vector<DeviceTensor> lossAccumulators;
+        lossAccumulators.reserve(numDevices);
+        for (std::size_t i = 0; i < numDevices; ++i) {
+            setActiveDevice(deviceIndices[i]);
+            lossAccumulators.push_back(DeviceTensor::zeros({1}));
+        }
+        std::size_t lossDivisor = 0;
+
         for (std::size_t b = 0; b < batchesPerEpoch; ++b) {
             std::vector<std::vector<Parameter*>> paramsPerDevice(numDevices);
-            double batchLossSum = 0.0;
 
             // Forward + backward indipendente per replica, ognuna sul
             // proprio shard disgiunto del batch corrente e sulla
@@ -209,15 +241,29 @@ TrainRunResult runMultiGpuTraining(const ast::Program& program, const ir::Module
             for (std::size_t i = 0; i < numDevices; ++i) {
                 setActiveDevice(deviceIndices[i]);
                 data::Dataset::Batch shard = dataset.batch(b * batchSize + i * shardSize, shardSize);
+
+                if (firstLayerVocabSize.has_value()) {
+                    validateHostIndexRange(shard.input, *firstLayerVocabSize, "embeddingLookup");
+                }
+
                 DeviceTensor inputDevice = DeviceTensor::fromHost(shard.input);
-                DeviceTensor targetDevice = DeviceTensor::fromHost(shard.target);
 
                 models[i].zeroGrad();
-                DeviceTensor output = models[i].forward(inputDevice);
-                LossResult loss = lossFn(output, targetDevice);
-                models[i].backward(loss.grad);
+                DeviceTensor output = models[i].forward(inputDevice, firstLayerVocabSize.has_value());
 
-                batchLossSum += loss.value;
+                if (isSparseCrossEntropy) {
+                    validateHostIndexRange(shard.target, output.shape().back(), "softmaxCrossEntropySparse");
+                }
+                DeviceTensor targetDevice = DeviceTensor::fromHost(shard.target);
+
+                std::size_t rowsPerCall = isSparseCrossEntropy || lossField->name == "cross_entropy"
+                                               ? output.elementCount() / output.shape().back()
+                                               : output.elementCount();
+                lossDivisor += rowsPerCall;
+
+                DeviceTensor grad = lossAccumulateFn(output, targetDevice, lossAccumulators[i]);
+                models[i].backward(grad, firstLayerVocabSize.has_value());
+
                 paramsPerDevice[i] = models[i].parameters();
             }
 
@@ -255,15 +301,16 @@ TrainRunResult runMultiGpuTraining(const ast::Program& program, const ir::Module
                 optimizers[i]->step(models[i].parameters());
             }
 
-            // Media delle loss di shard: siccome ogni loss e' gia' una
-            // MEDIA sul proprio shard e tutti gli shard hanno la stessa
-            // dimensione, la media delle medie coincide con la loss
-            // media sull'intero batch (nessuna distorsione introdotta
-            // dallo sharding).
-            epochLossSum += batchLossSum / static_cast<double>(numDevices);
         }
 
-        double avgLoss = epochLossSum / static_cast<double>(batchesPerEpoch);
+        // Somma delle loss accumulate su ogni GPU: una cudaMemcpy per
+        // replica (numDevices in tutto, invece di numDevices*batchesPerEpoca).
+        double lossSum = 0.0;
+        for (std::size_t i = 0; i < numDevices; ++i) {
+            setActiveDevice(deviceIndices[i]);
+            lossSum += static_cast<double>(lossAccumulators[i].toHost().at(0));
+        }
+        double avgLoss = lossSum / static_cast<double>(lossDivisor);
         result.epochLosses.push_back(avgLoss);
 
         if (progressOutput != nullptr) {

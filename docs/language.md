@@ -659,6 +659,66 @@ stimato inizialmente, il singolo intervento a più alto impatto.
 codice dopo essere stati superati dal nucleo fuso del punto 4, non
 lasciati come codice morto.
 
+#### Sincronizzazioni host rimosse dall'hot loop di addestramento: ~4% reale
+
+Secondo intervento dell'audit: tre sincronizzazioni host bloccanti per
+OGNI singolo step di addestramento, identificate leggendo `loss.cu`,
+`ops_elementwise.cu` e `autodiff.cu`. Stesso protocollo del punto
+precedente — uno stub temporaneo usa-e-getta (non committato) per
+isolare l'impatto reale prima di investire in un refactor:
+
+1. **Lettura della loss scalare** (`cudaMemcpy` in `meanSquaredError`/
+   `softmaxCrossEntropy`/`softmaxCrossEntropySparse`): il valore veniva
+   letto sull'host ad OGNI chiamata (1000 volte nel benchmark), anche se
+   serve solo per la stampa di fine epoca — ogni lettura forza la CPU ad
+   aspettare che l'intera pipeline GPU accumulata fino a quel punto
+   finisca, impedendo qualunque overlap CPU/GPU tra uno step e il
+   successivo.
+2. **Validazione dei token id** (`embeddingLookup`/
+   `embeddingLookupBackward`): un `tokenIds.toHost()` completo (l'intero
+   batch) ad ogni forward E ad ogni backward, per controllare che ogni id
+   sia in `[0, vocabSize)` prima di lanciare il kernel (un kernel CUDA
+   non può lanciare eccezioni).
+3. **Validazione degli indici di classe** (`softmaxCrossEntropySparse`):
+   stesso pattern, un `targetIndices.toHost()` completo ad ogni chiamata.
+
+Stub temporaneo di tutte e tre insieme: **41,0-41,4s** (tre run) contro
+43,84-43,98s prima — un **~6-7% reale**, la seconda volta in questo
+audit che una misura diretta smentisce l'intuizione iniziale (qui
+l'overhead di sincronizzazione conta, ma meno di quanto la sola
+presenza di tre round-trip per step avrebbe fatto pensare). Isolando il
+solo punto 1 (validazioni riattivate): **42,9s**, cioè la lettura della
+loss vale da sola solo ~2%; il resto (~4-5%) viene dalle due
+validazioni.
+
+Implementazione reale (non lo stub usa-e-getta, che avrebbe rotto la
+sicurezza): per il punto 1, un accumulatore device (`DeviceTensor` di un
+solo elemento) sommato via `atomicAdd` da un nuovo kernel
+(`sumReduceAccumulateKernel`) ad ogni step, letto sull'host una sola
+volta a fine epoca invece che una volta per step
+(`meanSquaredErrorAccumulate`/`softmaxCrossEntropyAccumulate`/
+`softmaxCrossEntropySparseAccumulate` in `loss.hpp`). Per i punti 2 e
+3, NESSUNA validazione è stata rimossa: spostata invece sull'host, sui
+dati del batch (`batch.input`/`batch.target`, entrambi ancora
+`runtime::Tensor` residenti su CPU) PRIMA del caricamento su device —
+stessi valori che il round-trip avrebbe scaricato dal device, zero
+round-trip aggiuntivo, stessa tempistica dell'eccezione (lanciata nello
+stesso punto logico del ciclo, non rimandata). Usata solo quando il
+primo layer della pipeline è `embedding`
+(`Model::firstLayerEmbeddingVocabSize()`): in quel caso
+`Model::forward()`/`backward()` ricevono `inputRangeTrusted=true` e
+usano `embeddingLookupPreValidated`/`embeddingLookupBackwardPreValidated`
+solo per quel primo layer (ogni altro layer, e ogni chiamata generica
+fuori dall'hot loop di training — `blackforge run`, `generate`, i
+test — continua a validare internamente come prima, invariato).
+
+Risultato misurato con l'implementazione reale (stesso benchmark):
+**42,0-42,3s** (due run) contro 43,84-43,98s prima — **~4% reale**, un
+guadagno onesto ma non risolutivo, verificato senza indebolire nessuna
+garanzia di sicurezza (391 test CUDA verdi, inclusi i test di parità
+CPU/GPU e multi-GPU, che confermano la matematica identica a meno del
+riordino dell'accumulo in virgola mobile).
+
 ## Training (pretraining, fine-tuning, LoRA, forecasting)
 
 `dataset { ... }` e `train { ... }` collegano il linguaggio al motore

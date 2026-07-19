@@ -187,11 +187,12 @@ Model::Model(const ir::ModelIR& modelIR, unsigned int seed, std::optional<ir::Pr
     }
 }
 
-DeviceTensor Model::forward(const DeviceTensor& input) {
+DeviceTensor Model::forward(const DeviceTensor& input, bool inputRangeTrusted) {
     DeviceTensor current = input.clone();
 
     for (auto& layer : layers_) {
         layer.cachedInput = current.clone();
+        bool isFirstLayer = (&layer == &layers_.front());
 
         switch (layer.kind) {
             case ir::OpKind::Linear:
@@ -203,7 +204,11 @@ DeviceTensor Model::forward(const DeviceTensor& input) {
             case ir::OpKind::Gelu: current = gelu(current); break;
             case ir::OpKind::RmsNorm: current = rmsnorm(current); break;
             case ir::OpKind::Softmax: current = softmax(current); break;
-            case ir::OpKind::Embedding: current = embeddingLookup(current, layer.embeddingTable->value); break;
+            case ir::OpKind::Embedding:
+                current = (inputRangeTrusted && isFirstLayer)
+                              ? embeddingLookupPreValidated(current, layer.embeddingTable->value)
+                              : embeddingLookup(current, layer.embeddingTable->value);
+                break;
             case ir::OpKind::PositionalEmbedding:
                 current = addPositionalEmbedding(current, layer.positionalTable->value);
                 break;
@@ -226,11 +231,12 @@ DeviceTensor Model::forward(const DeviceTensor& input) {
     return current;
 }
 
-void Model::backward(const DeviceTensor& outputGrad) {
+void Model::backward(const DeviceTensor& outputGrad, bool inputRangeTrusted) {
     DeviceTensor gradCurrent = outputGrad.clone();
 
     for (auto it = layers_.rbegin(); it != layers_.rend(); ++it) {
         LayerState& layer = *it;
+        bool isFirstLayer = (&layer == &layers_.front());
 
         switch (layer.kind) {
             case ir::OpKind::Linear: {
@@ -253,7 +259,11 @@ void Model::backward(const DeviceTensor& outputGrad) {
             case ir::OpKind::RmsNorm: gradCurrent = rmsnormBackward(layer.cachedInput, gradCurrent); break;
             case ir::OpKind::Softmax: gradCurrent = softmaxBackward(layer.cachedInput, gradCurrent); break;
             case ir::OpKind::Embedding: {
-                DeviceTensor dTable = embeddingLookupBackward(layer.cachedInput, gradCurrent, layer.embeddingVocabSize);
+                DeviceTensor dTable = (inputRangeTrusted && isFirstLayer)
+                                          ? embeddingLookupBackwardPreValidated(layer.cachedInput, gradCurrent,
+                                                                                 layer.embeddingVocabSize)
+                                          : embeddingLookupBackward(layer.cachedInput, gradCurrent,
+                                                                     layer.embeddingVocabSize);
                 accumulate(layer.embeddingTable->grad, dTable);
                 // I token id sono indici, non differenziabili: nessun
                 // gradiente da propagare a un eventuale layer precedente.
@@ -376,6 +386,13 @@ std::vector<Parameter*> Model::parameters() {
         }
     }
     return result;
+}
+
+std::optional<std::size_t> Model::firstLayerEmbeddingVocabSize() const {
+    if (layers_.empty() || layers_.front().kind != ir::OpKind::Embedding) {
+        return std::nullopt;
+    }
+    return layers_.front().embeddingVocabSize;
 }
 
 }  // namespace blackforge::backend::cuda

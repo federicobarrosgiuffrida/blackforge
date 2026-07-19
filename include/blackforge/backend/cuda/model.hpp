@@ -59,13 +59,29 @@ public:
 
     // Esegue la pipeline e salva le attivazioni intermedie (su device)
     // necessarie a backward(). Va chiamata prima di ogni backward().
-    DeviceTensor forward(const DeviceTensor& input);
+    //
+    // 'inputRangeTrusted': se true E il primo layer della pipeline e'
+    // 'embedding', salta la validazione del range dei token id
+    // sull'host per QUEL layer (nessun round-trip device->host->device —
+    // vedi embeddingLookupPreValidated in ops.hpp). PRECONDIZIONE,
+    // responsabilita' del chiamante: 'input' deve gia' contenere solo
+    // token id in [0, vocabSize) — usato dall'hot loop di addestramento
+    // (train_runner.cu/multi_gpu_train_runner.cu), che valida gli stessi
+    // valori sull'host PRIMA di caricarli su device, rendendo la
+    // validazione interna ridondante. Ignorato (nessun effetto, nessun
+    // rischio) se il primo layer non e' 'embedding'.
+    DeviceTensor forward(const DeviceTensor& input, bool inputRangeTrusted = false);
 
     // Calcola i gradienti dei parametri a partire dal gradiente
     // dell'uscita (dL/doutput), usando le attivazioni salvate
     // dall'ultima forward(). Li ACCUMULA (non li azzera): chiamare
     // zeroGrad() prima di ogni step di addestramento.
-    void backward(const DeviceTensor& outputGrad);
+    //
+    // 'inputRangeTrusted': stessa semantica/precondizione di forward() —
+    // deve avere lo STESSO valore passato all'ultima forward() (la
+    // validazione riguarda gli stessi token id cachati da quella
+    // chiamata).
+    void backward(const DeviceTensor& outputGrad, bool inputRangeTrusted = false);
 
     void zeroGrad();
 
@@ -89,6 +105,12 @@ public:
     [[nodiscard]] std::vector<Parameter*> parameters();
 
     [[nodiscard]] const std::string& name() const { return name_; }
+
+    // Se il primo layer della pipeline e' 'embedding', restituisce la
+    // dimensione del suo vocabolario (per permettere al chiamante di
+    // validare i token id sull'host prima di caricarli su device, vedi
+    // forward()/backward() sopra); std::nullopt altrimenti.
+    [[nodiscard]] std::optional<std::size_t> firstLayerEmbeddingVocabSize() const;
 
 private:
     struct LayerState {

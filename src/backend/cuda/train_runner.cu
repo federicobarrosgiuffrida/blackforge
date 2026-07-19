@@ -1,8 +1,11 @@
 #include "blackforge/backend/cuda/train_runner.hpp"
 
+#include <cmath>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <variant>
 
 #include "blackforge/backend/cuda/checkpoint.hpp"
@@ -46,6 +49,24 @@ const ast::DatasetDecl* findDatasetDecl(const ast::Program& program, const std::
         }
     }
     return nullptr;
+}
+
+// Lancia std::invalid_argument se un elemento di 'hostTensor' e' fuori
+// da [0, bound) — stessa validazione fatta storicamente da
+// embeddingLookup()/softmaxCrossEntropySparse() sul device, ma eseguita
+// qui direttamente sui dati host PRIMA di caricarli su device (vedi
+// Model::forward()'s 'inputRangeTrusted' e le varianti "Accumulate" in
+// loss.hpp): stessi valori, zero round-trip device->host->device per
+// ogni singolo step di addestramento. Duplicata deliberatamente in
+// multi_gpu_train_runner.cu (stessa idea, diversa unita' di traduzione).
+void validateHostIndexRange(const runtime::Tensor& hostTensor, std::size_t bound, const char* errorLabel) {
+    for (std::size_t i = 0; i < hostTensor.elementCount(); ++i) {
+        auto index = static_cast<long long>(std::lround(hostTensor.at(i)));
+        if (index < 0 || static_cast<std::size_t>(index) >= bound) {
+            throw std::invalid_argument(std::string(errorLabel) + ": indice " + std::to_string(index) +
+                                         " fuori da [0, " + std::to_string(bound) + ")");
+        }
+    }
 }
 
 }  // namespace
@@ -101,14 +122,28 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
 
     Model model(*modelIR, /*seed=*/42, module.precision);
 
-    std::function<LossResult(const DeviceTensor&, const DeviceTensor&)> lossFn;
+    // Varianti "Accumulate" (vedi loss.hpp): calcolano il gradiente
+    // subito, ma sommano la loss di riga in un accumulatore device
+    // invece di leggerla sull'host ad ogni chiamata — una sola cudaMemcpy
+    // a fine epoca invece di una per step (vedi il ciclo sotto).
+    bool isSparseCrossEntropy = (lossField->name == "cross_entropy_sparse");
+    std::function<DeviceTensor(const DeviceTensor&, const DeviceTensor&, DeviceTensor&)> lossAccumulateFn;
     if (lossField->name == "cross_entropy") {
-        lossFn = softmaxCrossEntropy;
-    } else if (lossField->name == "cross_entropy_sparse") {
-        lossFn = softmaxCrossEntropySparse;
+        lossAccumulateFn = softmaxCrossEntropyAccumulate;
+    } else if (isSparseCrossEntropy) {
+        lossAccumulateFn = softmaxCrossEntropySparseAccumulate;
     } else {
-        lossFn = meanSquaredError;
+        lossAccumulateFn = meanSquaredErrorAccumulate;
     }
+
+    // Se il primo layer del modello e' 'embedding', i token id in
+    // ingresso possono essere validati direttamente sui dati host del
+    // batch (vedi validateHostIndexRange sopra), PRIMA di caricarli su
+    // device — stessi valori che embeddingLookup()/embeddingLookupBackward()
+    // validerebbero comunque, ma senza il round-trip device->host->device
+    // che farebbero se richiamati con la validazione interna attiva (vedi
+    // Model::forward()/backward()).
+    std::optional<std::size_t> firstLayerVocabSize = model.firstLayerEmbeddingVocabSize();
 
     if (!fromCheckpointPath.empty()) {
         loadCheckpoint(model, fromCheckpointPath);
@@ -158,22 +193,46 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
             optimizer->setLearningRate(scheduledLr);
         }
 
-        double epochLossSum = 0.0;
+        // Accumulatore device della loss dell'intera epoca: una singola
+        // cudaMemcpy dopo l'ultimo batch legge il totale, invece di
+        // sincronizzare la pipeline GPU una volta per ogni singolo step
+        // (vedi le varianti "Accumulate" in loss.hpp).
+        DeviceTensor lossAccumulator = DeviceTensor::zeros({1});
+        std::size_t lossDivisor = 0;  // righe per chiamata * batchesPerEpoca, noto dopo il primo batch
+
         for (std::size_t b = 0; b < batchesPerEpoch; ++b) {
             data::Dataset::Batch batch = dataset.batch(b * batchSize, batchSize);
+
+            if (firstLayerVocabSize.has_value()) {
+                validateHostIndexRange(batch.input, *firstLayerVocabSize, "embeddingLookup");
+            }
+
             DeviceTensor inputDevice = DeviceTensor::fromHost(batch.input);
-            DeviceTensor targetDevice = DeviceTensor::fromHost(batch.target);
 
             model.zeroGrad();
-            DeviceTensor output = model.forward(inputDevice);
-            LossResult loss = lossFn(output, targetDevice);
-            model.backward(loss.grad);
-            optimizer->step(model.parameters());
+            DeviceTensor output = model.forward(inputDevice, firstLayerVocabSize.has_value());
 
-            epochLossSum += loss.value;
+            if (isSparseCrossEntropy) {
+                // batch.target e' ancora sull'host qui: stessi valori che
+                // softmaxCrossEntropySparse() validerebbe sul device, zero
+                // round-trip aggiuntivo (vedi softmaxCrossEntropySparseAccumulate).
+                validateHostIndexRange(batch.target, output.shape().back(), "softmaxCrossEntropySparse");
+            }
+            DeviceTensor targetDevice = DeviceTensor::fromHost(batch.target);
+
+            std::size_t rowsPerCall =
+                isSparseCrossEntropy || lossField->name == "cross_entropy"
+                    ? output.elementCount() / output.shape().back()
+                    : output.elementCount();
+            lossDivisor += rowsPerCall;
+
+            DeviceTensor grad = lossAccumulateFn(output, targetDevice, lossAccumulator);
+            model.backward(grad, firstLayerVocabSize.has_value());
+            optimizer->step(model.parameters());
         }
 
-        double avgLoss = epochLossSum / static_cast<double>(batchesPerEpoch);
+        float lossSum = lossAccumulator.toHost().at(0);
+        double avgLoss = static_cast<double>(lossSum) / static_cast<double>(lossDivisor);
         result.epochLosses.push_back(avgLoss);
 
         if (progressOutput != nullptr) {

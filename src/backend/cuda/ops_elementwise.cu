@@ -337,6 +337,41 @@ DeviceTensor embeddingLookup(const DeviceTensor& tokenIds, const DeviceTensor& t
     return result;
 }
 
+// Come embeddingLookup(), ma NON valida il range di 'tokenIds' sull'host
+// (nessun round-trip device->host->device). PRECONDIZIONE,
+// responsabilita' del chiamante: ogni token id deve gia' essere in [0,
+// vocabSize) — comportamento indefinito altrimenti (un kernel CUDA non
+// puo' lanciare eccezioni). Pensata per essere chiamata quando il
+// chiamante ha GIA' gli stessi valori sull'host PRIMA di caricarli su
+// device (vedi cuda::Model::forward/backward, che la usano solo per il
+// primo layer di una pipeline che inizia con 'embedding': in quel caso
+// 'tokenIds' e' esattamente l'input della rete appena caricato da host,
+// gia' validato li' da chi ha costruito il batch — vedi train_runner.cu).
+DeviceTensor embeddingLookupPreValidated(const DeviceTensor& tokenIds, const DeviceTensor& table) {
+    if (tokenIds.rank() != 2) {
+        throw std::invalid_argument(
+            "embeddingLookupPreValidated: richiede token id a rango 2 [batch, seq] sul device");
+    }
+    if (table.rank() != 2) {
+        throw std::invalid_argument(
+            "embeddingLookupPreValidated: richiede una tabella a rango 2 [vocabSize, dim] sul device");
+    }
+
+    std::size_t batch = tokenIds.dim(0);
+    std::size_t seq = tokenIds.dim(1);
+    std::size_t vocabSize = table.dim(0);
+    std::size_t dim = table.dim(1);
+
+    DeviceTensor result({batch, seq, dim});
+    std::size_t total = batch * seq * dim;
+    if (total > 0) {
+        embeddingLookupKernel<<<gridSizeFor(total), kBlockSize>>>(result.data(), tokenIds.data(), table.data(),
+                                                                   batch, seq, vocabSize, dim);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
 DeviceTensor addPositionalEmbedding(const DeviceTensor& input, const DeviceTensor& table) {
     if (input.rank() != 3) {
         throw std::invalid_argument("addPositionalEmbedding: richiede un input a rango 3 [batch, seq, dim] sul "
