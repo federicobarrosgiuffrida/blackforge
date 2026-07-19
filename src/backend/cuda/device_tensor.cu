@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "blackforge/backend/cuda/cuda_check.hpp"
+#include "blackforge/backend/cuda/device_pool.hpp"
 
 namespace blackforge::backend::cuda {
 
@@ -18,13 +19,21 @@ std::size_t product(const std::vector<std::size_t>& shape) {
 DeviceTensor::DeviceTensor(std::vector<std::size_t> shape) : shape_(std::move(shape)) {
     std::size_t bytes = product(shape_) * sizeof(float);
     if (bytes > 0) {
-        BLACKFORGE_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&data_), bytes));
+        // Pool per-device invece di cudaMalloc diretto (vedi
+        // device_pool.hpp): la stragrande maggioranza dei DeviceTensor
+        // di questo backend sono intermedi di vita brevissima (un
+        // singolo matmul/attivazione), riallocati con le STESSE forme
+        // ad ogni step di un training loop.
+        data_ = static_cast<float*>(devicePoolAcquire(bytes));
     }
 }
 
 DeviceTensor::~DeviceTensor() {
     if (data_ != nullptr) {
-        cudaFree(data_);  // il distruttore non puo' lanciare eccezioni
+        // Torna al pool invece di cudaFree diretto: il distruttore non
+        // puo' lanciare eccezioni, e devicePoolRelease() non ne lancia
+        // (vedi device_pool.cu).
+        devicePoolRelease(data_, elementCount() * sizeof(float));
     }
 }
 

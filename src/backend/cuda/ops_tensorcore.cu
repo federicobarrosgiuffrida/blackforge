@@ -6,6 +6,7 @@
 
 #include "blackforge/backend/cuda/autodiff.hpp"
 #include "blackforge/backend/cuda/cuda_check.hpp"
+#include "blackforge/backend/cuda/device_pool.hpp"
 #include "blackforge/backend/cuda/ops.hpp"
 
 namespace blackforge::backend::cuda {
@@ -32,12 +33,18 @@ class DeviceBf16Buffer {
 public:
     explicit DeviceBf16Buffer(std::size_t count) : count_(count) {
         if (count_ > 0) {
-            BLACKFORGE_CUDA_CHECK(cudaMalloc(&ptr_, count_ * sizeof(__nv_bfloat16)));
+            // Stesso pool per-device di DeviceTensor (vedi
+            // device_pool.hpp): questo buffer viene ri-allocato ad ogni
+            // singola chiamata a matmulBf16/linearBf16, con dimensioni
+            // che si ripetono identiche ad ogni step di un training
+            // loop — lo stesso ragionamento che ha motivato il pool per
+            // DeviceTensor si applica qui.
+            ptr_ = static_cast<__nv_bfloat16*>(devicePoolAcquire(count_ * sizeof(__nv_bfloat16)));
         }
     }
     ~DeviceBf16Buffer() {
         if (ptr_ != nullptr) {
-            cudaFree(ptr_);
+            devicePoolRelease(ptr_, count_ * sizeof(__nv_bfloat16));
         }
     }
     DeviceBf16Buffer(const DeviceBf16Buffer&) = delete;
@@ -50,7 +57,7 @@ public:
     DeviceBf16Buffer& operator=(DeviceBf16Buffer&& other) noexcept {
         if (this != &other) {
             if (ptr_ != nullptr) {
-                cudaFree(ptr_);
+                devicePoolRelease(ptr_, count_ * sizeof(__nv_bfloat16));
             }
             ptr_ = other.ptr_;
             count_ = other.count_;

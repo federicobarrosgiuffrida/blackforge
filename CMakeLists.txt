@@ -136,6 +136,7 @@ set(
 if(BLACKFORGE_ENABLE_CUDA)
     list(
         APPEND BLACKFORGE_CORE_SOURCES
+        src/backend/cuda/device_pool.cu
         src/backend/cuda/device_tensor.cu
         src/backend/cuda/ops_elementwise.cu
         src/backend/cuda/ops_gemm.cu
