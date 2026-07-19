@@ -1,4 +1,5 @@
 #include <stdexcept>
+#include <unordered_map>
 
 #include <cublas_v2.h>
 
@@ -32,20 +33,30 @@ __global__ void matmulTransposeBKernel(float* out, const float* a, const float* 
     out[idx] = sum;
 }
 
-// Un handle cuBLAS per processo, creato alla prima chiamata e mai
-// distrutto esplicitamente (il runtime CUDA lo libera all'uscita del
-// processo): crearne e distruggerne uno ad ogni singola matmul() e'
-// corretto ma non ottimale, un handle e' pensato per essere riusato.
-// Assunzione esplicita: nessun accesso concorrente da piu' thread
-// (l'intero progetto, CLI compresa, e' a singolo thread quando esegue
-// codice CUDA — nessun lock qui, ne servirebbe uno se cambiasse).
+// Un handle cuBLAS per DISPOSITIVO CUDA (non uno globale per processo:
+// un cublasHandle_t e' legato al contesto/device attivo al momento di
+// cublasCreate(), quindi riusarne uno creato per il device 0 mentre e'
+// attivo il device 1 e' undefined behaviour — essenziale per il
+// training multi-GPU, dove blackforge alterna il device attivo via
+// setActiveDevice() tra una replica e l'altra dello stesso processo).
+// Creato alla prima chiamata per ciascun device e mai distrutto
+// esplicitamente (il runtime CUDA libera ogni contesto all'uscita del
+// processo). Assunzione esplicita: nessun accesso concorrente da piu'
+// thread (l'intero progetto, CLI compresa, e' a singolo thread quando
+// esegue codice CUDA — nessun lock qui, ne servirebbe uno se
+// cambiasse).
 cublasHandle_t sharedHandle() {
-    static cublasHandle_t handle = [] {
-        cublasHandle_t h;
-        BLACKFORGE_CUBLAS_CHECK(cublasCreate(&h));
-        return h;
-    }();
-    return handle;
+    static std::unordered_map<int, cublasHandle_t> handles;
+    int device = 0;
+    BLACKFORGE_CUDA_CHECK(cudaGetDevice(&device));
+    auto it = handles.find(device);
+    if (it != handles.end()) {
+        return it->second;
+    }
+    cublasHandle_t h;
+    BLACKFORGE_CUBLAS_CHECK(cublasCreate(&h));
+    handles.emplace(device, h);
+    return h;
 }
 
 }  // namespace

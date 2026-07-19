@@ -2,6 +2,7 @@
 #include <cublasLt.h>
 
 #include <stdexcept>
+#include <unordered_map>
 
 #include "blackforge/backend/cuda/autodiff.hpp"
 #include "blackforge/backend/cuda/cuda_check.hpp"
@@ -76,16 +77,22 @@ DeviceBf16Buffer toBf16(const DeviceTensor& t) {
     return buffer;
 }
 
-// Un handle cuBLASLt per processo (stessa scelta di sharedHandle() in
-// ops_gemm.cu per il cuBLAS classico: crearne uno ad ogni chiamata e'
-// corretto ma non ottimale, un handle e' pensato per essere riusato).
+// Un handle cuBLASLt per DISPOSITIVO CUDA, stessa scelta e stesso
+// motivo di sharedHandle() in ops_gemm.cu per il cuBLAS classico
+// (essenziale per il training multi-GPU: un handle creato mentre e'
+// attivo un device non e' valido su un device diverso).
 cublasLtHandle_t sharedLtHandle() {
-    static cublasLtHandle_t handle = [] {
-        cublasLtHandle_t h;
-        BLACKFORGE_CUBLAS_CHECK(cublasLtCreate(&h));
-        return h;
-    }();
-    return handle;
+    static std::unordered_map<int, cublasLtHandle_t> handles;
+    int device = 0;
+    BLACKFORGE_CUDA_CHECK(cudaGetDevice(&device));
+    auto it = handles.find(device);
+    if (it != handles.end()) {
+        return it->second;
+    }
+    cublasLtHandle_t h;
+    BLACKFORGE_CUBLAS_CHECK(cublasLtCreate(&h));
+    handles.emplace(device, h);
+    return h;
 }
 
 // Esegue C[resultRows, resultCols] = op(A) @ op(B) in row-major, con A

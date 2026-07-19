@@ -33,6 +33,7 @@
 #include "blackforge/backend/cuda/device_query.hpp"
 #include "blackforge/backend/cuda/executor.hpp"
 #include "blackforge/backend/cuda/model.hpp"
+#include "blackforge/backend/cuda/multi_gpu_train_runner.hpp"
 #include "blackforge/backend/cuda/train_runner.hpp"
 #endif
 
@@ -67,9 +68,13 @@ void printUsage() {
               << "  --print-ir         Mostra la rappresentazione interna (IR) del programma (solo 'check')\n"
               << "  --batch N          Dimensione di batch usata per risolvere le dimensioni simboliche "
                  "dell'input (default 1)\n"
-              << "  --device cpu|cuda|cuda:N  Dispositivo su cui eseguire ('run'/'train'/'benchmark', default "
-                 "cpu). Su 'train', il backend CUDA supporta 'loss mse' e 'cross_entropy' ma non ancora 'lora' "
-                 "(errore esplicito se richiesto); checkpoint supportati su entrambi i device, stesso formato\n"
+              << "  --device cpu|cuda|cuda:N  Dispositivo su cui eseguire ('run'/'train'/'generate'/'benchmark', "
+                 "default cpu). Su 'train', il backend CUDA supporta 'loss mse' e 'cross_entropy' ma non ancora "
+                 "'lora' (errore esplicito se richiesto); checkpoint supportati su entrambi i device, stesso "
+                 "formato\n"
+              << "  --devices 0,1,...  Addestramento data-parallelo su piu' GPU CUDA (solo 'train', alternativo "
+                 "a '--device'; almeno 2 indici, 'batch_size' deve essere divisibile per il numero di GPU); "
+                 "all-reduce dei gradienti via staging host (NCCL non e' disponibile su Windows)\n"
               << "  --from-checkpoint <file>  Pesi da caricare: esecuzione con pesi allenati per 'run', "
                  "fine-tuning/LoRA per 'train' (LoRA solo CPU), obbligatorio per 'forecast' (solo CPU)\n"
               << "  --save-checkpoint <file>  Dove salvare i pesi al termine dell'addestramento (solo 'train')\n"
@@ -113,6 +118,45 @@ struct DeviceSpec {
     bool isCuda = false;
     int cudaIndex = 0;
 };
+
+// Analizza '--devices 0,1,2': un elenco di indici GPU separati da
+// virgola, per l'addestramento data-parallelo multi-GPU (vedi
+// blackforge::backend::cuda::runMultiGpuTraining). Restituisce false e
+// riempie 'error' se la stringa e' vuota, contiene un elemento non
+// numerico, o ha meno di 2 indici (per 1 sola GPU si usa '--device
+// cuda:N', non questo flag).
+bool parseDeviceList(const std::string& devicesList, std::vector<int>& outIndices, std::string& outError) {
+    outIndices.clear();
+    std::string current;
+    auto flush = [&](const std::string& token) -> bool {
+        if (token.empty() ||
+            !std::all_of(token.begin(), token.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+            outError = "indice GPU non valido in '--devices " + devicesList + "'";
+            return false;
+        }
+        outIndices.push_back(std::stoi(token));
+        return true;
+    };
+    for (char c : devicesList) {
+        if (c == ',') {
+            if (!flush(current)) {
+                return false;
+            }
+            current.clear();
+        } else {
+            current.push_back(c);
+        }
+    }
+    if (!flush(current)) {
+        return false;
+    }
+    if (outIndices.size() < 2) {
+        outError = "'--devices' richiede almeno 2 indici GPU separati da virgola (per 1 sola GPU usa '--device "
+                   "cuda:N')";
+        return false;
+    }
+    return true;
+}
 
 // Analizza '--device cpu' | 'cuda' | 'cuda:N'. Restituisce false e
 // riempie 'error' se la stringa non e' un dispositivo valido.
@@ -351,7 +395,45 @@ int runRun(const std::string& path, std::size_t batchSize, const std::string& de
 }
 
 int runTrain(const std::string& path, const std::string& fromCheckpoint, const std::string& saveCheckpointPath,
-             const std::string& device) {
+             const std::string& device, const std::string& devicesList) {
+    if (!devicesList.empty()) {
+        // '--devices' e' esclusivo di CUDA multi-GPU: non ha senso
+        // insieme a '--device cpu' (nessun training multi-CPU) ne'
+        // insieme a '--device cuda:N' (un solo indice, ambiguo con
+        // l'elenco di '--devices').
+        std::vector<int> deviceIndices;
+        std::string devicesError;
+        if (!parseDeviceList(devicesList, deviceIndices, devicesError)) {
+            std::cerr << "errore: " << devicesError << "\n";
+            return 2;
+        }
+        if (!BLACKFORGE_HAS_CUDA) {
+            std::cerr << "errore: '--devices' richiesto ma questa build di blackforge e' stata compilata senza "
+                         "supporto CUDA (BLACKFORGE_ENABLE_CUDA=OFF in fase di compilazione)\n";
+            return 1;
+        }
+
+        CompileOutput result = compile(path, /*verbose=*/false, /*printAst=*/false, /*printIr=*/false);
+        if (result.status == CompileStatus::FileNotFound) {
+            return 2;
+        }
+        if (result.status == CompileStatus::AnalysisFailed) {
+            std::cerr << path << ": impossibile addestrare, l'analisi ha trovato errori\n";
+            return 1;
+        }
+
+        try {
+#if BLACKFORGE_HAS_CUDA
+            blackforge::backend::cuda::runMultiGpuTraining(result.program, result.module, deviceIndices,
+                                                            fromCheckpoint, saveCheckpointPath, &std::cout);
+#endif
+        } catch (const std::exception& e) {
+            std::cerr << "errore di addestramento multi-GPU: " << e.what() << "\n";
+            return 1;
+        }
+        return 0;
+    }
+
     DeviceSpec spec;
     std::string deviceError;
     if (!parseDeviceSpec(device, spec, deviceError)) {
@@ -885,6 +967,7 @@ int main(int argc, char** argv) {
     bool printIr = false;
     std::size_t batchSize = 1;
     std::string device = "cpu";
+    std::string devicesList;
     std::string fromCheckpoint;
     std::string saveCheckpointPath;
     std::size_t warmupIterations = 5;
@@ -923,6 +1006,13 @@ int main(int argc, char** argv) {
                 return 2;
             }
             device = args[++i];
+        } else if (args[i] == "--devices") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--devices' richiede un elenco di indici GPU separati da virgola (es. "
+                             "'0,1')\n";
+                return 2;
+            }
+            devicesList = args[++i];
         } else if (args[i] == "--from-checkpoint") {
             if (i + 1 >= args.size()) {
                 std::cerr << "errore: '--from-checkpoint' richiede un percorso\n";
@@ -1034,7 +1124,7 @@ int main(int argc, char** argv) {
             std::cerr << "errore: comando 'train' richiede il percorso di un file .bf\n";
             return 2;
         }
-        return runTrain(positional.front(), fromCheckpoint, saveCheckpointPath, device);
+        return runTrain(positional.front(), fromCheckpoint, saveCheckpointPath, device, devicesList);
     }
     if (command == "forecast") {
         if (positional.empty()) {

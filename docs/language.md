@@ -926,6 +926,84 @@ viceversa) senza conversioni.
   del backend CPU (non Xavier/Kaiming), come per `Executor`/`Model`
   CPU.
 
+### Addestramento multi-GPU (`blackforge train --devices 0,1,...`)
+
+Per un LLM di dimensioni realistiche, una singola GPU non basta:
+`blackforge train` supporta l'addestramento **data-parallelo** su più
+GPU dello stesso processo con il flag `--devices` (alternativo a
+`--device`, esclusivo di CUDA):
+
+```bash
+blackforge train modello.bf --devices 0,1 --save-checkpoint pesi.bfckpt
+```
+
+**Come funziona**: una replica completa del modello per ogni indice in
+`--devices` (stesso seme di inizializzazione, quindi pesi iniziali
+identici su ogni GPU). Ad ogni step, `batch_size` viene diviso in
+altrettanti shard disgiunti di uguale dimensione — un requisito
+esplicito: `batch_size` deve essere divisibile per il numero di GPU,
+altrimenti `blackforge train` fallisce con un errore chiaro invece di
+approssimare con shard sbilanciati. Ogni replica calcola forward e
+backward **indipendentemente** sul proprio shard e sulla propria GPU;
+poi il gradiente di ogni parametro viene **mediato tra tutte le
+repliche** (ALL-REDUCE) prima dello step dell'optimizer, cosicché ogni
+replica applichi esattamente lo stesso aggiornamento e resti
+sincronizzata con le altre — matematicamente equivalente ad allenare
+con l'intero batch su una singola GPU (perché ogni operazione del
+modello, `linear`/`rmsnorm`/`softmax`/`attention`/..., agisce
+per-esempio, senza alcuna dipendenza incrociata dentro il batch), non
+un'approssimazione. Solo la replica 0 viene salvata su checkpoint
+(tutte restano sincronizzate per costruzione).
+
+**Strategia di all-reduce — staging via host, non NCCL.** NCCL (la
+libreria standard NVIDIA per la comunicazione collettiva tra GPU) non
+supporta nativamente Windows, dove questo progetto viene sviluppato e
+testato. L'all-reduce è quindi implementato copiando il gradiente di
+ogni parametro dalla GPU alla RAM (una copia per replica), sommandolo e
+mediandolo sulla CPU, e ricopiandolo su ciascuna GPU. È più lento di un
+all-reduce diretto GPU-to-GPU (P2P/NVLink) o di NCCL, ma **funziona su
+qualunque combinazione di GPU**, senza richiedere che supportino il
+peer access (NVLink o lo stesso switch PCIe) — rilevante per GPU
+affittate su cloud, dove il collegamento fisico tra le schede non è
+garantito. Una scelta esplicita di correttezza e portabilità prima
+delle prestazioni, coerente con il resto del progetto.
+
+**Un bug genuino trovato e corretto lungo il percorso**: `cublasHandle_t`
+e `cublasLtHandle_t` sono legati al contesto/device CUDA attivo al
+momento della creazione — riusarne uno creato per il device 0 mentre è
+attivo il device 1 è undefined behaviour. Prima di questa milestone,
+`ops_gemm.cu`/`ops_tensorcore.cu` mantenevano un **singolo handle per
+processo** (corretto per una sola GPU, ma silenziosamente sbagliato non
+appena si alterna il device attivo tra repliche). Corretto con una
+mappa `device -> handle`, un handle creato pigramente per ciascun
+device incontrato (vedi `sharedHandle()`/`sharedLtHandle()`).
+
+**Verificato per correttezza, non su hardware multi-GPU reale**: questa
+è l'unica milestone di questo progetto per cui manca ancora la verifica
+finale su hardware fisicamente multi-GPU — la macchina di sviluppo ha
+una sola GPU (RTX 5060). Per rendere comunque possibile una
+verifica rigorosa, `runMultiGpuTraining` permette deliberatamente indici
+**ripetuti** in `--devices` (es. `{0, 0}`): due o più repliche sullo
+stesso hardware fisico non offrono alcun vantaggio di velocità, ma
+esercitano per intero la logica di sharding/all-reduce/sincronizzazione
+dell'optimizer su una singola GPU disponibile. Con questo caso limite,
+`CudaMultiGpuTrainRunnerTest.ProduceUnaLossFinaleEquivalenteAllaVersioneSingolaGpu`
+e `CudaMultiGpuTrainRunnerTest.ParitaConPiuBatchPerEpocaEPiuEpoche`
+verificano che l'addestramento a 2 repliche produca, epoca per epoca,
+la stessa identica traiettoria di loss di un addestramento a singola
+GPU sull'intero batch (entro la tolleranza numerica attesa da un
+diverso ordine di somma in virgola mobile) — anche con più batch per
+epoca e centinaia di step di ottimizzazione. La logica è quindi
+verificata; la parallelizzazione reale su hardware fisicamente distinto
+resta da confermare quando sarà disponibile (RTX PRO 4500/RTX PRO 6000
+Blackwell pianificate).
+
+**Limitazioni esplicite**: stesse limitazioni di `--device cuda` (niente
+`lora`); `--devices` richiede almeno 2 indici (per una singola GPU si
+usa `--device cuda:N`); nessun supporto multi-GPU per `run`/`generate`/
+`forecast`/`benchmark` (solo `train`, dove il parallelismo dei dati ha
+senso).
+
 ### Shuffling e learning rate scheduler
 
 Ad ogni epoca, `blackforge train` rimescola l'ordine degli esempi del

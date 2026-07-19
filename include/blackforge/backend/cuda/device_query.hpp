@@ -25,9 +25,11 @@ std::vector<CudaDeviceInfo> enumerateDevices();
 // Executor) vengono eseguiti su questo indice. Lancia
 // std::runtime_error se l'indice non e' valido. Permette a
 // 'blackforge run/benchmark --device cuda:N' di scegliere la GPU
-// quando ne sono presenti piu' di una (nessun'altra forma di
-// multi-GPU e' supportata: non e' possibile eseguire su piu' GPU
-// contemporaneamente).
+// quando ne sono presenti piu' di una. E' anche il meccanismo con cui
+// blackforge::backend::cuda::runMultiGpuTraining alterna il device
+// attivo tra una replica del modello e l'altra dello stesso processo
+// (vedi multi_gpu_train_runner.hpp) per il training data-parallelo su
+// piu' GPU.
 void setActiveDevice(int index);
 
 }  // namespace blackforge::backend::cuda

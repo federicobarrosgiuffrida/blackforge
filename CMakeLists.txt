@@ -149,6 +149,7 @@ if(BLACKFORGE_ENABLE_CUDA)
         src/backend/cuda/checkpoint.cu
         src/backend/cuda/optimizer.cu
         src/backend/cuda/train_runner.cu
+        src/backend/cuda/multi_gpu_train_runner.cu
     )
 endif()
 
