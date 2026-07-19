@@ -1,5 +1,8 @@
 #include "blackforge/backend/cuda/model.hpp"
 
+#include <algorithm>
+#include <cmath>
+
 #include <gtest/gtest.h>
 
 #include "blackforge/backend/cpu/loss.hpp"
@@ -229,6 +232,90 @@ TEST(CudaModelTest, TrainingLoopRiduceLaLossConAdamW) {
         "}\n");
 
     cuda::Model model(module.models.front());
+    Tensor input({4, 4}, {
+                             1.0F, 0.0F, 0.0F, 0.0F,
+                             0.0F, 1.0F, 0.0F, 0.0F,
+                             0.0F, 0.0F, 1.0F, 0.0F,
+                             0.0F, 0.0F, 0.0F, 1.0F,
+                         });
+    Tensor target({4, 2}, {
+                              1.0F, 0.0F,
+                              0.0F, 1.0F,
+                              1.0F, 1.0F,
+                              0.0F, 0.0F,
+                          });
+    cuda::DeviceTensor inputDevice = cuda::DeviceTensor::fromHost(input);
+    cuda::DeviceTensor targetDevice = cuda::DeviceTensor::fromHost(target);
+
+    cuda::AdamW optimizer(/*learningRate=*/0.1F);
+
+    float firstLoss = 0.0F;
+    float lastLoss = 0.0F;
+    for (int step = 0; step < 200; ++step) {
+        model.zeroGrad();
+        cuda::DeviceTensor output = model.forward(inputDevice);
+        cuda::LossResult loss = cuda::meanSquaredError(output, targetDevice);
+        if (step == 0) {
+            firstLoss = loss.value;
+        }
+        lastLoss = loss.value;
+        model.backward(loss.grad);
+        optimizer.step(model.parameters());
+    }
+
+    EXPECT_LT(lastLoss, firstLoss * 0.1F);
+}
+
+// --- Tensor Core BF16 reale (precision { compute bf16 }) ---
+
+TEST(CudaModelTest, ForwardConPrecisionBf16CorrispondeApprossimativamenteAllaVersioneFp32) {
+    ir::Module fp32Module = buildModule(
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(3) |> silu |> linear(2)\n"
+        "}\n");
+    ir::Module bf16Module = buildModule(
+        "precision {\n"
+        "    compute bf16\n"
+        "}\n"
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(3) |> silu |> linear(2)\n"
+        "}\n");
+    ASSERT_TRUE(bf16Module.precision.has_value());
+    ASSERT_EQ(bf16Module.precision->compute, sema::DType::BF16);
+
+    cuda::Model fp32Model(fp32Module.models.front(), /*seed=*/7);
+    cuda::Model bf16Model(bf16Module.models.front(), /*seed=*/7, bf16Module.precision);
+
+    Tensor input({2, 4}, {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.1F, 0.2F, -0.3F});
+    Tensor fp32Out = fp32Model.forward(cuda::DeviceTensor::fromHost(input)).toHost();
+    Tensor bf16Out = bf16Model.forward(cuda::DeviceTensor::fromHost(input)).toHost();
+
+    ASSERT_EQ(fp32Out.elementCount(), bf16Out.elementCount());
+    for (std::size_t i = 0; i < fp32Out.elementCount(); ++i) {
+        float tolerance = std::max(0.05F, std::abs(fp32Out.at(i)) * 0.1F);
+        EXPECT_NEAR(bf16Out.at(i), fp32Out.at(i), tolerance) << "indice " << i;
+    }
+}
+
+TEST(CudaModelTest, TrainingLoopConPrecisionBf16RiduceLaLoss) {
+    // Prova che il percorso Tensor Core sia genuinamente allenabile
+    // (forward E backward via matmulBf16/matmulBf16Backward), non solo
+    // utilizzabile per l'inferenza: un ciclo di addestramento completo
+    // con 'precision { compute bf16 }' deve far scendere la loss quasi
+    // quanto la controparte FP32 (non esattamente, per via
+    // dell'arrotondamento BF16 nel prodotto matriciale).
+    ir::Module module = buildModule(
+        "precision {\n"
+        "    compute bf16\n"
+        "}\n"
+        "model M {\n"
+        "    input bf16[batch, 4]\n"
+        "    input |> linear(2)\n"
+        "}\n");
+
+    cuda::Model model(module.models.front(), /*seed=*/42, module.precision);
     Tensor input({4, 4}, {
                              1.0F, 0.0F, 0.0F, 0.0F,
                              0.0F, 1.0F, 0.0F, 0.0F,

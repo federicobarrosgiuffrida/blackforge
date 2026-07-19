@@ -306,17 +306,23 @@ int runRun(const std::string& path, std::size_t batchSize, const std::string& de
             if (fromCheckpoint.empty()) {
                 output = executor.run(model, input);
             } else {
-                blackforge::backend::cuda::Model loadedModel(model);
+                blackforge::backend::cuda::Model loadedModel(model, /*seed=*/42, result.module.precision);
                 blackforge::backend::cuda::loadCheckpoint(loadedModel, fromCheckpoint);
                 std::cout << "Pesi caricati da '" << fromCheckpoint << "'\n";
                 blackforge::backend::cuda::DeviceTensor inputDevice =
                     blackforge::backend::cuda::DeviceTensor::fromHost(input);
                 output = loadedModel.forward(inputDevice).toHost();
             }
-            if (result.module.precision.has_value()) {
-                std::cout << "nota: un blocco 'precision' e' dichiarato, ma il backend CUDA non applica ancora "
-                             "la quantizzazione simulata (solo il backend CPU lo fa per ora): l'esecuzione "
-                             "sulla GPU e' in piena precisione float32.\n";
+            if (result.module.precision.has_value() &&
+                result.module.precision->compute == blackforge::sema::DType::BF16 && !fromCheckpoint.empty()) {
+                std::cout << "nota: 'precision { compute bf16 }' su GPU usa Tensor Core BF16 reali per ogni "
+                             "layer 'linear' (non quantizzazione simulata); 'storage'/'accumulate' restano "
+                             "ignorati (sempre float32).\n";
+            } else if (result.module.precision.has_value()) {
+                std::cout << "nota: un blocco 'precision' e' dichiarato, ma il backend CUDA applica solo "
+                             "'compute bf16' (Tensor Core reale, solo con --from-checkpoint) — "
+                             "'storage'/'accumulate' e qualunque altro 'compute' restano ignorati (sempre "
+                             "float32 su GPU).\n";
             }
 #endif
         }

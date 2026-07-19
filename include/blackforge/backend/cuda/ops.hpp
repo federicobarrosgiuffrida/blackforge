@@ -23,6 +23,19 @@ DeviceTensor matmul(const DeviceTensor& a, const DeviceTensor& b);
 // stessa scelta di correttezza-prima-che-prestazioni di matmulBackward.
 DeviceTensor matmulTransposeB(const DeviceTensor& a, const DeviceTensor& b);
 
+// Prodotto matriciale 2D via cuBLASLt su Tensor Core: [M, K] x [K, N]
+// -> [M, N]. A differenza di matmul() (SGEMM, calcolo interamente in
+// float32 su CUDA core), qui gli operandi vengono convertiti in BF16
+// prima del prodotto (Tensor Core reale, non simulato: throughput
+// significativamente maggiore su hardware Blackwell/Hopper/Ampere),
+// con accumulo e uscita in float32 (lo schema "mixed precision"
+// standard usato per l'addestramento di modelli linguistici — BF16 ha
+// lo stesso range di esponente di FP32, quindi a differenza di FP16
+// non serve loss scaling per evitare overflow/underflow). L'input
+// resta float32 (stesso contratto di ogni altra funzione di questo
+// modulo): la conversione a BF16 e' un dettaglio interno.
+DeviceTensor matmulBf16(const DeviceTensor& a, const DeviceTensor& b);
+
 DeviceTensor silu(const DeviceTensor& input);
 DeviceTensor relu(const DeviceTensor& input);
 DeviceTensor gelu(const DeviceTensor& input);
@@ -70,5 +83,11 @@ DeviceTensor selfAttention(const DeviceTensor& input, const DeviceTensor& wq, co
 // rango >= 2 (vedi DeviceTensor::reshaped): per rango > 2 appiattisce
 // temporaneamente a [rows, inFeatures] prima del prodotto matriciale.
 DeviceTensor linear(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias);
+
+// Come linear(), ma il prodotto matriciale usa matmulBf16() (Tensor
+// Core reale) invece di matmul() (SGEMM float32): stessa generalizzazione
+// a rango >= 2, stesso bias in float32 pieno (solo il prodotto matriciale
+// passa per il Tensor Core, non l'addizione del bias).
+DeviceTensor linearBf16(const DeviceTensor& input, const DeviceTensor& weight, const DeviceTensor& bias);
 
 }  // namespace blackforge::backend::cuda

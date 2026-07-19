@@ -1,5 +1,8 @@
 #include "blackforge/backend/cuda/ops.hpp"
 
+#include <algorithm>
+#include <cmath>
+
 #include <gtest/gtest.h>
 
 #include "blackforge/backend/cpu/ops.hpp"
@@ -77,6 +80,54 @@ TEST(CudaOpsTest, MatmulNonQuadratoCorrispondeAllaVersioneCpu) {
     for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
         EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-3F) << "indice " << i;
     }
+}
+
+TEST(CudaOpsTest, MatmulBf16CalcolaIlProdottoCorretto) {
+    // Stessi valori interi esatti di MatmulCalcolaIlProdottoCorretto:
+    // interi piccoli sono rappresentabili esattamente in BF16 (7 bit di
+    // mantissa bastano per interi fino a 256), quindi il risultato deve
+    // coincidere esattamente con quello FP32, non solo approssimativamente
+    // — verifica che la conversione FP32->BF16 e la geometria del
+    // prodotto (trasposizioni, layout riga-maggiore) siano corrette,
+    // isolando l'errore di arrotondamento BF16 come variabile.
+    Tensor a({2, 2}, {1.0F, 2.0F, 3.0F, 4.0F});
+    Tensor b({2, 2}, {5.0F, 6.0F, 7.0F, 8.0F});
+
+    Tensor result = cuda::matmulBf16(cuda::DeviceTensor::fromHost(a), cuda::DeviceTensor::fromHost(b)).toHost();
+
+    ASSERT_EQ(result.shape(), (std::vector<std::size_t>{2, 2}));
+    EXPECT_NEAR(result.at(0), 19.0F, 1e-3F);  // 1*5 + 2*7
+    EXPECT_NEAR(result.at(1), 22.0F, 1e-3F);  // 1*6 + 2*8
+    EXPECT_NEAR(result.at(2), 43.0F, 1e-3F);  // 3*5 + 4*7
+    EXPECT_NEAR(result.at(3), 50.0F, 1e-3F);  // 3*6 + 4*8
+}
+
+TEST(CudaOpsTest, MatmulBf16CorrispondeApprossimativamenteAMatmulFp32) {
+    // [3,4] x [4,2] -> [3,2], stessa forma non quadrata di
+    // MatmulNonQuadratoCorrispondeAllaVersioneCpu: la tolleranza qui e'
+    // deliberatamente piu' larga (BF16 ha solo ~2-3 cifre decimali
+    // significative, a differenza di FP32) — non ci si aspetta un
+    // risultato identico, solo vicino, ed e' precisamente questo il
+    // trade-off documentato di usare i Tensor Core.
+    Tensor a({3, 4}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, 9.0F, 10.0F, 11.0F, 12.0F});
+    Tensor b({4, 2}, {0.5F, -0.5F, 1.0F, 2.0F, -1.0F, 0.0F, 3.0F, 1.0F});
+
+    Tensor fp32Result = cuda::matmul(cuda::DeviceTensor::fromHost(a), cuda::DeviceTensor::fromHost(b)).toHost();
+    Tensor bf16Result = cuda::matmulBf16(cuda::DeviceTensor::fromHost(a), cuda::DeviceTensor::fromHost(b)).toHost();
+
+    ASSERT_EQ(bf16Result.shape(), fp32Result.shape());
+    for (std::size_t i = 0; i < fp32Result.elementCount(); ++i) {
+        float tolerance = std::max(0.1F, std::abs(fp32Result.at(i)) * 0.05F);
+        EXPECT_NEAR(bf16Result.at(i), fp32Result.at(i), tolerance) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, MatmulBf16LanciaSuFormeIncompatibili) {
+    Tensor a({2, 3}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F});
+    Tensor b({4, 2}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F});
+    EXPECT_THROW(
+        (void)cuda::matmulBf16(cuda::DeviceTensor::fromHost(a), cuda::DeviceTensor::fromHost(b)),
+        std::invalid_argument);
 }
 
 TEST(CudaOpsTest, LinearCorrispondeAllaVersioneCpu) {

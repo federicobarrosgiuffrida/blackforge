@@ -21,6 +21,12 @@ struct MatmulGrad {
 // matmul: C = A @ B, A:[M,K], B:[K,N], C:[M,N].
 MatmulGrad matmulBackward(const DeviceTensor& a, const DeviceTensor& b, const DeviceTensor& gradOutput);
 
+// Backward di matmulBf16 (vedi ops.hpp): stessa formula analitica di
+// matmulBackward (dA = gradOutput @ B^T, dB = A^T @ gradOutput), ma
+// entrambi i prodotti eseguiti via Tensor Core BF16 invece che SGEMM
+// float32 — coerente con l'uso di matmulBf16 nel forward corrispondente.
+MatmulGrad matmulBf16Backward(const DeviceTensor& a, const DeviceTensor& b, const DeviceTensor& gradOutput);
+
 struct MatmulTransposeBGrad {
     DeviceTensor dA;
     DeviceTensor dB;

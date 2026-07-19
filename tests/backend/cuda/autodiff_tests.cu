@@ -1,5 +1,7 @@
 #include "blackforge/backend/cuda/autodiff.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <functional>
 #include <stdexcept>
 
@@ -58,6 +60,80 @@ TEST(CudaAutodiffTest, MatmulBackwardCorrispondeAllaVersioneCpu) {
     for (std::size_t i = 0; i < cpuGrad.dB.elementCount(); ++i) {
         EXPECT_NEAR(gpuDB.at(i), cpuGrad.dB.at(i), 1e-4F) << "dB indice " << i;
     }
+}
+
+TEST(CudaAutodiffTest, MatmulBf16BackwardCorrispondeApprossimativamenteAMatmulBackwardFp32) {
+    // Stessa formula analitica di matmulBackward (dA = gradOutput @ B^T,
+    // dB = A^T @ gradOutput), ma via Tensor Core BF16: tolleranza
+    // deliberatamente piu' larga della controparte FP32 (vedi il
+    // commento equivalente in ops_tests.cu/MatmulBf16Corrisponde...).
+    Tensor a({3, 4}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, 9.0F, 10.0F, 11.0F, 12.0F});
+    Tensor b({4, 2}, {0.5F, -0.5F, 1.0F, 2.0F, -1.0F, 0.0F, 3.0F, 1.0F});
+    Tensor gradOutput({3, 2}, {1.0F, -0.5F, 0.5F, 2.0F, -1.0F, 0.3F});
+
+    cuda::MatmulGrad fp32Grad = cuda::matmulBackward(cuda::DeviceTensor::fromHost(a), cuda::DeviceTensor::fromHost(b),
+                                                       cuda::DeviceTensor::fromHost(gradOutput));
+    cuda::MatmulGrad bf16Grad = cuda::matmulBf16Backward(
+        cuda::DeviceTensor::fromHost(a), cuda::DeviceTensor::fromHost(b), cuda::DeviceTensor::fromHost(gradOutput));
+
+    Tensor fp32DA = fp32Grad.dA.toHost();
+    Tensor bf16DA = bf16Grad.dA.toHost();
+    Tensor fp32DB = fp32Grad.dB.toHost();
+    Tensor bf16DB = bf16Grad.dB.toHost();
+
+    for (std::size_t i = 0; i < fp32DA.elementCount(); ++i) {
+        float tolerance = std::max(0.1F, std::abs(fp32DA.at(i)) * 0.05F);
+        EXPECT_NEAR(bf16DA.at(i), fp32DA.at(i), tolerance) << "dA indice " << i;
+    }
+    for (std::size_t i = 0; i < fp32DB.elementCount(); ++i) {
+        float tolerance = std::max(0.1F, std::abs(fp32DB.at(i)) * 0.05F);
+        EXPECT_NEAR(bf16DB.at(i), fp32DB.at(i), tolerance) << "dB indice " << i;
+    }
+}
+
+TEST(CudaAutodiffTest, MatmulBf16BackwardCorrispondeAllaDerivataNumerica) {
+    // Gradient check numerico diretto (non solo confronto con la
+    // versione FP32): usa matmulBf16 stesso come funzione forward per
+    // la derivata numerica, cosi' la formula di backward viene
+    // verificata contro la stessa funzione a cui si applica davvero,
+    // non contro un proxy FP32.
+    //
+    // eps deliberatamente molto piu' grande del default (1e-3): l'input
+    // perturbato viene convertito in BF16 PRIMA del prodotto (7 bit di
+    // mantissa, passo di quantizzazione ~0.3*2^-7 =~ 0.0023 per valori
+    // dell'ordine di 0.3), quindi una perturbazione piu' piccola del
+    // passo di quantizzazione puo' venire riassorbita dall'arrotondamento
+    // e produrre una derivata numerica che misura solo rumore di
+    // quantizzazione, non il vero gradiente. matmul() e' lineare in
+    // ciascun operando, quindi un eps piu' grande non introduce errore
+    // di curvatura (a differenza di una funzione non lineare) — qui
+    // serve solo a superare il "gradino" di quantizzazione BF16.
+    Tensor a({2, 3}, {0.3F, -0.6F, 0.2F, -0.4F, 0.5F, 0.1F});
+    Tensor b({3, 2}, {0.2F, -0.1F, 0.4F, 0.1F, -0.3F, 0.2F});
+    Tensor gradOutput({2, 2}, {1.0F, -0.5F, 0.3F, 0.7F});
+
+    cuda::MatmulGrad analytic = cuda::matmulBf16Backward(
+        cuda::DeviceTensor::fromHost(a), cuda::DeviceTensor::fromHost(b), cuda::DeviceTensor::fromHost(gradOutput));
+    Tensor analyticDA = analytic.dA.toHost();
+
+    auto fA = [&](const Tensor& aVar) {
+        Tensor out = cuda::matmulBf16(cuda::DeviceTensor::fromHost(aVar), cuda::DeviceTensor::fromHost(b)).toHost();
+        return dot(out, gradOutput);
+    };
+    for (std::size_t i = 0; i < a.elementCount(); ++i) {
+        float numeric = numericalDerivative(fA, a, i, /*eps=*/0.1F);
+        float tolerance = std::max(0.1F, std::abs(numeric) * 0.1F);
+        EXPECT_NEAR(analyticDA.at(i), numeric, tolerance) << "dA indice " << i;
+    }
+}
+
+TEST(CudaAutodiffTest, MatmulBf16BackwardLanciaSuFormeIncompatibili) {
+    Tensor a({2, 3}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F});
+    Tensor b({4, 2}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F});
+    Tensor gradOutput({2, 2}, {1.0F, 2.0F, 3.0F, 4.0F});
+    EXPECT_THROW((void)cuda::matmulBf16Backward(cuda::DeviceTensor::fromHost(a), cuda::DeviceTensor::fromHost(b),
+                                                 cuda::DeviceTensor::fromHost(gradOutput)),
+                 std::invalid_argument);
 }
 
 TEST(CudaAutodiffTest, MatmulBackwardNonQuadratoCorrispondeAllaDerivataNumerica) {

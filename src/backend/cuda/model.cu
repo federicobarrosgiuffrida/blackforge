@@ -74,7 +74,8 @@ DeviceTensor flatten2D(const DeviceTensor& t) {
 
 }  // namespace
 
-Model::Model(const ir::ModelIR& modelIR, unsigned int seed) : name_(modelIR.name) {
+Model::Model(const ir::ModelIR& modelIR, unsigned int seed, std::optional<ir::PrecisionPolicy> precision)
+    : name_(modelIR.name), useTensorCoreLinear_(precision.has_value() && precision->compute == sema::DType::BF16) {
     if (modelIR.pipelines.empty()) {
         throw std::invalid_argument("cuda::Model: il modello '" + modelIR.name + "' non ha pipeline da addestrare");
     }
@@ -182,7 +183,10 @@ DeviceTensor Model::forward(const DeviceTensor& input) {
         layer.cachedInput = current.clone();
 
         switch (layer.kind) {
-            case ir::OpKind::Linear: current = linear(current, layer.weight->value, layer.bias->value); break;
+            case ir::OpKind::Linear:
+                current = useTensorCoreLinear_ ? linearBf16(current, layer.weight->value, layer.bias->value)
+                                                : linear(current, layer.weight->value, layer.bias->value);
+                break;
             case ir::OpKind::Silu: current = silu(current); break;
             case ir::OpKind::Relu: current = relu(current); break;
             case ir::OpKind::Gelu: current = gelu(current); break;
@@ -216,7 +220,10 @@ void Model::backward(const DeviceTensor& outputGrad) {
             case ir::OpKind::Linear: {
                 AddBiasGrad addGrad = addBiasBackward(gradCurrent);
                 MatmulGrad matGrad =
-                    matmulBackward(flatten2D(layer.cachedInput), layer.weight->value, flatten2D(addGrad.dInput));
+                    useTensorCoreLinear_
+                        ? matmulBf16Backward(flatten2D(layer.cachedInput), layer.weight->value,
+                                             flatten2D(addGrad.dInput))
+                        : matmulBackward(flatten2D(layer.cachedInput), layer.weight->value, flatten2D(addGrad.dInput));
 
                 accumulate(layer.weight->grad, matGrad.dB);
                 accumulate(layer.bias->grad, addGrad.dBias);

@@ -99,7 +99,7 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
 
     data::Dataset dataset = data::loadDataset(pathField->path);
 
-    Model model(*modelIR);
+    Model model(*modelIR, /*seed=*/42, module.precision);
 
     std::function<LossResult(const DeviceTensor&, const DeviceTensor&)> lossFn;
     if (lossField->name == "cross_entropy") {

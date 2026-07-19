@@ -461,13 +461,58 @@ nei test confrontando il risultato con il backend CPU su matrici non
 quadrate (dove uno scambio errato di `m`/`n` produrrebbe una forma o
 dei valori visibilmente sbagliati).
 
-### Limitazioni esplicite
+### Tensor Core BF16 reale (`precision { compute bf16 }`)
 
-- Come il backend CPU, calcola sempre in **float32**: nessun uso reale
-  di FP8/BF16/TF32 come precisione di calcolo, nessun uso dei Tensor
-  Core. Il linguaggio riconosce e valida questi formati, ma
-  l'esecuzione GPU non li sfrutta ancora — è il prossimo passo naturale
-  per un backend Blackwell.
+A differenza della quantizzazione simulata del backend CPU (che
+arrotonda un valore già calcolato in float32, quindi non è
+differenziabile e resta solo-inferenza), `compute bf16` su
+`--device cuda` usa **Tensor Core BF16 reali** via **cuBLASLt**
+(`matmulBf16`/`matmulBf16Backward`, `src/backend/cuda/ops_tensorcore.cu`):
+gli operandi vengono convertiti in BF16 prima del prodotto matriciale,
+con accumulo e uscita in float32 (lo schema "mixed precision" standard
+usato per l'addestramento di modelli linguistici — BF16 ha lo stesso
+range di esponente di FP32, quindi a differenza di FP16 non serve loss
+scaling per evitare overflow/underflow). Il backward differenzia
+esattamente l'operazione BF16 che il forward ha davvero eseguito (non
+un proxy FP32 arrotondato dopo il fatto), quindi è **genuinamente
+allenabile**, non solo utilizzabile per l'inferenza:
+
+```blackforge
+precision {
+    compute bf16
+}
+
+model TinyLM {
+    input bf16[batch, 8]
+    input |> embedding(300, 16) |> positional_embedding(8) |> attention(2) |> feedforward(32) |> linear(300)
+}
+```
+
+`cuda::Model` applica Tensor Core BF16 a ogni layer **`linear`** della
+pipeline (sia in `forward()` sia in `backward()`), sia per `blackforge
+train --device cuda` sia per `blackforge run --device cuda
+--from-checkpoint`. Verificato con gradient checking numerico
+(`CudaAutodiffTest.MatmulBf16Backward...`), confronto diretto con la
+controparte FP32 e un training loop end-to-end sull'intera pipeline di
+un modello linguistico (stessa traiettoria di loss della versione
+FP32).
+
+Limitazioni esplicite di questa prima versione:
+
+- Si applica solo a `linear`: le proiezioni Q/K/V/Out interne ad
+  `attention` e i due layer interni a `feedforward` calcolano ancora in
+  float32 pieno (SGEMM). Estendere Tensor Core BF16 anche lì è lavoro
+  futuro.
+- Solo **BF16**: `FP8` (e4m3/e5m2) richiederebbe fattori di scala per
+  vivere nel suo range dinamico molto più limitato (tipico
+  dell'addestramento a bassa precisione reale, es. Transformer Engine
+  di NVIDIA) — un sotto-progetto sostanzialmente più complesso di BF16,
+  non ancora affrontato. `TF32`/`FP16` restano solo quantizzazione
+  simulata (solo CPU, solo inferenza, vedi sopra).
+- `executor::Executor` (usato da `blackforge run` senza
+  `--from-checkpoint`, pesi casuali di sola ispezione) non applica
+  ancora Tensor Core: solo `Model` (pesi reali, allenabili o caricati
+  da checkpoint) lo fa.
 - Nessun supporto multi-GPU, stream CUDA o esecuzione asincrona ancora.
 - Testato solo per l'architettura configurata in
   `BLACKFORGE_CUDA_ARCHITECTURES` (120, Blackwell consumer); altre
