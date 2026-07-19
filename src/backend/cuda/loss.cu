@@ -1,5 +1,6 @@
 #include "blackforge/backend/cuda/loss.hpp"
 
+#include <cmath>
 #include <stdexcept>
 
 #include "blackforge/backend/cuda/cuda_check.hpp"
@@ -126,6 +127,70 @@ __global__ void softmaxCrossEntropyKernel(float* grad, float* rowLoss, const flo
     }
 }
 
+// Come softmaxCrossEntropyKernel, ma legge un solo indice di classe per
+// riga (gia' validato sull'host, vedi softmaxCrossEntropySparse) invece
+// di un target denso [righe, classi]: evita di materializzare mai un
+// target di dimensione proporzionale al vocabolario sul device.
+__global__ void softmaxCrossEntropySparseKernel(float* grad, float* rowLoss, const float* logits,
+                                                  const float* targetIndices, std::size_t rows,
+                                                  std::size_t numClasses) {
+    extern __shared__ float shared[];
+
+    std::size_t row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const float* rowLogits = logits + row * numClasses;
+    float* rowGrad = grad + row * numClasses;
+    auto targetClass = static_cast<std::size_t>(lroundf(targetIndices[row]));
+
+    float localMax = -INFINITY;
+    for (std::size_t c = threadIdx.x; c < numClasses; c += blockDim.x) {
+        localMax = fmaxf(localMax, rowLogits[c]);
+    }
+    shared[threadIdx.x] = localMax;
+    __syncthreads();
+    for (std::size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    __shared__ float rowMax;
+    if (threadIdx.x == 0) {
+        rowMax = shared[0];
+    }
+    __syncthreads();
+
+    float localSumExp = 0.0F;
+    for (std::size_t c = threadIdx.x; c < numClasses; c += blockDim.x) {
+        localSumExp += expf(rowLogits[c] - rowMax);
+    }
+    shared[threadIdx.x] = localSumExp;
+    __syncthreads();
+    for (std::size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    __shared__ float sumExp;
+    if (threadIdx.x == 0) {
+        sumExp = shared[0];
+    }
+    __syncthreads();
+
+    for (std::size_t c = threadIdx.x; c < numClasses; c += blockDim.x) {
+        float prob = expf(rowLogits[c] - rowMax) / sumExp;
+        float t = (c == targetClass) ? 1.0F : 0.0F;
+        rowGrad[c] = (prob - t) / static_cast<float>(rows);
+    }
+    if (threadIdx.x == 0) {
+        float targetProb = expf(rowLogits[targetClass] - rowMax) / sumExp;
+        rowLoss[row] = -logf(fmaxf(targetProb, 1e-12F));
+    }
+}
+
 }  // namespace
 
 LossResult meanSquaredError(const DeviceTensor& prediction, const DeviceTensor& target) {
@@ -173,6 +238,53 @@ LossResult softmaxCrossEntropy(const DeviceTensor& logits, const DeviceTensor& t
         std::size_t sharedBytes = kBlockSize * sizeof(float);
         softmaxCrossEntropyKernel<<<static_cast<int>(rows), kBlockSize, sharedBytes>>>(
             grad.data(), rowLoss.data(), logits.data(), target.data(), rows, numClasses);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+
+        DeviceTensor sumResult({1});
+        sumReduceKernel<<<1, kBlockSize, kBlockSize * sizeof(float)>>>(sumResult.data(), rowLoss.data(), rows);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+
+        float totalLoss = 0.0F;
+        BLACKFORGE_CUDA_CHECK(cudaMemcpy(&totalLoss, sumResult.data(), sizeof(float), cudaMemcpyDeviceToHost));
+        value = totalLoss / static_cast<float>(rows);
+    }
+
+    return LossResult{value, std::move(grad)};
+}
+
+LossResult softmaxCrossEntropySparse(const DeviceTensor& logits, const DeviceTensor& targetIndices) {
+    if (logits.rank() < 2) {
+        throw std::invalid_argument("softmaxCrossEntropySparse: richiede logits a rango >= 2 sul device");
+    }
+    std::size_t numClasses = logits.shape().back();
+    std::size_t rows = logits.elementCount() / numClasses;
+
+    if (targetIndices.elementCount() != rows) {
+        throw std::invalid_argument("softmaxCrossEntropySparse: targetIndices ha un numero di elementi "
+                                     "incompatibile con le righe di logits sul device");
+    }
+
+    // Un kernel CUDA non puo' lanciare eccezioni: la validazione del
+    // range degli indici avviene sull'host, prima del lancio (stessa
+    // scelta di embeddingLookup/embeddingLookupBackward).
+    if (rows > 0) {
+        runtime::Tensor hostIndices = targetIndices.toHost();
+        for (std::size_t i = 0; i < hostIndices.elementCount(); ++i) {
+            auto idx = static_cast<long long>(std::lround(hostIndices.at(i)));
+            if (idx < 0 || static_cast<std::size_t>(idx) >= numClasses) {
+                throw std::invalid_argument("softmaxCrossEntropySparse: indice di classe " + std::to_string(idx) +
+                                             " fuori da [0, " + std::to_string(numClasses) + ")");
+            }
+        }
+    }
+
+    DeviceTensor grad(logits.shape());
+    float value = 0.0F;
+    if (rows > 0 && numClasses > 0) {
+        DeviceTensor rowLoss({rows});
+        std::size_t sharedBytes = kBlockSize * sizeof(float);
+        softmaxCrossEntropySparseKernel<<<static_cast<int>(rows), kBlockSize, sharedBytes>>>(
+            grad.data(), rowLoss.data(), logits.data(), targetIndices.data(), rows, numClasses);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
 
         DeviceTensor sumResult({1});

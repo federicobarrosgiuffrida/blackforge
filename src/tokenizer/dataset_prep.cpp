@@ -15,27 +15,22 @@ std::size_t buildLanguageModelDataset(const Tokenizer& tok, const std::string& c
                                      std::to_string(seqLen + 1) + " (seqLen + 1) per una singola finestra");
     }
 
-    std::size_t vocabSize = tok.vocabSize();
     std::size_t numExamples = (ids.size() - 1) / seqLen;
 
     std::vector<float> inputs;
     std::vector<float> targets;
     inputs.reserve(numExamples * seqLen);
-    targets.reserve(numExamples * seqLen * vocabSize);
+    targets.reserve(numExamples * seqLen);
 
     for (std::size_t example = 0; example < numExamples; ++example) {
         std::size_t windowStart = example * seqLen;
         for (std::size_t s = 0; s < seqLen; ++s) {
             inputs.push_back(static_cast<float>(ids[windowStart + s]));
-
-            std::size_t nextToken = ids[windowStart + s + 1];
-            for (std::size_t c = 0; c < vocabSize; ++c) {
-                targets.push_back(c == nextToken ? 1.0F : 0.0F);
-            }
+            targets.push_back(static_cast<float>(ids[windowStart + s + 1]));
         }
     }
 
-    data::saveDataset(outputPath, {seqLen}, {seqLen, vocabSize}, inputs, targets, numExamples);
+    data::saveDataset(outputPath, {seqLen}, {seqLen}, inputs, targets, numExamples);
     return numExamples;
 }
 

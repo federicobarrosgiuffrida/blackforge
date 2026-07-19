@@ -31,4 +31,19 @@ LossResult meanSquaredError(const runtime::Tensor& prediction, const runtime::Te
 // coincidono o se non sono a rango >= 2.
 LossResult softmaxCrossEntropy(const runtime::Tensor& logits, const runtime::Tensor& target);
 
+// Variante sparsa di softmaxCrossEntropy: 'targetIndices' ha rango
+// logits.rank() - 1 (la stessa forma di 'logits' senza l'ultima
+// dimensione) e contiene, per ogni riga, l'INDICE della classe
+// corretta (un intero non negativo rappresentato come float,
+// arrotondato con std::lround — la stessa convenzione degli id di
+// token altrove) invece di un vettore one-hot denso. Matematicamente
+// identica a softmaxCrossEntropy() con un target one-hot equivalente
+// (stessa loss, stesso gradiente), ma senza mai materializzare un
+// target di dimensione [..., classi]: essenziale quando 'classi' e' un
+// vocabolario grande (next-token-prediction di un modello linguistico),
+// dove un target denso sprecherebbe memoria proporzionale al
+// vocabolario. Lancia std::invalid_argument se le forme non
+// corrispondono o se un indice e' fuori da [0, classi).
+LossResult softmaxCrossEntropySparse(const runtime::Tensor& logits, const runtime::Tensor& targetIndices);
+
 }  // namespace blackforge::backend::cpu

@@ -64,9 +64,14 @@ bool isStorageField(ast::PrecisionFieldKind kind) {
 // al motore stesso. 'mse' e' pensata per la regressione (forecasting
 // incluso); 'cross_entropy' per la classificazione multiclasse (softmax
 // applicata internamente, target one-hot o soft della stessa forma
-// dell'uscita del modello, vedi loss.hpp).
+// dell'uscita del modello, vedi loss.hpp); 'cross_entropy_sparse' e'
+// matematicamente identica ma con un target di indici di classe invece
+// di un vettore one-hot denso (una dimensione in meno rispetto
+// all'uscita del modello) — essenziale per vocabolari grandi, dove il
+// target denso sprecherebbe memoria proporzionale al vocabolario (vedi
+// backend::cpu::softmaxCrossEntropySparse).
 const std::unordered_set<std::string>& knownLossNames() {
-    static const std::unordered_set<std::string> names = {"mse", "cross_entropy"};
+    static const std::unordered_set<std::string> names = {"mse", "cross_entropy", "cross_entropy_sparse"};
     return names;
 }
 
@@ -360,7 +365,8 @@ void SemanticAnalyzer::analyzeTrain(const ast::TrainDecl& decl) {
                     if (knownLossNames().find(node.name) == knownLossNames().end()) {
                         diagnostics_.addError(
                             node.location,
-                            "loss sconosciuta '" + node.name + "'. Loss supportate: mse, cross_entropy");
+                            "loss sconosciuta '" + node.name +
+                                "'. Loss supportate: mse, cross_entropy, cross_entropy_sparse");
                     }
                 } else if constexpr (std::is_same_v<T, ast::TrainOptimizerField>) {
                     ++optimizerCount;

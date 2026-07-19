@@ -104,6 +104,8 @@ TrainRunResult runTraining(const ast::Program& program, const ir::Module& module
     std::function<LossResult(const DeviceTensor&, const DeviceTensor&)> lossFn;
     if (lossField->name == "cross_entropy") {
         lossFn = softmaxCrossEntropy;
+    } else if (lossField->name == "cross_entropy_sparse") {
+        lossFn = softmaxCrossEntropySparse;
     } else {
         lossFn = meanSquaredError;
     }

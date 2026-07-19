@@ -14,10 +14,14 @@ namespace blackforge::tokenizer {
 // seqLen; l'ultima finestra, se il corpus tokenizzato non basta a
 // riempirla, viene scartata — non e' un errore, a meno che NESSUNA
 // finestra sia completa). Ogni esempio prodotto ha input `[seqLen]`
-// (id di token) e target `[seqLen, tok.vocabSize()]` (one-hot del
-// token successivo per ogni posizione, shift-by-one causale — la
-// stessa forma attesa da `loss cross_entropy` generalizzata a rango 3,
-// vedi backend::{cpu,cuda}::softmaxCrossEntropy).
+// (id di token) e target **sparso** `[seqLen]` (l'indice del token
+// successivo per ogni posizione, shift-by-one causale — non un
+// vettore one-hot denso `[seqLen, vocabSize]`: per un vocabolario di
+// decine di migliaia di token, il target denso sprecherebbe
+// `vocabSize` volte più memoria del necessario). Pensato per essere
+// allenato con `loss cross_entropy_sparse` (vedi
+// backend::{cpu,cuda}::softmaxCrossEntropySparse), NON `cross_entropy`
+// (che si aspetta un target denso della stessa forma dei logit).
 //
 // Ritorna il numero di esempi scritti. Lancia std::invalid_argument
 // se il corpus tokenizzato non produce nemmeno una finestra completa

@@ -502,29 +502,38 @@ train {
 }
 ```
 
-Il campo `loss` accetta due valori:
+Il campo `loss` accetta tre valori:
 
 - **`mse`** (errore quadratico medio): `mean((prediction - target)^2)`
   su tutti gli elementi. Adatta alla regressione, incluso il
   forecasting; `prediction`/`target` possono avere qualunque forma,
   purché coincidano.
-- **`cross_entropy`** (cross-entropy con softmax interna): pensata per
-  la classificazione multiclasse. Richiede `prediction`/`target` a
-  rango >= 2 `[..., classi]` (es. `[batch, classi]` per la
-  classificazione, `[batch, seq, classi]` per la next-token-prediction
-  di un modello linguistico: la loss è la media su tutte le "righe", non
-  solo sul batch); `prediction` sono i logit grezzi del modello
-  (l'operazione applica una softmax internamente, in modo numericamente
-  stabile), `target` è una distribuzione di probabilità per riga
-  (tipicamente one-hot). Il gradiente restituito è la forma chiusa
-  standard per softmax+cross-entropy combinati (`softmax(logits) -
-  target`, diviso per il numero di righe), non richiede quindi un
-  backward separato per la softmax. Supportata sia su CPU sia su
-  `--device cuda`.
+- **`cross_entropy`** (cross-entropy con softmax interna, target
+  **denso**): pensata per la classificazione multiclasse. Richiede
+  `prediction`/`target` a rango >= 2 `[..., classi]` (es. `[batch,
+  classi]` per la classificazione, `[batch, seq, classi]` per la
+  next-token-prediction di un modello linguistico: la loss è la media
+  su tutte le "righe", non solo sul batch); `prediction` sono i logit
+  grezzi del modello (l'operazione applica una softmax internamente, in
+  modo numericamente stabile), `target` è una distribuzione di
+  probabilità per riga (tipicamente one-hot). Il gradiente restituito è
+  la forma chiusa standard per softmax+cross-entropy combinati
+  (`softmax(logits) - target`, diviso per il numero di righe), non
+  richiede quindi un backward separato per la softmax.
+- **`cross_entropy_sparse`** (stessa formula, target **sparso**):
+  matematicamente identica a `cross_entropy`, ma `target` ha un rango in
+  MENO di `prediction` (`[..., classi]` → `[...]`) e contiene, per ogni
+  riga, l'**indice** della classe corretta invece di un vettore one-hot
+  denso. Per un vocabolario grande (next-token-prediction con decine di
+  migliaia di token) questo evita di materializzare mai un target
+  `classi` volte più grande del necessario — è il formato prodotto da
+  `blackforge dataset-build` (vedi la sezione "Tokenizer" più sopra) ed
+  è la scelta corretta per allenare un modello linguistico su un
+  vocabolario realistico.
 
-Entrambe sono implementate in `blackforge::backend::cpu` (vedi
-`loss.hpp`) e verificate con gradient checking numerico (differenze
-finite centrali).
+Tutte e tre sono implementate sia in `blackforge::backend::cpu` sia in
+`blackforge::backend::cuda` (vedi `loss.hpp`) e verificate con gradient
+checking numerico (differenze finite centrali) e parità CPU/GPU.
 
 ### Formato dataset su disco
 
@@ -565,8 +574,9 @@ blackforge tokenizer-encode tok.bftok testo.txt
 
 # Tokenizza il corpus e costruisce un dataset .bfdata pronto per
 # 'blackforge train': finestre non sovrapposte di 'seq-len' token,
-# target one-hot shift-by-one (next-token-prediction causale) — la
-# stessa forma [seqLen, vocabSize] attesa da 'loss cross_entropy'
+# target SPARSO shift-by-one (l'indice del token successivo per ogni
+# posizione, forma [seqLen] — non un vettore one-hot [seqLen, vocabSize]:
+# usa 'loss cross_entropy_sparse', non 'cross_entropy'
 blackforge dataset-build corpus.txt tok.bftok --seq-len 128 --output corpus.bfdata
 ```
 
@@ -590,15 +600,13 @@ Limitazioni esplicite dell'implementazione attuale:
 - **Training O(numMerge × numChunkUnici)** per iterazione, non la
   struttura a coda di priorità + lista concatenata delle implementazioni
   ottimizzate per corpora da gigabyte: correttezza prima delle
-  prestazioni, adeguata alla scala di corpora che questo linguaggio può
-  oggi caricare in memoria (vedi sopra: `dataset-build`, come
-  `data::Dataset` in generale, costruisce l'intero dataset in RAM prima
-  di scriverlo su disco).
-- `dataset-build` produce sempre target **one-hot densi** `[seqLen,
-  vocabSize]` (coerenti con `loss cross_entropy`): per vocabolari molto
-  grandi (decine di migliaia di token) questo è memoria sprecata
-  rispetto a un target sparso (un solo intero per posizione); non
-  ancora ottimizzato.
+  prestazioni.
+- `dataset-build` (come `data::Dataset` in generale, sia in scrittura
+  sia in lettura via `blackforge::data::loadDataset`) costruisce
+  l'intero dataset **in RAM** prima di scriverlo/leggerlo — anche coi
+  target sparsi (vedi sotto), un corpus da molti gigabyte non ci sta.
+  Caricamento realmente streaming/memory-mapped (che non richieda mai
+  l'intero corpus in memoria) resta lavoro futuro.
 
 ### Cosa fa `blackforge train`
 

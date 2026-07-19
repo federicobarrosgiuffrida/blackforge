@@ -27,4 +27,13 @@ LossResult meanSquaredError(const DeviceTensor& prediction, const DeviceTensor& 
 // forme non coincidono o se non sono a rango >= 2.
 LossResult softmaxCrossEntropy(const DeviceTensor& logits, const DeviceTensor& target);
 
+// Variante sparsa (vedi backend::cpu::softmaxCrossEntropySparse per la
+// semantica completa, identica): 'targetIndices' contiene, per ogni
+// riga, l'indice della classe corretta invece di un vettore one-hot
+// denso — essenziale per vocabolari grandi (next-token-prediction),
+// dove un target denso sul device sprecherebbe memoria proporzionale al
+// vocabolario. Lancia std::invalid_argument se le forme non
+// corrispondono o se un indice e' fuori da [0, classi).
+LossResult softmaxCrossEntropySparse(const DeviceTensor& logits, const DeviceTensor& targetIndices);
+
 }  // namespace blackforge::backend::cuda

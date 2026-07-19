@@ -81,4 +81,69 @@ LossResult softmaxCrossEntropy(const runtime::Tensor& logits, const runtime::Ten
     return LossResult{value, runtime::Tensor(logits.shape(), std::move(grad))};
 }
 
+LossResult softmaxCrossEntropySparse(const runtime::Tensor& logits, const runtime::Tensor& targetIndices) {
+    if (logits.rank() < 2) {
+        throw std::invalid_argument(
+            "softmaxCrossEntropySparse: richiede logits a rango >= 2 [..., classi], trovato " +
+            logits.shapeToString());
+    }
+    std::size_t numClasses = logits.shape().back();
+    std::size_t batch = logits.elementCount() / numClasses;
+
+    if (targetIndices.elementCount() != batch) {
+        throw std::invalid_argument("softmaxCrossEntropySparse: targetIndices ha " +
+                                     std::to_string(targetIndices.elementCount()) +
+                                     " elementi, ne servono " + std::to_string(batch) +
+                                     " (uno per riga di logits, cioe' " + logits.shapeToString() +
+                                     " senza l'ultima dimensione)");
+    }
+
+    // Matematicamente identico a softmaxCrossEntropy() con un target
+    // one-hot (stessa formula, stesso gradiente in forma chiusa), ma
+    // 'targetIndices' e' l'indice della classe corretta per riga
+    // (arrotondato con std::lround, la stessa convenzione degli id di
+    // token altrove in BlackForge — vedi embeddingLookup), non un
+    // vettore one-hot denso: evita di materializzare mai un target di
+    // dimensione [..., classi], fondamentale quando 'classi' e' un
+    // vocabolario da decine di migliaia di token (next-token-prediction
+    // di un modello linguistico), dove il target denso sprecherebbe
+    // 'classi' volte piu' memoria del necessario.
+    std::vector<float> grad(logits.elementCount());
+    double totalLoss = 0.0;
+    std::vector<double> probs(numClasses);
+
+    for (std::size_t b = 0; b < batch; ++b) {
+        std::size_t rowOffset = b * numClasses;
+
+        auto targetClassSigned = static_cast<long long>(std::lround(targetIndices.at(b)));
+        if (targetClassSigned < 0 || static_cast<std::size_t>(targetClassSigned) >= numClasses) {
+            throw std::invalid_argument("softmaxCrossEntropySparse: indice di classe " +
+                                         std::to_string(targetClassSigned) + " fuori da [0, " +
+                                         std::to_string(numClasses) + ")");
+        }
+        auto targetClass = static_cast<std::size_t>(targetClassSigned);
+
+        float maxLogit = logits.at(rowOffset);
+        for (std::size_t c = 1; c < numClasses; ++c) {
+            maxLogit = std::max(maxLogit, logits.at(rowOffset + c));
+        }
+
+        double sumExp = 0.0;
+        for (std::size_t c = 0; c < numClasses; ++c) {
+            probs[c] = std::exp(static_cast<double>(logits.at(rowOffset + c) - maxLogit));
+            sumExp += probs[c];
+        }
+
+        for (std::size_t c = 0; c < numClasses; ++c) {
+            probs[c] /= sumExp;
+            float t = (c == targetClass) ? 1.0F : 0.0F;
+            grad[rowOffset + c] = static_cast<float>((probs[c] - static_cast<double>(t)) / static_cast<double>(batch));
+        }
+        totalLoss += -std::log(std::max(probs[targetClass], 1e-12));
+    }
+
+    float value = static_cast<float>(totalLoss / static_cast<double>(batch));
+    return LossResult{value, runtime::Tensor(logits.shape(), std::move(grad))};
+}
+
 }  // namespace blackforge::backend::cpu

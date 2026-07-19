@@ -111,3 +111,51 @@ TEST(LossTest, CrossEntropyGradienteCorrispondeAllaDerivataNumerica) {
         EXPECT_NEAR(result.grad.at(i), numeric, 1e-3F) << "indice " << i;
     }
 }
+
+TEST(LossTest, CrossEntropySparseCorrispondeAllaVersioneDensaEquivalente) {
+    Tensor logits({2, 3}, {0.5F, -1.2F, 0.3F, 2.0F, 0.1F, -0.5F});
+    Tensor denseTarget({2, 3}, {0.0F, 1.0F, 0.0F, 1.0F, 0.0F, 0.0F});
+    Tensor sparseTarget({2}, {1.0F, 0.0F});  // stesse classi corrette: riga 0 -> 1, riga 1 -> 0
+
+    cpu::LossResult dense = cpu::softmaxCrossEntropy(logits, denseTarget);
+    cpu::LossResult sparse = cpu::softmaxCrossEntropySparse(logits, sparseTarget);
+
+    EXPECT_NEAR(sparse.value, dense.value, 1e-6F);
+    ASSERT_EQ(sparse.grad.elementCount(), dense.grad.elementCount());
+    for (std::size_t i = 0; i < dense.grad.elementCount(); ++i) {
+        EXPECT_NEAR(sparse.grad.at(i), dense.grad.at(i), 1e-6F) << "indice " << i;
+    }
+}
+
+TEST(LossTest, CrossEntropySparseLanciaSeUnIndiceEFuoriRange) {
+    Tensor logits({1, 3}, {0.1F, 0.2F, 0.3F});
+    Tensor targetIndices({1}, {5.0F});
+    EXPECT_THROW((void)cpu::softmaxCrossEntropySparse(logits, targetIndices), std::invalid_argument);
+}
+
+TEST(LossTest, CrossEntropySparseLanciaSeIlNumeroDiRigheNonCorrisponde) {
+    Tensor logits({2, 3}, {0.1F, 0.2F, 0.3F, 0.4F, 0.5F, 0.6F});
+    Tensor targetIndices({3}, {0.0F, 1.0F, 2.0F});  // 3 indici per 2 righe di logits
+    EXPECT_THROW((void)cpu::softmaxCrossEntropySparse(logits, targetIndices), std::invalid_argument);
+}
+
+TEST(LossTest, CrossEntropySparseGradienteCorrispondeAllaDerivataNumerica) {
+    Tensor logits({2, 4}, {0.3F, -0.8F, 1.1F, 0.2F, -0.5F, 0.9F, 0.1F, -1.3F});
+    Tensor targetIndices({2}, {2.0F, 0.0F});
+
+    cpu::LossResult result = cpu::softmaxCrossEntropySparse(logits, targetIndices);
+
+    float eps = 1e-3F;
+    for (std::size_t i = 0; i < logits.elementCount(); ++i) {
+        Tensor plusLogits = logits;
+        plusLogits.at(i) += eps;
+        Tensor minusLogits = logits;
+        minusLogits.at(i) -= eps;
+
+        float plus = cpu::softmaxCrossEntropySparse(plusLogits, targetIndices).value;
+        float minus = cpu::softmaxCrossEntropySparse(minusLogits, targetIndices).value;
+        float numeric = (plus - minus) / (2.0F * eps);
+
+        EXPECT_NEAR(result.grad.at(i), numeric, 1e-3F) << "indice " << i;
+    }
+}
