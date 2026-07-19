@@ -758,6 +758,34 @@ Il gap rispetto a PyTorch scende da ~2,5x a **~1,7x più lento**
 (nessun cambiamento di comportamento osservabile, solo quale
 allocatore libera un buffer).
 
+#### Optimizer e zeroGrad fusi ("multi-tensor"): nessun guadagno aggiuntivo, atteso col senno di poi
+
+Quarto intervento dell'audit, quello originariamente pianificato prima
+della scoperta del punto precedente: `SGD::step()`/`AdamW::step()`
+lanciavano un kernel per OGNI parametro (~68 lanci per step sul modello
+del benchmark) e `Model::zeroGrad()` faceva altrettante
+`DeviceTensor::zeros()` (che ora, dopo il fix del punto precedente,
+passano correttamente dal pool). Sostituiti con un solo lancio di
+kernel ciascuno, stile "multi-tensor apply" di PyTorch
+(`foreach`/`fused`): un array di metadati per-parametro
+(puntatore+dimensione, per `SgdTarget`/`AdamWTarget`/`ZeroTarget` in
+`optimizer.cu`/`model.cu`) caricato su device ad ogni chiamata (poche
+centinaia di byte, nessuna dipendenza da un risultato GPU pendente,
+quindi nessuna sincronizzazione bloccante), poi UN kernel con
+`blockIdx.y` a scegliere il parametro invece di un lancio per
+parametro.
+
+Risultato misurato (stesso benchmark a regime): **27,4-27,8s**,
+indistinguibile dai 27,5-27,7s di prima — **nessun guadagno aggiuntivo
+rilevabile**. Col senno di poi, atteso: il fix del pool al punto
+precedente aveva gia' reso il percorso per-parametro economico (pool
+hit invece di vera `cudaMalloc`/`cudaFree`), quindi il numero di lanci
+di kernel di per se' non era piu' il collo di bottiglia dominante a
+questo punto — lo stesso schema gia' visto con la cache cuBLASLt (una
+teoria ragionevole, smentita dalla misura diretta). Modifica mantenuta
+comunque: codice piu' pulito (un solo punto di lancio invece di un
+loop), nessuna regressione, verificato sui 391 test CUDA.
+
 ## Training (pretraining, fine-tuning, LoRA, forecasting)
 
 `dataset { ... }` e `train { ... }` collegano il linguaggio al motore

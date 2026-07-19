@@ -1,10 +1,13 @@
 #include "blackforge/backend/cuda/model.hpp"
 
+#include <algorithm>
 #include <stdexcept>
+#include <vector>
 
 #include "blackforge/backend/cpu/random_init.hpp"
 #include "blackforge/backend/cuda/autodiff.hpp"
 #include "blackforge/backend/cuda/cuda_check.hpp"
+#include "blackforge/backend/cuda/device_pool.hpp"
 #include "blackforge/backend/cuda/ops.hpp"
 
 namespace blackforge::backend::cuda {
@@ -40,6 +43,65 @@ void accumulate(DeviceTensor& target, const DeviceTensor& delta) {
         accumulateKernel<<<gridSizeFor(n), kBlockSize>>>(target.data(), delta.data(), n);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }
+}
+
+// Un puntatore device + dimensione, per il kernel "multi-tensor" sotto:
+// blockIdx.y sceglie IL TENSORE (fino a un lancio per modello, non uno
+// per parametro), blockIdx.x/threadIdx.x indicizzano dentro quel
+// tensore (stesso schema di ogni altro kernel elementwise di questo
+// file). Serve a Model::zeroGrad(): azzerare ~68 gradienti con UN
+// lancio di kernel invece di 68, invece di ri-allocare ogni gradiente
+// da zero con DeviceTensor::zeros() (che oltretutto scarterebbe il
+// buffer precedente, gia' della dimensione giusta, per acquisirne uno
+// nuovo dal pool — inutile quando la dimensione non cambia mai tra uno
+// step e l'altro).
+struct ZeroTarget {
+    float* ptr;
+    std::size_t n;
+};
+
+__global__ void zeroFusedKernel(const ZeroTarget* targets, std::size_t numTargets) {
+    std::size_t paramIdx = blockIdx.y;
+    if (paramIdx >= numTargets) {
+        return;
+    }
+    ZeroTarget target = targets[paramIdx];
+    std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < target.n) {
+        target.ptr[i] = 0.0F;
+    }
+}
+
+// Azzera in-place tutti i buffer descritti da 'targets' (gia' allocati
+// alla dimensione giusta) con un solo lancio di kernel. L'array di
+// metadati e' ricostruito e ricaricato su device ad ogni chiamata
+// (niente cache tra step: piu' semplice e robusto di inseguire
+// l'invalidazione se i puntatori dovessero mai cambiare, e il
+// trasferimento — poche decine di (puntatore,dimensione), qualche
+// centinaio di byte — non dipende da alcun risultato GPU pendente,
+// quindi non introduce una sincronizzazione bloccante come quelle
+// rimosse altrove in questo audit).
+void zeroFused(const std::vector<ZeroTarget>& targets) {
+    if (targets.empty()) {
+        return;
+    }
+    std::size_t maxN = 0;
+    for (const ZeroTarget& target : targets) {
+        maxN = std::max(maxN, target.n);
+    }
+    if (maxN == 0) {
+        return;
+    }
+
+    std::size_t bytes = targets.size() * sizeof(ZeroTarget);
+    auto* deviceTargets = static_cast<ZeroTarget*>(devicePoolAcquire(bytes));
+    BLACKFORGE_CUDA_CHECK(cudaMemcpy(deviceTargets, targets.data(), bytes, cudaMemcpyHostToDevice));
+
+    dim3 grid(static_cast<unsigned int>(gridSizeFor(maxN)), static_cast<unsigned int>(targets.size()));
+    zeroFusedKernel<<<grid, kBlockSize>>>(deviceTargets, targets.size());
+    BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+
+    devicePoolRelease(deviceTargets, bytes);
 }
 
 // Dimensione delle feature in ingresso a un layer che ne ha bisogno per
@@ -371,11 +433,13 @@ std::vector<Parameter*> Model::allParameterSlots(LayerState& layer) {
 }
 
 void Model::zeroGrad() {
+    std::vector<ZeroTarget> targets;
     for (auto& layer : layers_) {
         for (Parameter* param : allParameterSlots(layer)) {
-            param->grad = DeviceTensor::zeros(param->grad.shape());
+            targets.push_back({param->grad.data(), param->grad.elementCount()});
         }
     }
+    zeroFused(targets);
 }
 
 std::vector<Parameter*> Model::parameters() {
