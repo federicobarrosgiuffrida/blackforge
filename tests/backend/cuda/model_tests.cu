@@ -446,6 +446,108 @@ TEST(CudaModelTest, TrainingLoopDiUnModelloLinguisticoCorrispondeAllaVersioneCpu
     EXPECT_NEAR(cpuLoss, cudaLoss, 5e-2F);
 }
 
+// --- Generazione incrementale con cache K/V (mirror CUDA di
+// ModelTest.ForwardIncrementalCorrispondeAForwardCompletoTokenPerToken /
+// ResetGenerationStateAzzeraLaCacheELaPosizione in tests/backend/cpu/model_tests.cpp) ---
+
+TEST(CudaModelTest, ForwardIncrementalCorrispondeAForwardCompletoTokenPerToken) {
+    // Stesso test di correttezza fondamentale del KV-cache della
+    // controparte CPU: genera una sequenza di 4 token uno alla volta
+    // con forwardIncremental() (prompt iniziale di 2 token, poi 2
+    // chiamate con un solo token nuovo ciascuna) e verifica che
+    // l'uscita per OGNI posizione coincida con quella che forward()
+    // produrrebbe ricalcolando l'intera sottosequenza da capo.
+    ir::Module module = buildTinyLmModule();
+    cuda::Model incrementalModel(module.models.front(), /*seed=*/11);
+    cuda::Model referenceModel(module.models.front(), /*seed=*/11);
+
+    // buildTinyLmModule() usa positional_embedding(4): 4 e' la
+    // lunghezza massima di sequenza supportata dal modello.
+    std::vector<float> fullSequence = {0.0F, 3.0F, 1.0F, 4.0F};
+    incrementalModel.resetGenerationState();
+
+    Tensor prompt({1, 2}, {fullSequence[0], fullSequence[1]});
+    Tensor incOut = incrementalModel.forwardIncremental(cuda::DeviceTensor::fromHost(prompt)).toHost();
+
+    Tensor refPrompt({1, 2}, {fullSequence[0], fullSequence[1]});
+    Tensor refOut = referenceModel.forward(cuda::DeviceTensor::fromHost(refPrompt)).toHost();
+
+    ASSERT_EQ(incOut.shape(), refOut.shape());
+    for (std::size_t i = 0; i < incOut.elementCount(); ++i) {
+        EXPECT_NEAR(incOut.at(i), refOut.at(i), 1e-3F) << "prompt, indice " << i;
+    }
+
+    for (std::size_t step = 2; step < fullSequence.size(); ++step) {
+        Tensor newToken({1, 1}, {fullSequence[step]});
+        Tensor incStepOut = incrementalModel.forwardIncremental(cuda::DeviceTensor::fromHost(newToken)).toHost();
+
+        std::vector<float> subsequence(fullSequence.begin(),
+                                        fullSequence.begin() + static_cast<std::ptrdiff_t>(step) + 1);
+        Tensor refSub({1, subsequence.size()}, subsequence);
+        Tensor refSubOut = referenceModel.forward(cuda::DeviceTensor::fromHost(refSub)).toHost();
+
+        std::size_t vocab = incStepOut.dim(2);
+        ASSERT_EQ(incStepOut.shape(), (std::vector<std::size_t>{1, 1, vocab}));
+        for (std::size_t v = 0; v < vocab; ++v) {
+            float incValue = incStepOut.at(v);
+            float refValue = refSubOut.at(step * vocab + v);  // ultima posizione di refSubOut
+            EXPECT_NEAR(incValue, refValue, 1e-3F) << "step " << step << " colonna " << v;
+        }
+    }
+}
+
+TEST(CudaModelTest, ForwardIncrementalCorrispondeAllaVersioneCpuAParitaDiSeme) {
+    // Parita' diretta CPU/GPU sulla generazione incrementale: stesso
+    // seme (stessi pesi), stesso prompt, stessa sequenza di token nuovi
+    // -> stesso output ad ogni step, entro la tolleranza numerica
+    // attesa tra somme in virgola mobile CPU e cuBLAS/kernel GPU.
+    ir::Module module = buildTinyLmModule();
+    cpu::Model cpuModel(module.models.front(), /*seed=*/7);
+    cuda::Model cudaModel(module.models.front(), /*seed=*/7);
+
+    cpuModel.resetGenerationState();
+    cudaModel.resetGenerationState();
+
+    Tensor prompt({1, 2}, {0.0F, 2.0F});
+    Tensor cpuOut = cpuModel.forwardIncremental(prompt);
+    Tensor cudaOut = cudaModel.forwardIncremental(cuda::DeviceTensor::fromHost(prompt)).toHost();
+
+    ASSERT_EQ(cpuOut.shape(), cudaOut.shape());
+    for (std::size_t i = 0; i < cpuOut.elementCount(); ++i) {
+        EXPECT_NEAR(cpuOut.at(i), cudaOut.at(i), 1e-3F) << "prompt, indice " << i;
+    }
+
+    Tensor nextToken({1, 1}, {1.0F});
+    Tensor cpuStepOut = cpuModel.forwardIncremental(nextToken);
+    Tensor cudaStepOut = cudaModel.forwardIncremental(cuda::DeviceTensor::fromHost(nextToken)).toHost();
+
+    ASSERT_EQ(cpuStepOut.shape(), cudaStepOut.shape());
+    for (std::size_t i = 0; i < cpuStepOut.elementCount(); ++i) {
+        EXPECT_NEAR(cpuStepOut.at(i), cudaStepOut.at(i), 1e-3F) << "step, indice " << i;
+    }
+}
+
+TEST(CudaModelTest, ResetGenerationStateAzzeraLaCacheELaPosizione) {
+    // Dopo resetGenerationState(), una nuova sessione di generazione
+    // deve comportarsi esattamente come la prima (stessa cache vuota,
+    // stessa posizione 0).
+    ir::Module module = buildTinyLmModule();
+    cuda::Model model(module.models.front(), /*seed=*/3);
+
+    Tensor prompt({1, 2}, {1.0F, 2.0F});
+
+    model.resetGenerationState();
+    Tensor firstSessionOut = model.forwardIncremental(cuda::DeviceTensor::fromHost(prompt)).toHost();
+
+    model.resetGenerationState();
+    Tensor secondSessionOut = model.forwardIncremental(cuda::DeviceTensor::fromHost(prompt)).toHost();
+
+    ASSERT_EQ(firstSessionOut.shape(), secondSessionOut.shape());
+    for (std::size_t i = 0; i < firstSessionOut.elementCount(); ++i) {
+        EXPECT_FLOAT_EQ(firstSessionOut.at(i), secondSessionOut.at(i)) << "indice " << i;
+    }
+}
+
 TEST(CudaModelTest, TrainingLoopCorrispondeAllaVersioneCpuAParitaDiSeme) {
     // Il test di parita' piu' importante di questa milestone: lo stesso
     // ciclo di addestramento (stesso seme, stessi dati, stesso

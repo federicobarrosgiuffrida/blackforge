@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "blackforge/backend/cuda/device_tensor.hpp"
+#include "blackforge/backend/cuda/ops.hpp"
 #include "blackforge/ir/module.hpp"
 
 namespace blackforge::backend::cuda {
@@ -68,6 +69,21 @@ public:
 
     void zeroGrad();
 
+    // Genera un output autoregressivo incrementale su device (vedi
+    // backend::cpu::Model::forwardIncremental per la semantica
+    // completa, identica qui): 'newTokenIds' contiene SOLO i token
+    // nuovi rispetto all'ultima chiamata. Mantiene una cache K/V
+    // (backend::cuda::KVCache) per ogni layer 'attention' della
+    // pipeline. Non salva alcuno stato per backward(): non mescolare
+    // forward()/backward() con forwardIncremental() sulla stessa
+    // istanza senza chiamare resetGenerationState() in mezzo.
+    DeviceTensor forwardIncremental(const DeviceTensor& newTokenIds);
+
+    // Azzera la cache K/V di ogni layer 'attention' e la posizione
+    // assoluta corrente: va chiamata prima di iniziare una nuova
+    // sessione di generazione.
+    void resetGenerationState();
+
     // Parametri allenabili: pesi/bias di ogni layer 'linear'. E' quello
     // che va passato a un Optimizer.
     [[nodiscard]] std::vector<Parameter*> parameters();
@@ -95,6 +111,7 @@ private:
         std::optional<Parameter> attnWv;
         std::optional<Parameter> attnWout;
         std::size_t attentionNumHeads = 0;
+        KVCache kvCache;  // usata solo da forwardIncremental()
 
         // Validi solo se kind == FeedForward.
         std::optional<Parameter> ffW1;
@@ -108,6 +125,7 @@ private:
     std::string name_;
     std::vector<LayerState> layers_;
     bool useTensorCoreLinear_ = false;
+    std::size_t generationPosition_ = 0;  // usata solo da forwardIncremental()
 };
 
 }  // namespace blackforge::backend::cuda

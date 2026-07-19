@@ -268,6 +268,22 @@ __global__ void addPositionalEmbeddingKernel(float* out, const float* input, con
     out[idx] = input[idx] + table[withinBatch];
 }
 
+// Come addPositionalEmbeddingKernel, ma la riga della tabella usata per
+// la posizione s e' 'offset + s' invece di 's' (vedi
+// backend::cuda::addPositionalEmbeddingAt).
+__global__ void addPositionalEmbeddingAtKernel(float* out, const float* input, const float* table, std::size_t batch,
+                                                std::size_t seq, std::size_t dim, std::size_t offset) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = batch * seq * dim;
+    if (idx >= total) {
+        return;
+    }
+    std::size_t withinBatch = idx % (seq * dim);
+    std::size_t s = withinBatch / dim;
+    std::size_t d = withinBatch % dim;
+    out[idx] = input[idx] + table[(offset + s) * dim + d];
+}
+
 DeviceTensor rmsnorm(const DeviceTensor& input) {
     // Generalizzato a rango >= 2, stessa idea di addBias sopra.
     if (input.rank() < 2) {
@@ -344,6 +360,35 @@ DeviceTensor addPositionalEmbedding(const DeviceTensor& input, const DeviceTenso
     if (total > 0) {
         addPositionalEmbeddingKernel<<<gridSizeFor(total), kBlockSize>>>(result.data(), input.data(), table.data(),
                                                                           batch, seq, dim);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+DeviceTensor addPositionalEmbeddingAt(const DeviceTensor& input, const DeviceTensor& table, std::size_t offset) {
+    if (input.rank() != 3) {
+        throw std::invalid_argument("addPositionalEmbeddingAt: richiede un input a rango 3 [batch, seq, dim] sul "
+                                     "device");
+    }
+    if (table.rank() != 2 || table.dim(1) != input.dim(2)) {
+        throw std::invalid_argument("addPositionalEmbeddingAt: richiede una tabella [maxSeqLen, dim] con dim "
+                                     "coerente con l'input sul device");
+    }
+
+    std::size_t batch = input.dim(0);
+    std::size_t seq = input.dim(1);
+    std::size_t dim = input.dim(2);
+    std::size_t maxSeqLen = table.dim(0);
+    if (offset + seq > maxSeqLen) {
+        throw std::invalid_argument("addPositionalEmbeddingAt: la posizione assoluta supera maxSeqLen della "
+                                     "tabella");
+    }
+
+    DeviceTensor result(input.shape());
+    std::size_t total = batch * seq * dim;
+    if (total > 0) {
+        addPositionalEmbeddingAtKernel<<<gridSizeFor(total), kBlockSize>>>(result.data(), input.data(), table.data(),
+                                                                            batch, seq, dim, offset);
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
     }
     return result;

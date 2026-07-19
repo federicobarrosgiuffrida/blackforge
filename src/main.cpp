@@ -56,8 +56,9 @@ void printUsage() {
               << "                                  per l'addestramento di un modello linguistico causale\n"
               << "                                  (richiede --seq-len e --output; aggiungi --mlm per un\n"
               << "                                  dataset mascherato stile BERT invece, con --mask-prob)\n"
-              << "  generate <file>     Genera testo autoregressivamente con cache K/V (CPU, greedy/argmax,\n"
-              << "                                  richiede --from-checkpoint, --tokenizer, --prompt)\n"
+              << "  generate <file>     Genera testo autoregressivamente con cache K/V (CPU o GPU via --device,\n"
+              << "                                  greedy/argmax, richiede --from-checkpoint, --tokenizer, "
+                 "--prompt)\n"
               << "  --help, -h         Mostra questo messaggio\n"
               << "  --version, -v      Mostra la versione del compilatore\n\n"
               << "Opzioni:\n"
@@ -413,16 +414,33 @@ int runForecast(const std::string& path, const std::string& fromCheckpoint, std:
     return 0;
 }
 
+// Sceglie il prossimo id in base ai logit dell'ultima posizione di un
+// tensore host [1, seq, vocabSize]: decodifica sempre greedy (argmax),
+// nessuna strategia di campionamento (temperatura/top-k/nucleus) ancora
+// implementata — una limitazione esplicita, non nascosta: la stessa
+// sequenza in ingresso produce sempre la stessa continuazione.
+std::uint32_t argmaxLastPosition(const blackforge::runtime::Tensor& logits) {
+    std::size_t vocabSize = logits.dim(2);
+    std::size_t lastPos = logits.dim(1) - 1;
+
+    std::size_t bestId = 0;
+    float bestVal = logits.at(lastPos * vocabSize);
+    for (std::size_t v = 1; v < vocabSize; ++v) {
+        float val = logits.at(lastPos * vocabSize + v);
+        if (val > bestVal) {
+            bestVal = val;
+            bestId = v;
+        }
+    }
+    return static_cast<std::uint32_t>(bestId);
+}
+
 // Genera testo autoregressivamente da un modello linguistico allenato,
-// usando la cache K/V (Model::forwardIncremental): decodifica sempre
-// greedy (argmax sulla posizione piu' recente), nessuna strategia di
-// campionamento (temperatura/top-k/nucleus) ancora implementata — una
-// limitazione esplicita, non nascosta: la stessa sequenza in ingresso
-// produce sempre la stessa continuazione. Solo CPU per ora: cuda::Model
-// non ha ancora un percorso di generazione incrementale (vedi
-// backend::cpu::Model::forwardIncremental).
+// usando la cache K/V (Model::forwardIncremental) su CPU o su GPU (vedi
+// backend::cpu::Model::forwardIncremental / backend::cuda::Model::
+// forwardIncremental, stessa semantica su entrambi i backend).
 int runGenerate(const std::string& path, const std::string& fromCheckpoint, const std::string& tokenizerPath,
-                 const std::string& prompt, std::size_t maxNewTokens) {
+                 const std::string& prompt, std::size_t maxNewTokens, const std::string& device) {
     if (fromCheckpoint.empty()) {
         std::cerr << "errore: comando 'generate' richiede '--from-checkpoint' (generare da pesi casuali non ha "
                      "senso)\n";
@@ -431,6 +449,18 @@ int runGenerate(const std::string& path, const std::string& fromCheckpoint, cons
     if (tokenizerPath.empty()) {
         std::cerr << "errore: comando 'generate' richiede '--tokenizer <file.bftok>'\n";
         return 2;
+    }
+
+    DeviceSpec spec;
+    std::string deviceError;
+    if (!parseDeviceSpec(device, spec, deviceError)) {
+        std::cerr << "errore: " << deviceError << "\n";
+        return 2;
+    }
+    if (spec.isCuda && !BLACKFORGE_HAS_CUDA) {
+        std::cerr << "errore: '--device " << device << "' richiesto ma questa build di blackforge e' stata "
+                     "compilata senza supporto CUDA (BLACKFORGE_ENABLE_CUDA=OFF in fase di compilazione)\n";
+        return 1;
     }
 
     CompileOutput result = compile(path, /*verbose=*/false, /*printAst=*/false, /*printIr=*/false);
@@ -450,44 +480,59 @@ int runGenerate(const std::string& path, const std::string& fromCheckpoint, cons
     try {
         blackforge::tokenizer::Tokenizer tok = blackforge::tokenizer::loadTokenizer(tokenizerPath);
 
-        blackforge::backend::cpu::Model loadedModel(model);
-        blackforge::backend::cpu::loadCheckpoint(loadedModel, fromCheckpoint);
-
         std::vector<std::uint32_t> promptIds = tok.encode(prompt);
         if (promptIds.empty()) {
             std::cerr << "errore: il prompt codificato e' vuoto (prompt vuoto?)\n";
             return 1;
         }
-
-        loadedModel.resetGenerationState();
-
         std::vector<float> promptFloats(promptIds.begin(), promptIds.end());
         blackforge::runtime::Tensor promptTensor({1, promptIds.size()}, promptFloats);
-        blackforge::runtime::Tensor logits = loadedModel.forwardIncremental(promptTensor);
 
         std::vector<std::uint32_t> generated = promptIds;
-        for (std::size_t step = 0; step < maxNewTokens; ++step) {
-            std::size_t vocabSize = logits.dim(2);
-            std::size_t lastPos = logits.dim(1) - 1;
 
-            std::size_t bestId = 0;
-            float bestVal = logits.at(lastPos * vocabSize);
-            for (std::size_t v = 1; v < vocabSize; ++v) {
-                float val = logits.at(lastPos * vocabSize + v);
-                if (val > bestVal) {
-                    bestVal = val;
-                    bestId = v;
+        if (!spec.isCuda) {
+            blackforge::backend::cpu::Model loadedModel(model);
+            blackforge::backend::cpu::loadCheckpoint(loadedModel, fromCheckpoint);
+            loadedModel.resetGenerationState();
+
+            blackforge::runtime::Tensor logits = loadedModel.forwardIncremental(promptTensor);
+            for (std::size_t step = 0; step < maxNewTokens; ++step) {
+                std::uint32_t bestId = argmaxLastPosition(logits);
+                generated.push_back(bestId);
+
+                try {
+                    blackforge::runtime::Tensor nextInput({1, 1}, {static_cast<float>(bestId)});
+                    logits = loadedModel.forwardIncremental(nextInput);
+                } catch (const std::exception&) {
+                    std::cout << "(lunghezza massima di sequenza del modello raggiunta, generazione interrotta)\n";
+                    break;
                 }
             }
-            generated.push_back(static_cast<std::uint32_t>(bestId));
+        } else {
+#if BLACKFORGE_HAS_CUDA
+            blackforge::backend::cuda::setActiveDevice(spec.cudaIndex);
+            blackforge::backend::cuda::Model loadedModel(model);
+            blackforge::backend::cuda::loadCheckpoint(loadedModel, fromCheckpoint);
+            loadedModel.resetGenerationState();
 
-            try {
-                blackforge::runtime::Tensor nextInput({1, 1}, {static_cast<float>(bestId)});
-                logits = loadedModel.forwardIncremental(nextInput);
-            } catch (const std::exception&) {
-                std::cout << "(lunghezza massima di sequenza del modello raggiunta, generazione interrotta)\n";
-                break;
+            blackforge::runtime::Tensor logits =
+                loadedModel.forwardIncremental(blackforge::backend::cuda::DeviceTensor::fromHost(promptTensor))
+                    .toHost();
+            for (std::size_t step = 0; step < maxNewTokens; ++step) {
+                std::uint32_t bestId = argmaxLastPosition(logits);
+                generated.push_back(bestId);
+
+                try {
+                    blackforge::runtime::Tensor nextInput({1, 1}, {static_cast<float>(bestId)});
+                    logits = loadedModel
+                                 .forwardIncremental(blackforge::backend::cuda::DeviceTensor::fromHost(nextInput))
+                                 .toHost();
+                } catch (const std::exception&) {
+                    std::cout << "(lunghezza massima di sequenza del modello raggiunta, generazione interrotta)\n";
+                    break;
+                }
             }
+#endif
         }
 
         std::cout << tok.decode(generated) << "\n";
@@ -1042,7 +1087,7 @@ int main(int argc, char** argv) {
             std::cerr << "errore: comando 'generate' richiede il percorso di un file .bf\n";
             return 2;
         }
-        return runGenerate(positional.front(), fromCheckpoint, tokenizerPath, prompt, maxNewTokens);
+        return runGenerate(positional.front(), fromCheckpoint, tokenizerPath, prompt, maxNewTokens, device);
     }
 
     std::cerr << "errore: comando sconosciuto '" << command << "'\n";

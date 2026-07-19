@@ -370,3 +370,72 @@ TEST(CudaOpsTest, SelfAttentionLanciaSeNumHeadsNonDivideDim) {
                                             cuda::DeviceTensor::fromHost(w), /*numHeads=*/2),
                  std::invalid_argument);
 }
+
+TEST(CudaOpsTest, AddPositionalEmbeddingAtCorrispondeAllaVersioneCpu) {
+    Tensor input({1, 2, 2}, {0.0F, 0.0F, 100.0F, 100.0F});
+    Tensor table({4, 2}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F});
+
+    Tensor cpuResult = cpu::addPositionalEmbeddingAt(input, table, /*offset=*/2);
+    Tensor gpuResult = cuda::addPositionalEmbeddingAt(cuda::DeviceTensor::fromHost(input),
+                                                        cuda::DeviceTensor::fromHost(table), /*offset=*/2)
+                            .toHost();
+
+    ASSERT_EQ(gpuResult.shape(), cpuResult.shape());
+    for (std::size_t i = 0; i < cpuResult.elementCount(); ++i) {
+        EXPECT_NEAR(gpuResult.at(i), cpuResult.at(i), 1e-5F) << "indice " << i;
+    }
+}
+
+TEST(CudaOpsTest, SelfAttentionIncrementaleCorrispondeASelfAttentionSuTutteLePosizioni) {
+    // Stesso test di parita' della controparte CPU
+    // (CpuOpsTest.SelfAttentionIncrementaleCorrispondeASelfAttentionSuTutteLePosizioni):
+    // alimenta l'intera sequenza [1,3,4] a selfAttention() in un colpo
+    // solo, poi le stesse 3 posizioni una alla volta a
+    // selfAttentionIncremental() (con la STESSA cache K/V via
+    // riferimento, che cresce ad ogni chiamata) — le due devono
+    // produrre esattamente lo stesso output, posizione per posizione.
+    Tensor wq({4, 4}, {0.3F, -0.1F, 0.2F, 0.05F, 0.1F, 0.4F, -0.2F, 0.15F, -0.3F, 0.2F, 0.1F, -0.05F, 0.2F, -0.1F,
+                        0.3F, 0.1F});
+    Tensor wk({4, 4}, {0.1F, 0.2F, -0.1F, 0.3F, -0.2F, 0.1F, 0.4F, -0.1F, 0.3F, -0.3F, 0.1F, 0.2F, -0.1F, 0.2F,
+                        -0.2F, 0.1F});
+    Tensor wv({4, 4}, {0.2F, 0.1F, -0.1F, 0.3F, 0.1F, -0.2F, 0.3F, 0.1F, -0.1F, 0.3F, 0.2F, -0.1F, 0.3F, 0.1F, -0.2F,
+                        0.2F});
+    Tensor wout({4, 4}, {0.1F, -0.1F, 0.2F, 0.1F, 0.2F, 0.1F, -0.1F, 0.2F, -0.1F, 0.2F, 0.1F, -0.1F, 0.1F, 0.2F,
+                          -0.1F, 0.2F});
+
+    Tensor input({1, 3, 4}, {0.1F, -0.2F, 0.3F, 0.4F, -0.5F, 0.6F, 0.2F, -0.1F, 0.3F, 0.2F, -0.4F, 0.5F});
+    cuda::DeviceTensor wqDev = cuda::DeviceTensor::fromHost(wq);
+    cuda::DeviceTensor wkDev = cuda::DeviceTensor::fromHost(wk);
+    cuda::DeviceTensor wvDev = cuda::DeviceTensor::fromHost(wv);
+    cuda::DeviceTensor woutDev = cuda::DeviceTensor::fromHost(wout);
+
+    Tensor fullResult = cuda::selfAttention(cuda::DeviceTensor::fromHost(input), wqDev, wkDev, wvDev, woutDev,
+                                             /*numHeads=*/2)
+                             .toHost();
+
+    cuda::KVCache cache;
+    for (std::size_t s = 0; s < 3; ++s) {
+        Tensor oneToken({1, 1, 4},
+                         {input.at(s * 4 + 0), input.at(s * 4 + 1), input.at(s * 4 + 2), input.at(s * 4 + 3)});
+        Tensor incResult = cuda::selfAttentionIncremental(cuda::DeviceTensor::fromHost(oneToken), wqDev, wkDev,
+                                                            wvDev, woutDev, /*numHeads=*/2, cache)
+                                .toHost();
+
+        ASSERT_EQ(incResult.shape(), (std::vector<std::size_t>{1, 1, 4}));
+        for (std::size_t d = 0; d < 4; ++d) {
+            EXPECT_NEAR(incResult.at(d), fullResult.at(s * 4 + d), 1e-3F) << "posizione " << s << " indice " << d;
+        }
+    }
+    EXPECT_EQ(cache.length, 3u);
+}
+
+TEST(CudaOpsTest, SelfAttentionIncrementaleLanciaSeNumHeadsNonDivideDim) {
+    Tensor input({1, 1, 3}, std::vector<float>(3, 0.0F));
+    Tensor w = Tensor::zeros({3, 3});
+    cuda::KVCache cache;
+    EXPECT_THROW((void)cuda::selfAttentionIncremental(cuda::DeviceTensor::fromHost(input),
+                                                        cuda::DeviceTensor::fromHost(w), cuda::DeviceTensor::fromHost(w),
+                                                        cuda::DeviceTensor::fromHost(w), cuda::DeviceTensor::fromHost(w),
+                                                        /*numHeads=*/2, cache),
+                 std::invalid_argument);
+}

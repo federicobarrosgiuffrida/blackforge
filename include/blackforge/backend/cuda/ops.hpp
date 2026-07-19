@@ -65,6 +65,13 @@ DeviceTensor embeddingLookup(const DeviceTensor& tokenIds, const DeviceTensor& t
 // (vedi backend::cpu::addPositionalEmbedding, stessa semantica).
 DeviceTensor addPositionalEmbedding(const DeviceTensor& input, const DeviceTensor& table);
 
+// Come addPositionalEmbedding, ma la riga della tabella usata per la
+// posizione s e' 'offset + s' invece di semplicemente 's' (vedi
+// backend::cpu::addPositionalEmbeddingAt, stessa semantica: serve alla
+// generazione incrementale, dove ogni chiamata processa solo i token
+// NUOVI di una sequenza che sta crescendo).
+DeviceTensor addPositionalEmbeddingAt(const DeviceTensor& input, const DeviceTensor& table, std::size_t offset);
+
 // Blocco feed-forward pre-norm con residual (vedi
 // backend::cpu::feedForward per i dettagli, stessa semantica):
 // y = x + Linear2(SiLU(Linear1(RMSNorm(x)))).
@@ -77,6 +84,32 @@ DeviceTensor feedForward(const DeviceTensor& input, const DeviceTensor& w1, cons
 // essere divisibile per numHeads.
 DeviceTensor selfAttention(const DeviceTensor& input, const DeviceTensor& wq, const DeviceTensor& wk,
                             const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads);
+
+// Chiavi/valori accumulati di un layer 'attention' attraverso una
+// sessione di generazione autoregressiva incrementale sul device (vedi
+// backend::cpu::KVCache, stessa semantica): 'k'/'v' hanno forma
+// [batch, length, dim], crescente di 'newLen' ad ogni chiamata a
+// selfAttentionIncremental. Un'istanza per-layer, non condivisa tra
+// layer diversi.
+struct KVCache {
+    DeviceTensor k;
+    DeviceTensor v;
+    std::size_t length = 0;
+};
+
+// Variante incrementale di selfAttention su device, pensata per la
+// generazione autoregressiva token per token (vedi
+// backend::cpu::selfAttentionIncremental per la semantica completa,
+// identica qui: produce esattamente lo stesso risultato che
+// selfAttention() darebbe per ogni posizione nuova se le venisse
+// passata l'intera sequenza fino a quel punto — un'ottimizzazione, non
+// un'approssimazione). 'cache' deve essere una KVCache{} appena
+// costruita (length == 0) all'inizio di una nuova sequenza di
+// generazione. Lancia std::invalid_argument se dim non e' divisibile
+// per numHeads o se l'input non e' a rango 3.
+DeviceTensor selfAttentionIncremental(const DeviceTensor& newInput, const DeviceTensor& wq, const DeviceTensor& wk,
+                                       const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
+                                       KVCache& cache);
 
 // Layer lineare: input [..., inFeatures], weight [inFeatures, outFeatures],
 // bias [outFeatures] -> output [..., outFeatures]. Generalizzato a

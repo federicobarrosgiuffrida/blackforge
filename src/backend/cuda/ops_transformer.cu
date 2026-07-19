@@ -95,6 +95,79 @@ DeviceTensor applyCausalMask(const DeviceTensor& scores) {
     return result;
 }
 
+// Concatena due tensori device [batch, seqA, dim] e [batch, seqB, dim]
+// lungo la dimensione di sequenza, producendo [batch, seqA+seqB, dim]:
+// usato da selfAttentionIncremental per accumulare K/V nella cache
+// (vedi backend::cpu::concatSeq, stessa semantica). Un thread per
+// elemento di output.
+__global__ void concatSeqKernel(float* out, const float* a, const float* b, std::size_t seqA, std::size_t seqB,
+                                 std::size_t dim, std::size_t totalElements) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= totalElements) {
+        return;
+    }
+    std::size_t seqTotal = seqA + seqB;
+    std::size_t perBatch = seqTotal * dim;
+    std::size_t batchIdx = idx / perBatch;
+    std::size_t withinBatch = idx % perBatch;
+    std::size_t s = withinBatch / dim;
+    std::size_t d = withinBatch % dim;
+    if (s < seqA) {
+        out[idx] = a[(batchIdx * seqA + s) * dim + d];
+    } else {
+        out[idx] = b[(batchIdx * seqB + (s - seqA)) * dim + d];
+    }
+}
+
+DeviceTensor concatSeq(const DeviceTensor& a, const DeviceTensor& b) {
+    std::size_t batch = a.dim(0);
+    std::size_t seqA = a.dim(1);
+    std::size_t seqB = b.dim(1);
+    std::size_t dim = a.dim(2);
+    std::size_t seqTotal = seqA + seqB;
+
+    DeviceTensor result({batch, seqTotal, dim});
+    std::size_t total = batch * seqTotal * dim;
+    if (total > 0) {
+        concatSeqKernel<<<gridSizeFor(total), kBlockSize>>>(result.data(), a.data(), b.data(), seqA, seqB, dim,
+                                                              total);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
+// Come applyCausalMaskKernel, ma per una matrice di score
+// [newLen, totalLen] dove le query sono solo le 'newLen' posizioni piu'
+// recenti (assolute: oldLen..oldLen+newLen-1) e le chiavi coprono
+// l'intera cache [0, totalLen) (vedi backend::cpu::applyIncrementalCausalMask,
+// stessa semantica).
+__global__ void applyIncrementalCausalMaskKernel(float* scores, std::size_t newLen, std::size_t totalLen,
+                                                  std::size_t oldLen) {
+    std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t total = newLen * totalLen;
+    if (idx >= total) {
+        return;
+    }
+    std::size_t i = idx / totalLen;
+    std::size_t j = idx % totalLen;
+    if (j > oldLen + i) {
+        scores[idx] = -INFINITY;
+    }
+}
+
+DeviceTensor applyIncrementalCausalMask(const DeviceTensor& scores, std::size_t oldLen) {
+    DeviceTensor result = scores.clone();
+    std::size_t newLen = result.dim(0);
+    std::size_t totalLen = result.dim(1);
+    std::size_t total = newLen * totalLen;
+    if (total > 0) {
+        applyIncrementalCausalMaskKernel<<<gridSizeFor(total), kBlockSize>>>(result.data(), newLen, totalLen,
+                                                                              oldLen);
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    }
+    return result;
+}
+
 // scale() non e' esposta in ops.hpp (e' interna): un fattore scalare
 // moltiplicato elemento per elemento, riusa lo stesso kernel pattern
 // delle altre operazioni elementwise di questo backend.
@@ -168,6 +241,62 @@ DeviceTensor selfAttention(const DeviceTensor& input, const DeviceTensor& wq, co
     DeviceTensor projected =
         matmul(std::move(concatenated).reshaped({batch * seq, dim}), wout).reshaped({batch, seq, dim});
     return add(input, projected);
+}
+
+DeviceTensor selfAttentionIncremental(const DeviceTensor& newInput, const DeviceTensor& wq, const DeviceTensor& wk,
+                                       const DeviceTensor& wv, const DeviceTensor& wout, std::size_t numHeads,
+                                       KVCache& cache) {
+    if (newInput.rank() != 3) {
+        throw std::invalid_argument("selfAttentionIncremental: richiede un input a rango 3 [batch, seq, dim] sul "
+                                     "device");
+    }
+    std::size_t batch = newInput.dim(0);
+    std::size_t newLen = newInput.dim(1);
+    std::size_t dim = newInput.dim(2);
+    if (numHeads == 0 || dim % numHeads != 0) {
+        throw std::invalid_argument("selfAttentionIncremental: numHeads deve dividere esattamente dim");
+    }
+    std::size_t headDim = dim / numHeads;
+    float scaleFactor = 1.0F / std::sqrt(static_cast<float>(headDim));
+
+    // Pre-norm: e' per-posizione (nessuna dipendenza tra posizioni),
+    // quindi applicarla solo ai token nuovi e' esatto, non
+    // un'approssimazione (stesso ragionamento della controparte CPU).
+    DeviceTensor normed = rmsnorm(newInput);
+    DeviceTensor qNew = matmul(normed.clone().reshaped({batch * newLen, dim}), wq).reshaped({batch, newLen, dim});
+    DeviceTensor kNew = matmul(normed.clone().reshaped({batch * newLen, dim}), wk).reshaped({batch, newLen, dim});
+    DeviceTensor vNew = matmul(std::move(normed).reshaped({batch * newLen, dim}), wv).reshaped({batch, newLen, dim});
+
+    std::size_t oldLen = cache.length;
+    if (oldLen == 0) {
+        cache.k = std::move(kNew);
+        cache.v = std::move(vNew);
+    } else {
+        cache.k = concatSeq(cache.k, kNew);
+        cache.v = concatSeq(cache.v, vNew);
+    }
+    cache.length = oldLen + newLen;
+    std::size_t totalLen = cache.length;
+
+    DeviceTensor concatenated = DeviceTensor::zeros({batch, newLen, dim});
+    for (std::size_t b = 0; b < batch; ++b) {
+        for (std::size_t h = 0; h < numHeads; ++h) {
+            DeviceTensor qHead = extractHead(qNew, b, h, newLen, dim, headDim);
+            DeviceTensor kHead = extractHead(cache.k, b, h, totalLen, dim, headDim);
+            DeviceTensor vHead = extractHead(cache.v, b, h, totalLen, dim, headDim);
+
+            DeviceTensor scores = scale(matmulTransposeB(qHead, kHead), scaleFactor);  // [newLen, totalLen]
+            DeviceTensor maskedScores = applyIncrementalCausalMask(scores, oldLen);
+            DeviceTensor probs = softmax(maskedScores);
+            DeviceTensor headOut = matmul(probs, vHead);  // [newLen, headDim]
+
+            scatterHead(concatenated, headOut, b, h, newLen, dim, headDim);
+        }
+    }
+
+    DeviceTensor projected =
+        matmul(std::move(concatenated).reshaped({batch * newLen, dim}), wout).reshaped({batch, newLen, dim});
+    return add(newInput, projected);
 }
 
 }  // namespace blackforge::backend::cuda

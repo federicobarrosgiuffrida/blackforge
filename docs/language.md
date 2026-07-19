@@ -745,14 +745,17 @@ distribuzione sul vocabolario da cui va scelto il prossimo token.
 
 ```bash
 blackforge generate modello.bf --from-checkpoint pesi.bfckpt \
-    --tokenizer tok.bftok --prompt "il gatto" --max-new-tokens 50
+    --tokenizer tok.bftok --prompt "il gatto" --max-new-tokens 50 \
+    --device cuda
 ```
 
 Ricalcolare l'intera pipeline da capo ad ogni nuovo token (come farebbe
 un `forward()` ingenuo su una sequenza che cresce di 1 ad ogni passo)
 costerebbe O(N³) per generare N token in totale (O(N) chiamate, ciascuna
-O(N²) per via dell'attention). `Model::forwardIncremental` (CPU, vedi
-`include/blackforge/backend/cpu/model.hpp`) mantiene invece una **cache
+O(N²) per via dell'attention). `Model::forwardIncremental` (CPU **e
+CUDA**, vedi `include/blackforge/backend/cpu/model.hpp` e
+`include/blackforge/backend/cuda/model.hpp` — stessa interfaccia,
+stessa semantica su entrambi i backend) mantiene invece una **cache
 K/V** per ogni layer `attention` della pipeline (`ops::KVCache`):
 ogni chiamata processa SOLO i token nuovi (l'intero prompt alla prima
 chiamata, un solo token ad ogni chiamata successiva), calcola Q/K/V
@@ -771,10 +774,16 @@ nella chiamata corrente).
 **Verificato per correttezza, non solo per velocità**: la cache è
 un'ottimizzazione (riorganizzazione del calcolo), non
 un'approssimazione — `ModelTest.ForwardIncrementalCorrispondeAForward
-CompletoTokenPerToken` verifica che generare token per token con la
-cache produca, posizione per posizione, esattamente lo stesso risultato
-che si otterrebbe ricalcolando l'intera sottosequenza da capo con
-`forward()` ad ogni passo.
+CompletoTokenPerToken` (CPU) e `CudaModelTest.ForwardIncrementalCorrispon
+deAForwardCompletoTokenPerToken` (CUDA) verificano che generare token per
+token con la cache produca, posizione per posizione, esattamente lo
+stesso risultato che si otterrebbe ricalcolando l'intera sottosequenza
+da capo con `forward()` ad ogni passo; `CudaModelTest.ForwardIncremental
+CorrispondeAllaVersioneCpuAParitaDiSeme` verifica inoltre che, a parità
+di seme, CPU e CUDA producano lo stesso output token per token —
+confermato anche end-to-end via CLI reale su GPU (RTX 5060): lo stesso
+checkpoint genera lo stesso identico testo con `--device cpu` e
+`--device cuda`.
 
 La decodifica è sempre **greedy** (argmax sulla distribuzione
 dell'ultima posizione): nessuna strategia di campionamento
@@ -784,12 +793,6 @@ deterministica. Se la sequenza generata supera la lunghezza massima che
 il modello supporta (`positional_embedding`'s `maxSeq`), la generazione
 si interrompe con un messaggio esplicito invece di fallire in modo
 oscuro.
-
-**Limitazione esplicita**: `forwardIncremental`/cache K/V esistono solo
-sul backend CPU per ora. `cuda::Model` non ha ancora un percorso di
-generazione incrementale — mirrorarlo su CUDA (stessi
-`addPositionalEmbeddingAt`/`selfAttentionIncremental`/`KVCache`, ma con
-`DeviceTensor`) è lavoro futuro esplicito, non un'omissione nascosta.
 
 ### Modello linguistico mascherato — MLM (`bidirectional_attention`, `loss cross_entropy_masked`)
 
@@ -980,7 +983,7 @@ blackforge build <file>       Compila e costruisce ogni modello (alloca i parame
 blackforge run <file>         Esegue il primo modello; --batch N, --device cpu|cuda|cuda:N
 blackforge train <file>       Addestra (CPU o CUDA); --device, --from-checkpoint/--save-checkpoint (entrambi i device)
 blackforge forecast <file>    Rollout autoregressivo generico (CPU); --from-checkpoint (obbligatorio), --batch N
-blackforge generate <file>    Genera testo con cache K/V (CPU, greedy); --from-checkpoint, --tokenizer, --prompt,
+blackforge generate <file>    Genera testo con cache K/V (CPU o GPU via --device, greedy); --from-checkpoint, --tokenizer, --prompt,
                                --max-new-tokens
 blackforge benchmark <file>   Tempo/throughput/memoria; --device, --batch, --warmup, --iterations
 blackforge inspect <file>     Riepilogo: input, pipeline, numero di parametri per ogni modello
