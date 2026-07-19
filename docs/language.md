@@ -521,17 +521,21 @@ Limitazioni esplicite di questa prima versione:
   `BLACKFORGE_CUDA_ARCHITECTURES` (120, Blackwell consumer); altre
   architetture non sono state verificate.
 
-### Prestazioni del backend CUDA: pool di memoria, attention batchizzata, Tensor Core esteso
+### Prestazioni del backend CUDA: pool di memoria, attention fusa, Tensor Core esteso
 
 Allenare un modello reale (~23M parametri, `TinyStories`, `batch_size
 8`) con la versione iniziale del backend CUDA — corretta, verificata,
 ma mai ottimizzata per throughput — risultava stimato in **ore** per
-un addestramento completo. Tre interventi mirati, ciascuno verificato
-con l'intera suite di test prima di passare al successivo, hanno
-ridotto il tempo per step di **circa 8-9 volte** (misurato su un
-benchmark a regime, 1000 step a `batch_size 8`: ~45ms/step iniziali
-stimati oltre 400ms/step, scesi a ~45ms/step dopo tutti e quattro gli
-interventi):
+un addestramento completo. Cinque interventi mirati, ciascuno
+verificato con l'intera suite di test prima di passare al successivo,
+hanno ridotto il tempo per step da uno stimato oltre 400ms a
+**~39,6ms** (misurato su un benchmark a regime, 1000 step a
+`batch_size 8`, per isolare il costo per-step dall'overhead fisso di
+avvio) — un fattore **~10×**. Un confronto diretto con un modello
+PyTorch identico (stessi 23.152.640 parametri,
+`scaled_dot_product_attention` con autocast BF16, stesso hardware:
+16,08ms/step) mostra che BlackForge resta comunque **~2,5× più lento**
+di PyTorch dopo tutti e cinque gli interventi:
 
 1. **Pool di memoria device per-device** (`device_pool.hpp`/`.cu`):
    quasi ogni operazione allocava un `DeviceTensor` intermedio con
@@ -585,16 +589,35 @@ interventi):
    La riduzione del prodotto scalare usa uno shuffle a due livelli
    (intra-warp via `__shfl_down_sync`, poi un solo `__syncthreads` per
    la riduzione finale tra warp) invece della classica riduzione ad
-   albero in shared memory, per ridurre il numero di barriere di
-   sincronizzazione. Guadagno reale ma non risolutivo: il gap rispetto
-   a PyTorch scende da ~4× a ~2,8× — resta piu' lento perché ogni
-   blocco (una riga di query) ricarica K/V dalla memoria globale da
-   zero, mentre un vero FlashAttention carica un tile di K/V una sola
-   volta in shared memory e lo riusa per un intero gruppo di righe di
-   query nello stesso blocco (tiling multi-riga) — lavoro futuro
-   esplicito, non ancora affrontato.
+   albero in shared memory. Guadagno reale ma non risolutivo da solo:
+   il gap rispetto a PyTorch scende da ~3,9× a ~2,8×.
+5. **Tiling multi-riga** (stesso file, `tiledFusedAttentionForwardKernel`/
+   `tiledFusedAttentionBackwardKernel`): anche con il kernel fuso del
+   punto 4, ogni blocco (una riga di query sola) ricaricava K/V dalla
+   memoria globale in modo indipendente — con `newLen` righe che
+   condividono lo stesso K/V, un fattore `newLen` di traffico di
+   memoria in più del necessario. Un vero FlashAttention carica un tile
+   di K/V (`kBc = 32` posizioni) **una sola volta** in shared memory e
+   lo riusa per un intero gruppo di righe di query (`kBr = 8`) nello
+   stesso blocco, prima di passare al tile successivo — la
+   sincronizzazione (`__syncthreads`) avviene una volta per tile
+   (`~totalLen/kBc` volte) invece che una volta per singola posizione
+   chiave. Un warp per riga (nessuna riduzione tra warp necessaria,
+   solo `__shfl_down_sync` dentro il warp proprietario). Guadagno reale
+   ma modesto (~12%): il gap scende da ~2,8× a **~2,5× più lento di
+   PyTorch**.
 
-Le quattro ottimizzazioni sono puramente di **strategia di
+L'incrocio dei risultati (guadagni via via più piccoli nonostante
+interventi via via più aggressivi sull'attention) suggerisce che
+l'attention non è più il collo di bottiglia dominante a questo punto —
+probabilmente lo sono altre parti della pipeline non ancora esaminate
+(embedding lookup con il suo round-trip host, il trasferimento
+host→device per batch, l'optimizer). Identificarle richiederebbe una
+profilazione reale (Nsight Compute o simili), non altre iterazioni alla
+cieca sul kernel di attention: lavoro futuro esplicito, non
+intrapreso in questa sessione.
+
+Le cinque ottimizzazioni sono puramente di **strategia di
 esecuzione**: nessun cambiamento alla matematica, verificato
 dall'intera suite CUDA (391 test) rimasta verde ad ogni passo, inclusi
 gradient checking e parità CPU/GPU per attention e feedforward.
