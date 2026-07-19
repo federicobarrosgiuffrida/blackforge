@@ -719,6 +719,45 @@ garanzia di sicurezza (391 test CUDA verdi, inclusi i test di parità
 CPU/GPU e multi-GPU, che confermano la matematica identica a meno del
 riordino dell'accumulo in virgola mobile).
 
+#### Il pool di memoria (punto 1, stage originale) non funzionava mai davvero: -34%, il singolo intervento più grande dell'intera sessione
+
+Terzo intervento dell'audit, ma scoperto per caso mentre si leggeva
+`device_tensor.cu` in preparazione al quarto (fusione
+optimizer/zeroGrad, vedi sotto): `DeviceTensor::operator=(DeviceTensor&&)`
+chiamava `cudaFree(data_)` DIRETTAMENTE sul buffer precedente invece di
+`devicePoolRelease(...)` — esattamente l'operazione che il distruttore
+fa correttamente due righe sopra. Risultato: ogni assegnamento a un
+`DeviceTensor` già inizializzato bypassava del tutto il pool di memoria
+introdotto al punto 1 della sezione precedente (quello misurato "~20%,
+guadagno modesto, non il collo di bottiglia dominante").
+
+L'assegnamento-spostamento è il pattern PIÙ comune nell'intero
+forward/backward: `current = embeddingLookup(...)` / `current =
+selfAttentionBf16(...)` / ecc. in `Model::forward()` (una volta per
+layer: 19 per il modello TinyStories usato nel benchmark),
+`layer.cachedInput = current.clone()` (idem, 19 volte),
+`gradCurrent = ...Backward(...)` in `Model::backward()` (19 volte), e
+soprattutto `param->grad = DeviceTensor::zeros(...)` in
+`Model::zeroGrad()` (~68 volte, una per parametro). Circa 125
+`cudaFree` reali per singolo step di addestramento, invece di altrettante
+`devicePoolRelease` — il pool veniva svuotato ad ogni singolo step
+sul percorso più caldo del codice, quindi la stragrande maggioranza
+delle `devicePoolAcquire()` mancava sempre la cache e doveva fare una
+`cudaMalloc` vera. Il memory pool "completato" al punto 1 della sezione
+precedente non stava, di fatto, quasi mai facendo il suo lavoro.
+
+Fix: una riga, `cudaFree(data_)` → `devicePoolRelease(data_,
+elementCount() * sizeof(float))`, esattamente simmetrico al
+distruttore. Nessun cambiamento di semantica (RAII identico, solo la
+strategia di deallocazione cambia). Risultato misurato (stesso
+benchmark a regime): **27,5-27,7s** contro 42,0-42,3s prima — **-34%**,
+il singolo guadagno più grande di tutta la sessione, più grande di
+tutti e cinque gli interventi della sezione precedente messi insieme.
+Il gap rispetto a PyTorch scende da ~2,5x a **~1,7x più lento**
+(27,5ms/step contro 16,08ms/step). Verificato: 391 test CUDA verdi
+(nessun cambiamento di comportamento osservabile, solo quale
+allocatore libera un buffer).
+
 ## Training (pretraining, fine-tuning, LoRA, forecasting)
 
 `dataset { ... }` e `train { ... }` collegano il linguaggio al motore

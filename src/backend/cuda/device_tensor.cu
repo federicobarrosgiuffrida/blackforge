@@ -45,7 +45,18 @@ DeviceTensor::DeviceTensor(DeviceTensor&& other) noexcept
 DeviceTensor& DeviceTensor::operator=(DeviceTensor&& other) noexcept {
     if (this != &other) {
         if (data_ != nullptr) {
-            cudaFree(data_);
+            // Torna al pool invece di cudaFree diretto — stessa scelta
+            // del distruttore (vedi sopra). Prima di questo fix,
+            // l'assegnamento-spostamento (usato ad ogni 'current = op(...)'
+            // in Model::forward()/backward() e ad ogni zeroGrad()) faceva
+            // una cudaFree reale, bypassando completamente il pool di
+            // memoria (device_pool.hpp): il buffer liberato qui non
+            // tornava mai al free-list, quindi la successiva
+            // devicePoolAcquire() per la stessa dimensione mancava sempre
+            // la cache e doveva fare una nuova cudaMalloc — il pool
+            // veniva svuotato in pratica ad ogni riassegnamento, il
+            // percorso piu' comune nell'intero forward/backward.
+            devicePoolRelease(data_, elementCount() * sizeof(float));
         }
         data_ = other.data_;
         shape_ = std::move(other.shape_);
