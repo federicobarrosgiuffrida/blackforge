@@ -129,6 +129,7 @@ void TernaryTensor::quantizeRowsFrom(std::size_t firstRow, std::size_t rowCount,
     }
 
     const std::size_t groups = groupsPerRow();
+    const std::size_t words = wordsPerRow();
     for (std::size_t r = 0; r < rowCount; ++r) {
         const float* row = dense + r * rowLength_;
         const std::size_t target = firstRow + r;
@@ -171,10 +172,37 @@ void TernaryTensor::quantizeRowsFrom(std::size_t firstRow, std::size_t rowCount,
             const float scale = mean > 0.0 ? static_cast<float>(mean) : 1.0F;
             scales_[target * groups + group] = scale;
 
-            for (std::size_t i = first; i < last; ++i) {
-                int trit = static_cast<int>(std::lround(row[i] / scale));
-                trit = trit < -1 ? -1 : (trit > 1 ? 1 : trit);
-                setTritAt(target * rowLength_ + i, trit);
+            // Impacchettamento diretto, cinque trit per volta: passare
+            // da setTritAt() elemento per elemento costringerebbe a
+            // decodificare e ricodificare lo stesso byte cinque volte
+            // (lettura-modifica-scrittura su ogni trit). Su una matrice
+            // di embedding da 201 M elementi la differenza fra le due
+            // versioni e' un ordine di grandezza sul tempo di
+            // inizializzazione.
+            const float inverseScale = 1.0F / scale;
+            std::size_t i = first;
+            while (i < last) {
+                const std::size_t wordIndex = target * words + i / kTritsPerWord;
+                const int byteIndex = static_cast<int>((i % kTritsPerWord) / kTritsPerByte);
+                const std::size_t slotBase = i - (i % kTritsPerByte);
+
+                int trits[kTritsPerByte];
+                // Il byte puo' essere a cavallo del confine del gruppo o
+                // della riga: le posizioni non coperte da questa
+                // iterazione vanno lette, non azzerate.
+                decodeTritByte(wordByte(packedWords_[wordIndex], byteIndex), trits);
+
+                const std::size_t slotEnd = std::min(slotBase + kTritsPerByte, last);
+                for (std::size_t s = std::max(slotBase, first); s < slotEnd; ++s) {
+                    int trit = static_cast<int>(std::lround(row[s] * inverseScale));
+                    trit = trit < -1 ? -1 : (trit > 1 ? 1 : trit);
+                    trits[s - slotBase] = trit;
+                }
+
+                packedWords_[wordIndex] = setWordByte(
+                    packedWords_[wordIndex], byteIndex,
+                    encodeTritByte(trits[0], trits[1], trits[2], trits[3], trits[4]));
+                i = slotEnd;
             }
         }
     }

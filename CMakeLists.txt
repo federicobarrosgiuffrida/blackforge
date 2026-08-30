@@ -141,6 +141,8 @@ set(
     src/blackbit/low_rank_optimizer.cpp
     src/blackbit/checkpoint.cpp
     src/blackbit/benchmark.cpp
+    src/blackbit/residency.cpp
+    src/blackbit/capability.cpp
     src/data/dataset.cpp
     src/tokenizer/tokenizer.cpp
     src/tokenizer/dataset_prep.cpp

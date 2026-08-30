@@ -357,6 +357,31 @@ correttezza, non a stimare le prestazioni su GPU.
 
 ---
 
+## 7.2 Milestone G: BlackBit-9B-A3B istanziato davvero
+
+Non è una stima: il modello viene costruito, i parametri vengono
+inizializzati e quantizzati, l'ottimizzatore viene registrato.
+
+```
+costruzione modello:            112,6 s   (backend CPU, un core)
+parametri impacchettati:        1,912 GiB
+stato optimizer (r = 32):       0,944 GiB   (AdamW ordinario: 67,5 GiB)
+TOTALE residente:               2,855 GiB
+bit per parametro:              1,814
+```
+
+I 1,814 bit/parametro comprendono il padding di fine riga e le scale
+FP32: è il costo reale, non il 1,585 teorico né il 1,6 nominale del
+formato. Il confronto che conta è con i 16 bit di una copia BF16
+(11,3 GiB per gli stessi pesi) e con i 67,5 GiB che AdamW chiederebbe
+per lo stato.
+
+Quello che questo NON dimostra: un passo completo di forward+backward a
+9B su questo hardware. Con ~2·10¹² FLOP per passo e un backend CPU
+scalare servirebbe circa mezz'ora per passo, e soprattutto non direbbe
+nulla sulla RTX 5060. Il picco di memoria di un passo è quindi ancora
+**previsto** (3,090 GiB), non misurato.
+
 ## 8. Stato dei percorsi (aggiornato ad ogni fase)
 
 | Percorso | Stato | Verificato da |
@@ -376,4 +401,25 @@ correttezza, non a stimare le prestazioni su GPU.
 | Budget di memoria applicato | implementato | 7 test unitari eseguiti (CPU) |
 | Checkpoint impacchettato versionato | implementato | 6 test unitari eseguiti (CPU), inclusa la ripresa bit-identica |
 | `blackforge benchmark blackbit` | implementato | 8 test unitari + esecuzione reale su BlackBit-Tiny |
+| API di residenza (GPU/host-pinned/paginato) + pianificatore | implementato per la PIANIFICAZIONE | 3 test unitari; il trasferimento non e' implementato, vedi §8.1 |
+| Rilevamento capability e scelta del formato di calcolo | implementato | 3 test unitari; FP4 rilevato ma non usato, vedi §8.1 |
 | Kernel CUDA BlackBit | da fare | **non compilabile in questo ambiente** (nessun `nvcc`) |
+
+### 8.1 Cosa NON è implementato, detto esplicitamente
+
+* **Nessun kernel CUDA di BlackBit.** L'intero sottosistema gira sul
+  percorso di riferimento CPU. I byte riportati sono quelli reali del
+  formato — e sono gli stessi che la VRAM conterrebbe — ma i tempi sono
+  quelli di cicli tripli scritti a mano, non indicativi di una GPU.
+* **Il trasferimento host↔device dei parametri non residenti non
+  esiste.** `residency.hpp` fornisce l'API di proprietà e uno strumento
+  di pianificazione che calcola, con le dimensioni reali del formato,
+  quanto starebbe in ciascuno stato. Nessun percorso di esecuzione oggi
+  legge un parametro non residente.
+* **FP4 è rilevato ma non usato.** `preferredComputeDType()` restituisce
+  BF16 anche su Blackwell: un GEMM FP4 non esiste in questo motore, e
+  dichiararlo renderebbe falso ogni rapporto sul formato di calcolo.
+* **Lo stato dell'ottimizzatore è FP32**, non BF16/INT8 (vedi §2).
+* **Milestone F (300M che addestra stabilmente) è verificata solo per
+  stabilità**, non per convergenza: sul backend CPU un addestramento
+  vero di BlackBit-Medium richiederebbe settimane.

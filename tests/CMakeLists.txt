@@ -42,6 +42,7 @@ set(
     blackbit/checkpoint_tests.cpp
     blackbit/benchmark_tests.cpp
     blackbit/telemetry_tests.cpp
+    blackbit/residency_tests.cpp
     data/dataset_tests.cpp
     tokenizer/tokenizer_tests.cpp
     tokenizer/dataset_prep_tests.cpp

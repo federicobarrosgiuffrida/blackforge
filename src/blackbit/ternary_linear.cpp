@@ -5,7 +5,7 @@
 #include <stdexcept>
 
 #include "blackforge/backend/cpu/quantize.hpp"
-#include "blackforge/backend/cpu/random_init.hpp"
+#include "blackforge/blackbit/stochastic_round.hpp"
 #include "blackforge/blackbit/telemetry.hpp"
 
 namespace blackforge::blackbit {
@@ -107,18 +107,25 @@ void TernaryLinear::initialize(unsigned int seed) {
     const float limit =
         std::sqrt(6.0F / static_cast<float>(inFeatures_ + outFeatures_));
 
+    // Il generatore a contatore produce il valore direttamente da
+    // (seme, indice), senza stato e senza allocare un tensore per riga:
+    // su una tabella di embedding da 201 M elementi la versione con un
+    // runtime::Tensor temporaneo per riga passa gran parte del tempo ad
+    // allocare.
+    //
+    // Un seme per RIGA e un indice per colonna: il modello
+    // inizializzato non dipende da tileRows_, quindi cambiare la
+    // dimensione del tile non cambia i pesi.
+    const std::uint64_t baseSeed = static_cast<std::uint64_t>(seed) ^ 0x5B17ULL;
+
     for (std::size_t first = 0; first < outFeatures_; first += tileRows_) {
         const std::size_t count = std::min(tileRows_, outFeatures_ - first);
         for (std::size_t r = 0; r < count; ++r) {
-            // Un seme per riga: il risultato non dipende da tileRows_,
-            // quindi cambiare la dimensione del tile non cambia il
-            // modello inizializzato.
-            const runtime::Tensor row = backend::cpu::randomTensor(
-                {1, inFeatures_}, backend::cpu::seedFor(seed, first + r, 0x5B17U));
+            const std::uint64_t rowSeed = splitMix64(baseSeed ^ (first + r));
+            float* row = block.data() + r * inFeatures_;
             for (std::size_t c = 0; c < inFeatures_; ++c) {
-                // randomTensor produce uniforme in [-0,1, 0,1]:
-                // riscalato all'intervallo di Xavier.
-                block[r * inFeatures_ + c] = row.at(c) * (limit / 0.1F);
+                // Uniforme in [-limit, +limit].
+                row[c] = (counterUniform(rowSeed, c) * 2.0F - 1.0F) * limit;
             }
         }
         weight_.quantizeRowsFrom(first, count, block.data());
