@@ -6,6 +6,7 @@
 #include <ostream>
 #include <vector>
 
+#include "blackforge/blackbit/device_shared.hpp"
 #include "blackforge/runtime/tensor.hpp"
 
 // Rappresentazione ternaria impacchettata {-1, 0, +1} usata da BlackBit
@@ -48,16 +49,6 @@
 // round(w / scala) saturato a [-1, +1].
 
 namespace blackforge::blackbit {
-
-// Marcatore per le funzioni condivise tra host e kernel CUDA: la
-// codifica/decodifica dei trit e' letteralmente lo stesso codice nei
-// due percorsi, cosi' i test che girano su CPU coprono davvero il
-// formato che la GPU legge.
-#if defined(__CUDACC__)
-#define BLACKFORGE_HOST_DEVICE __host__ __device__
-#else
-#define BLACKFORGE_HOST_DEVICE
-#endif
 
 // Pesi ternari per byte impacchettato.
 inline constexpr std::size_t kTritsPerByte = 5;
@@ -194,6 +185,14 @@ public:
     // usato dal percorso a tile di TernaryLinear: il picco di memoria
     // e' quello del tile, non dell'intera matrice.
     void dequantizeRows(std::size_t firstRow, std::size_t rowCount, float* out) const;
+
+    // Quantizza UN INTERVALLO di righe da un buffer denso fornito dal
+    // chiamante (rowCount * rowLength() valori), con lo stesso criterio
+    // di quantizeFrom(). E' il primitivo che permette di costruire un
+    // peso di miliardi di elementi senza mai materializzarne piu' di
+    // un blocco in forma densa: l'inizializzazione di BlackBit-9B
+    // altrimenti chiederebbe 36 GB di float32 temporanei.
+    void quantizeRowsFrom(std::size_t firstRow, std::size_t rowCount, const float* dense);
 
     // Dequantizza l'INTERA matrice in un tensore denso. Alloca
     // elementCount() float: su una matrice BlackBit reale sono

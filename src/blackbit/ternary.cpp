@@ -120,14 +120,22 @@ double TernaryTensor::bitsPerWeight() const {
     return static_cast<double>(totalByteCount()) * 8.0 / static_cast<double>(elementCount());
 }
 
-TernaryTensor TernaryTensor::quantizeFrom(const runtime::Tensor& dense, std::size_t groupSize) {
-    TernaryTensor result(dense.shape(), groupSize);
+void TernaryTensor::quantizeRowsFrom(std::size_t firstRow, std::size_t rowCount, const float* dense) {
+    if (firstRow + rowCount > rows_) {
+        throw std::out_of_range("TernaryTensor::quantizeRowsFrom: intervallo di righe fuori dal tensore");
+    }
+    if (dense == nullptr && rowCount != 0) {
+        throw std::invalid_argument("TernaryTensor::quantizeRowsFrom: buffer di ingresso nullo");
+    }
 
-    const std::size_t groups = result.groupsPerRow();
-    for (std::size_t row = 0; row < result.rows_; ++row) {
+    const std::size_t groups = groupsPerRow();
+    for (std::size_t r = 0; r < rowCount; ++r) {
+        const float* row = dense + r * rowLength_;
+        const std::size_t target = firstRow + r;
+
         for (std::size_t group = 0; group < groups; ++group) {
-            const std::size_t first = group * groupSize;
-            const std::size_t last = std::min(first + groupSize, result.rowLength_);
+            const std::size_t first = group * groupSize_;
+            const std::size_t last = std::min(first + groupSize_, rowLength_);
 
             // absmean (BitNet b1.58): la scala e' la media dei valori
             // assoluti del gruppo, calcolata sui soli elementi NON
@@ -137,15 +145,15 @@ TernaryTensor TernaryTensor::quantizeFrom(const runtime::Tensor& dense, std::siz
             // formulazione originale, e serve a garantire
             // l'IDEMPOTENZA: se un gruppo e' gia' sulla griglia
             // ternaria (valori in {-s, 0, +s}), la media sui non nulli
-            // vale esattamente s, quindi quantizzare di nuovo restituisce
-            // gli stessi trit e la stessa scala. Con la media su TUTTI
-            // gli elementi la scala varrebbe s * (frazione di non nulli)
-            // e i pesi si contrarrebbero verso lo zero ad ogni
-            // riquantizzazione — un modello salvato e ricaricato piu'
-            // volte perderebbe ampiezza senza che nulla lo segnali.
-            // Su un gruppo denso (nessuno zero esatto, il caso di
-            // qualunque inizializzazione continua) le due formule
-            // coincidono.
+            // vale esattamente s, quindi quantizzare di nuovo
+            // restituisce gli stessi trit e la stessa scala. Con la
+            // media su TUTTI gli elementi la scala varrebbe
+            // s * (frazione di non nulli) e i pesi si contrarrebbero
+            // verso lo zero ad ogni riquantizzazione — un modello
+            // salvato e ricaricato piu' volte perderebbe ampiezza senza
+            // che nulla lo segnali. Su un gruppo denso (nessuno zero
+            // esatto, il caso di qualunque inizializzazione continua)
+            // le due formule coincidono.
             //
             // Un gruppo interamente nullo prende scala 1 invece di 0,
             // cosi' la dequantizzazione resta definita e un eventuale
@@ -153,7 +161,7 @@ TernaryTensor TernaryTensor::quantizeFrom(const runtime::Tensor& dense, std::siz
             double sum = 0.0;
             std::size_t nonZero = 0;
             for (std::size_t i = first; i < last; ++i) {
-                const double magnitude = std::fabs(static_cast<double>(dense.at(row * result.rowLength_ + i)));
+                const double magnitude = std::fabs(static_cast<double>(row[i]));
                 if (magnitude > 0.0) {
                     sum += magnitude;
                     ++nonZero;
@@ -161,16 +169,20 @@ TernaryTensor TernaryTensor::quantizeFrom(const runtime::Tensor& dense, std::siz
             }
             const double mean = nonZero > 0 ? sum / static_cast<double>(nonZero) : 0.0;
             const float scale = mean > 0.0 ? static_cast<float>(mean) : 1.0F;
-            result.scales_[row * groups + group] = scale;
+            scales_[target * groups + group] = scale;
 
             for (std::size_t i = first; i < last; ++i) {
-                const float value = dense.at(row * result.rowLength_ + i);
-                int trit = static_cast<int>(std::lround(value / scale));
+                int trit = static_cast<int>(std::lround(row[i] / scale));
                 trit = trit < -1 ? -1 : (trit > 1 ? 1 : trit);
-                result.setTritAt(row * result.rowLength_ + i, trit);
+                setTritAt(target * rowLength_ + i, trit);
             }
         }
     }
+}
+
+TernaryTensor TernaryTensor::quantizeFrom(const runtime::Tensor& dense, std::size_t groupSize) {
+    TernaryTensor result(dense.shape(), groupSize);
+    result.quantizeRowsFrom(0, result.rows_, dense.data().data());
     return result;
 }
 

@@ -322,7 +322,10 @@ con un numero**, non dichiarandolo.
 |---|---|---|
 | Impacchettamento/decodifica ternaria | implementato | test unitari eseguiti (CPU) |
 | Contabilità parametri/memoria BlackBit | implementato | test unitari eseguiti (CPU) |
-| `TernaryLinear` | da fare | — |
+| `TernaryLinear` (dequant a tile, forward/backward, STE) | implementato | 9 test unitari eseguiti (CPU), incluso il confronto con il gradiente numerico |
+| Arrotondamento stocastico + RNG a contatore | implementato | 6 test unitari eseguiti (CPU), incluso quello di non distorsione su 200 000 campioni |
+| Telemetria di memoria per arena + budget | implementato | verificata dai test di `TernaryLinear` |
+| Aggiornamento diretto dei trit (`TernarySgdSink`) | implementato | rete minuscola che riduce la loss del 15 %+ con soli pesi ternari |
 | MoE | da fare | — |
 | GQA | da fare | — |
 | Backward in streaming | da fare | — |

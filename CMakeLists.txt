@@ -131,6 +131,10 @@ set(
     src/blackbit/ternary.cpp
     src/blackbit/config.cpp
     src/blackbit/config_json.cpp
+    src/blackbit/telemetry.cpp
+    src/blackbit/gradient.cpp
+    src/blackbit/ternary_linear.cpp
+    src/blackbit/ternary_update.cpp
     src/data/dataset.cpp
     src/tokenizer/tokenizer.cpp
     src/tokenizer/dataset_prep.cpp

@@ -34,6 +34,8 @@ set(
     backend/cpu/quantize_tests.cpp
     blackbit/ternary_tests.cpp
     blackbit/config_tests.cpp
+    blackbit/stochastic_round_tests.cpp
+    blackbit/ternary_linear_tests.cpp
     data/dataset_tests.cpp
     tokenizer/tokenizer_tests.cpp
     tokenizer/dataset_prep_tests.cpp
