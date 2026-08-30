@@ -82,20 +82,41 @@ __global__ void gradientStatsKernel(const float* gradient, std::size_t count, De
     }
 }
 
+// Una componente per blocco: cosi' tutti i thread del blocco condividono
+// lo stesso 'component' per costruzione, anche quando cols non e' un
+// multiplo della dimensione del blocco.
+//
+// projection() dipende da (riga, componente) e non dalla colonna: nel
+// ciclo originale ogni thread la ricalcolava per ogni riga, quindi i 256
+// thread di un blocco valutavano 256 volte gli stessi hash. Qui il
+// blocco li calcola una volta in memoria condivisa e li riusa.
+//
+// Le somme restano per riga crescente, con gli stessi raggruppamenti,
+// quindi l'accumulatore e' bit-identico a prima.
 __global__ void projectGradientKernel(float* accumulator, const float* gradient, std::size_t firstRow,
                                       std::size_t rowCount, std::size_t cols, std::size_t rank,
                                       std::uint64_t seed, std::uint64_t epoch) {
-    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t count = rank * cols;
-    if (index >= count) return;
-    const std::size_t component = index / cols;
-    const std::size_t col = index % cols;
-    float sum = accumulator[index];
-    for (std::size_t localRow = 0; localRow < rowCount; ++localRow) {
-        sum += projection(seed, epoch, firstRow + localRow, component, rank) *
-               gradient[localRow * cols + col];
+    const std::size_t component = blockIdx.y;
+    if (component >= rank) return;
+    const std::size_t col = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const bool active = col < cols;
+    __shared__ float sharedProjection[kBlockSize];
+    float sum = active ? accumulator[component * cols + col] : 0.0F;
+    for (std::size_t base = 0; base < rowCount; base += kBlockSize) {
+        const std::size_t chunk = min(static_cast<std::size_t>(kBlockSize), rowCount - base);
+        if (threadIdx.x < chunk) {
+            sharedProjection[threadIdx.x] =
+                projection(seed, epoch, firstRow + base + threadIdx.x, component, rank);
+        }
+        __syncthreads();
+        if (active) {
+            for (std::size_t k = 0; k < chunk; ++k) {
+                sum += sharedProjection[k] * gradient[(base + k) * cols + col];
+            }
+        }
+        __syncthreads();
     }
-    accumulator[index] = sum;
+    if (active) accumulator[component * cols + col] = sum;
 }
 
 __global__ void accumulateDenseKernel(float* accumulator, const float* gradient, std::size_t count) {
@@ -330,8 +351,8 @@ void LowRankProjectedOptimizer::consumeWeightGradientBlock(const ParameterId& id
     const std::size_t gradientValues = rowCount * state.cols;
     gradientStatsKernel<<<gridFor(gradientValues), kBlockSize>>>(deviceBlock, gradientValues,
                                                                  deviceStats_.as<DeviceStepStats>());
-    const std::size_t projectedValues = state.rank * state.cols;
-    projectGradientKernel<<<gridFor(projectedValues), kBlockSize>>>(
+    const dim3 projectionGrid(gridFor(state.cols), static_cast<unsigned int>(state.rank));
+    projectGradientKernel<<<projectionGrid, kBlockSize>>>(
         state.accumulator.as<float>(), deviceBlock, firstRow, rowCount, state.cols, state.rank, state.seed,
         state.projectionEpoch);
     BLACKFORGE_CUDA_CHECK(cudaGetLastError());
