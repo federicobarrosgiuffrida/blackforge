@@ -590,7 +590,9 @@ int runGenerate(const std::string& path, const std::string& fromCheckpoint, cons
             std::cerr << "errore: il prompt codificato e' vuoto (prompt vuoto?)\n";
             return 1;
         }
-        std::vector<float> promptFloats(promptIds.begin(), promptIds.end());
+        std::vector<float> promptFloats;
+        promptFloats.reserve(promptIds.size());
+        for (const std::uint32_t id : promptIds) promptFloats.push_back(static_cast<float>(id));
         blackforge::runtime::Tensor promptTensor({1, promptIds.size()}, promptFloats);
 
         std::vector<std::uint32_t> generated = promptIds;
