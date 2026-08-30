@@ -38,6 +38,7 @@
 #include "blackforge/backend/cuda/model.hpp"
 #include "blackforge/backend/cuda/multi_gpu_train_runner.hpp"
 #include "blackforge/backend/cuda/train_runner.hpp"
+#include "blackforge/blackbit/cuda_benchmark.hpp"
 #endif
 
 namespace {
@@ -765,7 +766,7 @@ std::string formatShape(const std::vector<std::size_t>& shape) {
 int runBlackBitBenchmark(const std::string& configPath, const std::string& presetName, std::size_t seqLen,
                           std::size_t microBatch, std::size_t steps, std::size_t warmupSteps,
                           std::size_t maxVramMb, std::size_t optimizerRank, const std::string& recomputeMode,
-                          bool dryRun) {
+                          bool dryRun, const std::string& device) {
     try {
         blackforge::blackbit::BlackBitConfig config =
             configPath.empty() ? blackforge::blackbit::blackBitPreset(presetName.empty() ? "tiny" : presetName)
@@ -807,10 +808,27 @@ int runBlackBitBenchmark(const std::string& configPath, const std::string& prese
             return 2;
         }
 
-        const blackforge::blackbit::BenchmarkResult result =
-            blackforge::blackbit::runBlackBitBenchmark(config, options, dryRun ? nullptr : &std::cout);
+        DeviceSpec spec;
+        std::string deviceError;
+        if (!parseDeviceSpec(device, spec, deviceError)) {
+            std::cerr << "errore: " << deviceError << "\n";
+            return 2;
+        }
+        if (!spec.isCuda || dryRun) {
+            const blackforge::blackbit::BenchmarkResult result =
+                blackforge::blackbit::runBlackBitBenchmark(config, options, dryRun ? nullptr : &std::cout);
+            std::cout << "\n" << result.report();
+            return result.withinBudget ? 0 : 1;
+        }
+#if BLACKFORGE_HAS_CUDA
+        const blackforge::blackbit::cuda::BenchmarkResult result =
+            blackforge::blackbit::cuda::runBenchmark(config, options, spec.cudaIndex, &std::cout);
         std::cout << "\n" << result.report();
         return result.withinBudget ? 0 : 1;
+#else
+        std::cerr << "errore: benchmark BlackBit CUDA richiesto ma questa build non include CUDA\n";
+        return 1;
+#endif
     } catch (const std::exception& error) {
         std::cerr << "errore: " << error.what() << "\n";
         return 1;
@@ -1270,7 +1288,7 @@ int main(int argc, char** argv) {
             // esplicitamente, ne basta uno.
             return runBlackBitBenchmark(configPath, preset, seqLen, microBatch, steps,
                                          warmupGiven ? warmupIterations : 1,
-                                         maxVramMb, optimizerRank, recomputeMode, dryRun);
+                                         maxVramMb, optimizerRank, recomputeMode, dryRun, device);
         }
         return runBenchmark(positional.front(), device, batchSize, warmupIterations, measuredIterations);
     }

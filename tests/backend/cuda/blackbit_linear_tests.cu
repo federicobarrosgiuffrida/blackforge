@@ -136,3 +136,36 @@ TEST(CudaBlackBitLinearTest, RejectsIncompatibleShapes) {
         },
         std::invalid_argument);
 }
+
+TEST(CudaBlackBitLinearTest, VocabularyRowPrimitivesMatchFullLinearAndStreamingGradients) {
+    auto cpu = referenceLinear(3);
+    bbcuda::TernaryLinear gpu(cpu);
+    const Tensor input = values({4, 13}, 0.45F, 0.2F);
+    const auto deviceInput = bbcuda::Tensor::fromHost(input);
+    const Tensor full = gpu.forward(deviceInput).toHost();
+    const Tensor rows = gpu.forwardRows(deviceInput, 2, 5).toHost();
+    for (std::size_t row = 0; row < 4; ++row) {
+        for (std::size_t column = 0; column < 5; ++column) {
+            EXPECT_NEAR(rows.at(row * 5 + column), full.at(row * 11 + 2 + column), 1.0e-6F);
+        }
+    }
+    const Tensor gradRows = values({4, 5}, 0.2F, 0.7F);
+    const auto deviceGradRows = bbcuda::Tensor::fromHost(gradRows);
+    Tensor paddedGrad = Tensor::zeros({4, 11});
+    for (std::size_t row = 0; row < 4; ++row) {
+        for (std::size_t column = 0; column < 5; ++column) {
+            paddedGrad.at(row * 11 + 2 + column) = gradRows.at(row * 5 + column);
+        }
+    }
+    DeviceGradientCollector collector(11 * 13);
+    const Tensor expectedInput = gpu.backward(deviceInput, bbcuda::Tensor::fromHost(paddedGrad), &collector).toHost();
+    const Tensor actualInput = gpu.backwardInputRows(deviceGradRows, 2).toHost();
+    expectNear(actualInput, expectedInput, 1.0e-5F);
+    const Tensor actualWeight = gpu.weightGradientRows(deviceInput, deviceGradRows, 2).toHost();
+    for (std::size_t row = 0; row < 5; ++row) {
+        for (std::size_t column = 0; column < 13; ++column) {
+            EXPECT_NEAR(actualWeight.at(row * 13 + column), collector.gradient[(row + 2) * 13 + column],
+                        1.0e-5F);
+        }
+    }
+}

@@ -172,6 +172,8 @@ if(BLACKFORGE_ENABLE_CUDA)
         src/blackbit/cuda_ops.cu
         src/blackbit/cuda_attention.cu
         src/blackbit/cuda_moe.cu
+        src/blackbit/cuda_model.cu
+        src/blackbit/cuda_benchmark.cpp
         src/blackbit/cuda_ternary.cu
         src/blackbit/cuda_ternary_linear.cu
         src/blackbit/cuda_low_rank_optimizer.cu

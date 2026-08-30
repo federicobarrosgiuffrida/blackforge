@@ -163,6 +163,14 @@ std::string MemoryTelemetry::report() {
     return out.str();
 }
 
+void MemoryTelemetry::resetPeaks() {
+    ensureInitialized();
+    peak_ = current_;
+    peakAccountedTotal_ = currentTotal();
+    sampleDeviceMemory();
+    peakDeviceUsedBytes_ = totalDeviceBytes_ - freeDeviceBytes_;
+}
+
 void MemoryTelemetry::resetAccounting() {
     if (currentTotal() != 0) {
         throw std::runtime_error("CUDA BlackBit telemetry: reset requested while tracked allocations are alive");

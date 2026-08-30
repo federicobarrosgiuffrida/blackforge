@@ -228,6 +228,84 @@ Tensor TernaryLinear::forward(const Tensor& input) const {
     return output;
 }
 
+Tensor TernaryLinear::forwardRows(const Tensor& input, std::size_t firstRow, std::size_t rowCount) const {
+    requireFeatures(input, inFeatures_, name_, "input");
+    if (rowCount == 0 || firstRow + rowCount > outFeatures_) {
+        throw std::invalid_argument("CUDA TernaryLinear '" + name_ + "': invalid forward row range");
+    }
+    const std::size_t rows = rowsOf(input);
+    std::vector<std::size_t> outputShape = input.shape();
+    outputShape.back() = rowCount;
+    Tensor output(std::move(outputShape), MemoryArena::Temporary);
+    Buffer inputBf16(input.elementCount() * sizeof(__nv_bfloat16), MemoryArena::Temporary);
+    const std::size_t localTileRows = std::min(tileRows_, rowCount);
+    Buffer tile(localTileRows * inFeatures_ * sizeof(__nv_bfloat16), MemoryArena::DequantizationTiles);
+    floatToBf16Kernel<<<gridFor(input.elementCount()), kBlockSize>>>(
+        inputBf16.as<__nv_bfloat16>(), input.data(), input.elementCount());
+    for (std::size_t localFirst = 0; localFirst < rowCount; localFirst += localTileRows) {
+        const std::size_t count = std::min(localTileRows, rowCount - localFirst);
+        decodeBf16Kernel<<<gridFor(count * inFeatures_), kBlockSize>>>(
+            tile.as<__nv_bfloat16>(), weight_.packedWords(), weight_.scales(), firstRow + localFirst, count,
+            inFeatures_, weight_.wordsPerRow(), weight_.groupsPerRow(), weight_.groupSize());
+        gemm(CUBLAS_OP_N, CUBLAS_OP_T, inputBf16.as<__nv_bfloat16>(), rows, inFeatures_, inFeatures_,
+             tile.as<__nv_bfloat16>(), count, inFeatures_, inFeatures_, output.data() + localFirst, rows,
+             count, rowCount, 0.0F);
+    }
+    BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+Tensor TernaryLinear::backwardInputRows(const Tensor& gradOutput, std::size_t firstRow) const {
+    if (gradOutput.rank() < 2 || gradOutput.shape().back() == 0 ||
+        firstRow + gradOutput.shape().back() > outFeatures_) {
+        throw std::invalid_argument("CUDA TernaryLinear '" + name_ + "': invalid backward input row range");
+    }
+    const std::size_t rows = rowsOf(gradOutput);
+    const std::size_t rowCount = gradOutput.shape().back();
+    std::vector<std::size_t> resultShape = gradOutput.shape();
+    resultShape.back() = inFeatures_;
+    Tensor result = Tensor::zeros(std::move(resultShape), MemoryArena::Activations);
+    Buffer gradBf16(gradOutput.elementCount() * sizeof(__nv_bfloat16), MemoryArena::Temporary);
+    const std::size_t localTileRows = std::min(tileRows_, rowCount);
+    Buffer tile(localTileRows * inFeatures_ * sizeof(__nv_bfloat16), MemoryArena::DequantizationTiles);
+    floatToBf16Kernel<<<gridFor(gradOutput.elementCount()), kBlockSize>>>(
+        gradBf16.as<__nv_bfloat16>(), gradOutput.data(), gradOutput.elementCount());
+    for (std::size_t localFirst = 0; localFirst < rowCount; localFirst += localTileRows) {
+        const std::size_t count = std::min(localTileRows, rowCount - localFirst);
+        decodeBf16Kernel<<<gridFor(count * inFeatures_), kBlockSize>>>(
+            tile.as<__nv_bfloat16>(), weight_.packedWords(), weight_.scales(), firstRow + localFirst, count,
+            inFeatures_, weight_.wordsPerRow(), weight_.groupsPerRow(), weight_.groupSize());
+        gemm(CUBLAS_OP_N, CUBLAS_OP_N, gradBf16.as<__nv_bfloat16>() + localFirst, rows, count, rowCount,
+             tile.as<__nv_bfloat16>(), count, inFeatures_, inFeatures_, result.data(), rows, inFeatures_,
+             inFeatures_, localFirst == 0 ? 0.0F : 1.0F);
+    }
+    BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
+Tensor TernaryLinear::weightGradientRows(const Tensor& input, const Tensor& gradOutput,
+                                         std::size_t firstRow) const {
+    requireFeatures(input, inFeatures_, name_, "input");
+    if (gradOutput.rank() < 2 || rowsOf(input) != rowsOf(gradOutput) ||
+        gradOutput.shape().back() == 0 || firstRow + gradOutput.shape().back() > outFeatures_) {
+        throw std::invalid_argument("CUDA TernaryLinear '" + name_ + "': invalid weight-gradient row range");
+    }
+    const std::size_t rows = rowsOf(input);
+    const std::size_t rowCount = gradOutput.shape().back();
+    Tensor result({rowCount, inFeatures_}, MemoryArena::GradientTiles);
+    Buffer inputBf16(input.elementCount() * sizeof(__nv_bfloat16), MemoryArena::Temporary);
+    Buffer gradBf16(gradOutput.elementCount() * sizeof(__nv_bfloat16), MemoryArena::Temporary);
+    floatToBf16Kernel<<<gridFor(input.elementCount()), kBlockSize>>>(
+        inputBf16.as<__nv_bfloat16>(), input.data(), input.elementCount());
+    floatToBf16Kernel<<<gridFor(gradOutput.elementCount()), kBlockSize>>>(
+        gradBf16.as<__nv_bfloat16>(), gradOutput.data(), gradOutput.elementCount());
+    gemm(CUBLAS_OP_T, CUBLAS_OP_N, gradBf16.as<__nv_bfloat16>(), rows, rowCount, rowCount,
+         inputBf16.as<__nv_bfloat16>(), rows, inFeatures_, inFeatures_, result.data(), rowCount,
+         inFeatures_, inFeatures_, 0.0F);
+    BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
 Tensor TernaryLinear::backward(const Tensor& input, const Tensor& gradOutput, GradientSink* sink) const {
     requireFeatures(input, inFeatures_, name_, "input");
     requireFeatures(gradOutput, outFeatures_, name_, "output gradient");

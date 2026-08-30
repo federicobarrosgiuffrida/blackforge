@@ -64,6 +64,13 @@ public:
     [[nodiscard]] Tensor forward(const Tensor& input) const;
     [[nodiscard]] Tensor backward(const Tensor& input, const Tensor& gradOutput, GradientSink* sink) const;
 
+    // Row-range primitives for the tied embedding/output head. They keep
+    // vocabulary work chunk-local; no [tokens, vocab] tensor is created.
+    [[nodiscard]] Tensor forwardRows(const Tensor& input, std::size_t firstRow, std::size_t rowCount) const;
+    [[nodiscard]] Tensor backwardInputRows(const Tensor& gradOutput, std::size_t firstRow) const;
+    [[nodiscard]] Tensor weightGradientRows(const Tensor& input, const Tensor& gradOutput,
+                                            std::size_t firstRow) const;
+
     [[nodiscard]] const std::string& name() const { return name_; }
     [[nodiscard]] std::size_t inFeatures() const { return inFeatures_; }
     [[nodiscard]] std::size_t outFeatures() const { return outFeatures_; }

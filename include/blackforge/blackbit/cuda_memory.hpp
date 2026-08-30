@@ -62,6 +62,10 @@ public:
     DeviceMemorySnapshot snapshot();
     [[nodiscard]] std::string report();
 
+    // Starts a new measurement window without disturbing live persistent
+    // allocations (model/optimizer). Used after benchmark warmup.
+    void resetPeaks();
+
     // Only valid when no tracked allocations are alive.
     void resetAccounting();
 
