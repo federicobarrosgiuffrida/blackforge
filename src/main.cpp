@@ -10,6 +10,9 @@
 #include <vector>
 
 #include "blackforge/ast/ast.hpp"
+#include "blackforge/blackbit/benchmark.hpp"
+#include "blackforge/blackbit/checkpoint.hpp"
+#include "blackforge/blackbit/config.hpp"
 #include "blackforge/backend/cpu/benchmark.hpp"
 #include "blackforge/backend/cpu/checkpoint.hpp"
 #include "blackforge/backend/cpu/executor.hpp"
@@ -48,6 +51,10 @@ void printUsage() {
               << "  train <file>       Addestra il modello descritto dal blocco 'train' del file (CPU o CUDA)\n"
               << "  forecast <file>    Genera 'horizon' passi autoregressivi dal blocco 'forecast' del file (CPU)\n"
               << "  benchmark <file>   Misura tempo/throughput/memoria del primo modello del file\n"
+              << "  benchmark blackbit [preset]   Misura un modello BlackBit (MoE ternario a bassa memoria):\n"
+              << "                                  parametri totali/attivi, memoria per arena, tempi, e le\n"
+              << "                                  verifiche FULL PRECISION MASTER COPY / FULL MODEL GRADIENT\n"
+              << "                                  BUFFER. Preset: tiny, small, medium, 9b-a3b; oppure --config\n"
               << "  inspect <file>     Mostra un riepilogo dei modelli (input, pipeline, numero di parametri)\n"
               << "  devices            Elenca i dispositivi di calcolo disponibili (CPU e GPU CUDA)\n"
               << "  tokenizer-train <corpus.txt>   Addestra un tokenizer BPE byte-level sul corpus dato\n"
@@ -90,7 +97,17 @@ void printUsage() {
               << "  --mlm              Costruisce un dataset mascherato (MLM) invece che causale (solo "
                  "'dataset-build')\n"
               << "  --mask-prob P      Probabilita' di mascherare ogni posizione, 0 < P <= 1 (solo 'dataset-build "
-                 "--mlm', default 0.15)\n";
+                 "--mlm', default 0.15)\n"
+              << "  --config <file>    Configurazione JSON di BlackBit (solo 'benchmark blackbit')\n"
+              << "  --micro-batch N    Sequenze per passo (solo 'benchmark blackbit', default 1)\n"
+              << "  --steps N          Passi di addestramento misurati (solo 'benchmark blackbit', default 3)\n"
+              << "  --max-vram-mb N    Budget di memoria: superarlo e' un errore diagnosticato prima di allocare "
+                 "(solo 'benchmark blackbit', default 7800, 0 = nessun limite)\n"
+              << "  --optimizer-rank N Rango del sottospazio dell'ottimizzatore (solo 'benchmark blackbit')\n"
+              << "  --recompute MODO   none | per-layer | every-N | full: quante attivazioni conservare invece "
+                 "di ricalcolarle (solo 'benchmark blackbit', default per-layer)\n"
+              << "  --dry-run          Riporta solo la contabilita' prevista, senza allocare nulla (solo "
+                 "'benchmark blackbit')\n";
 }
 
 void printDevices() {
@@ -740,6 +757,66 @@ std::string formatShape(const std::vector<std::size_t>& shape) {
     return out.str();
 }
 
+// 'blackforge benchmark blackbit': misura un modello BlackBit (vedi
+// blackforge/blackbit/benchmark.hpp). E' un percorso separato da
+// runBenchmark() perche' BlackBit non e' descritto nel linguaggio: non
+// c'e' nessun file .bf da leggere, solo una configurazione JSON o il
+// nome di un preset.
+int runBlackBitBenchmark(const std::string& configPath, const std::string& presetName, std::size_t seqLen,
+                          std::size_t microBatch, std::size_t steps, std::size_t warmupSteps,
+                          std::size_t maxVramMb, std::size_t optimizerRank, const std::string& recomputeMode,
+                          bool dryRun) {
+    try {
+        blackforge::blackbit::BlackBitConfig config =
+            configPath.empty() ? blackforge::blackbit::blackBitPreset(presetName.empty() ? "tiny" : presetName)
+                                : blackforge::blackbit::loadConfigFromJson(configPath);
+
+        blackforge::blackbit::BenchmarkOptions options;
+        if (seqLen != 0) {
+            options.seqLen = seqLen;
+        }
+        if (microBatch != 0) {
+            options.microBatch = microBatch;
+        }
+        if (steps != 0) {
+            options.steps = steps;
+        }
+        options.warmupSteps = warmupSteps;
+        options.maxVramMb = maxVramMb;
+        options.dryRun = dryRun;
+        if (optimizerRank != 0) {
+            options.optimizer.rank = optimizerRank;
+        }
+
+        if (recomputeMode == "none") {
+            options.runtime.recompute = blackforge::blackbit::ActivationRecompute::None;
+        } else if (recomputeMode == "per-layer" || recomputeMode.empty()) {
+            options.runtime.recompute = blackforge::blackbit::ActivationRecompute::PerLayer;
+        } else if (recomputeMode == "full") {
+            options.runtime.recompute = blackforge::blackbit::ActivationRecompute::FullRecompute;
+        } else if (recomputeMode.rfind("every-", 0) == 0) {
+            options.runtime.recompute = blackforge::blackbit::ActivationRecompute::EveryNLayers;
+            options.runtime.recomputeEveryN =
+                static_cast<std::size_t>(std::strtoull(recomputeMode.substr(6).c_str(), nullptr, 10));
+            if (options.runtime.recomputeEveryN == 0) {
+                std::cerr << "errore: '--recompute every-N' richiede un intero positivo\n";
+                return 2;
+            }
+        } else {
+            std::cerr << "errore: '--recompute' accetta none, per-layer, every-N o full\n";
+            return 2;
+        }
+
+        const blackforge::blackbit::BenchmarkResult result =
+            blackforge::blackbit::runBlackBitBenchmark(config, options, dryRun ? nullptr : &std::cout);
+        std::cout << "\n" << result.report();
+        return result.withinBudget ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << "errore: " << error.what() << "\n";
+        return 1;
+    }
+}
+
 int runBenchmark(const std::string& path, const std::string& device, std::size_t batchSize,
                   std::size_t warmupIterations, std::size_t measuredIterations) {
     DeviceSpec spec;
@@ -971,6 +1048,7 @@ int main(int argc, char** argv) {
     std::string fromCheckpoint;
     std::string saveCheckpointPath;
     std::size_t warmupIterations = 5;
+    bool warmupGiven = false;
     std::size_t measuredIterations = 20;
     std::size_t vocabSize = 0;
     std::size_t seqLen = 0;
@@ -980,6 +1058,13 @@ int main(int argc, char** argv) {
     std::size_t maxNewTokens = 50;
     bool mlm = false;
     float maskProb = 0.15F;
+    std::string configPath;
+    std::size_t microBatch = 0;
+    std::size_t steps = 0;
+    std::size_t maxVramMb = 7800;
+    std::size_t optimizerRank = 0;
+    std::string recomputeMode;
+    bool dryRun = false;
     std::vector<std::string> positional;
     std::string command = args.front();
 
@@ -1031,6 +1116,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
             warmupIterations = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+            warmupGiven = true;
         } else if (args[i] == "--iterations") {
             if (i + 1 >= args.size()) {
                 std::cerr << "errore: '--iterations' richiede un valore\n";
@@ -1077,6 +1163,44 @@ int main(int argc, char** argv) {
                 return 2;
             }
             maxNewTokens = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--config") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--config' richiede un percorso\n";
+                return 2;
+            }
+            configPath = args[++i];
+        } else if (args[i] == "--micro-batch") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--micro-batch' richiede un valore\n";
+                return 2;
+            }
+            microBatch = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--steps") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--steps' richiede un valore\n";
+                return 2;
+            }
+            steps = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--max-vram-mb") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--max-vram-mb' richiede un valore (0 = nessun limite)\n";
+                return 2;
+            }
+            maxVramMb = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--optimizer-rank") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--optimizer-rank' richiede un valore\n";
+                return 2;
+            }
+            optimizerRank = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--recompute") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--recompute' richiede un valore (none, per-layer, every-N, full)\n";
+                return 2;
+            }
+            recomputeMode = args[++i];
+        } else if (args[i] == "--dry-run") {
+            dryRun = true;
         } else if (args[i] == "--mlm") {
             mlm = true;
         } else if (args[i] == "--mask-prob") {
@@ -1135,8 +1259,18 @@ int main(int argc, char** argv) {
     }
     if (command == "benchmark") {
         if (positional.empty()) {
-            std::cerr << "errore: comando 'benchmark' richiede il percorso di un file .bf\n";
+            std::cerr << "errore: comando 'benchmark' richiede il percorso di un file .bf (oppure 'blackbit')\n";
             return 2;
+        }
+        if (positional.front() == "blackbit") {
+            const std::string preset = positional.size() > 1 ? positional[1] : std::string();
+            // Il default di --warmup (5) e' pensato per il benchmark del
+            // linguaggio, dove un'iterazione costa millisecondi. Un passo
+            // BlackBit e' molto piu' caro: se non e' stato chiesto
+            // esplicitamente, ne basta uno.
+            return runBlackBitBenchmark(configPath, preset, seqLen, microBatch, steps,
+                                         warmupGiven ? warmupIterations : 1,
+                                         maxVramMb, optimizerRank, recomputeMode, dryRun);
         }
         return runBenchmark(positional.front(), device, batchSize, warmupIterations, measuredIterations);
     }

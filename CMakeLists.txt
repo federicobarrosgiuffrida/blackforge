@@ -128,6 +128,21 @@ set(
     src/backend/cpu/forecast_runner.cpp
     src/backend/cpu/benchmark.cpp
     src/backend/cpu/quantize.cpp
+    src/blackbit/ternary.cpp
+    src/blackbit/config.cpp
+    src/blackbit/config_json.cpp
+    src/blackbit/telemetry.cpp
+    src/blackbit/gradient.cpp
+    src/blackbit/ternary_linear.cpp
+    src/blackbit/ternary_update.cpp
+    src/blackbit/moe.cpp
+    src/blackbit/attention.cpp
+    src/blackbit/model.cpp
+    src/blackbit/low_rank_optimizer.cpp
+    src/blackbit/checkpoint.cpp
+    src/blackbit/benchmark.cpp
+    src/blackbit/residency.cpp
+    src/blackbit/capability.cpp
     src/data/dataset.cpp
     src/tokenizer/tokenizer.cpp
     src/tokenizer/dataset_prep.cpp
