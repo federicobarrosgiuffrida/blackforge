@@ -47,19 +47,31 @@ __global__ void floatToBf16Kernel(__nv_bfloat16* output, const float* input, std
 __global__ void decodeBf16Kernel(__nv_bfloat16* output, const std::uint32_t* packed, const float* scales,
                                  std::size_t firstRow, std::size_t rowCount, std::size_t rowLength,
                                  std::size_t wordsPerRow, std::size_t groupsPerRow, std::size_t groupSize) {
-    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t count = rowCount * rowLength;
-    if (index >= count) {
+    // La riga arriva da blockIdx.y e la colonna da blockIdx.x, invece di
+    // essere ricavate da index/rowLength e index%rowLength: erano due
+    // divisioni intere a 64 bit per ogni elemento decodificato, e la GPU
+    // non ha una divisione hardware. Con un tile di 128 righe la griglia
+    // 2D e' ampiamente entro il limite di 65535 blocchi in y.
+    //
+    // Le divisioni rimaste sono per costanti di compilazione (20 e 5,
+    // che nvcc riduce a moltiplicazione e shift) e per groupSize, che a
+    // 32 bit costa una frazione della versione a 64. Il valore prodotto
+    // e' identico: cambia solo il modo di calcolare gli indici.
+    const unsigned int localRow = blockIdx.y;
+    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (localRow >= rowCount || col >= rowLength) {
         return;
     }
-    const std::size_t localRow = index / rowLength;
-    const std::size_t col = index % rowLength;
     const std::size_t row = firstRow + localRow;
-    const std::uint32_t word = packed[row * wordsPerRow + col / kTritsPerWord];
-    const std::size_t inWord = col % kTritsPerWord;
-    const int trit = decodeTritAt(wordByte(word, static_cast<int>(inWord / kTritsPerByte)),
-                                  static_cast<int>(inWord % kTritsPerByte));
-    output[index] = __float2bfloat16(static_cast<float>(trit) * scales[row * groupsPerRow + col / groupSize]);
+    const unsigned int wordInRow = col / static_cast<unsigned int>(kTritsPerWord);
+    const unsigned int inWord = col - wordInRow * static_cast<unsigned int>(kTritsPerWord);
+    const std::uint32_t word = packed[row * wordsPerRow + wordInRow];
+    const unsigned int byteIndex = inWord / static_cast<unsigned int>(kTritsPerByte);
+    const unsigned int slot = inWord - byteIndex * static_cast<unsigned int>(kTritsPerByte);
+    const int trit = decodeTritAt(wordByte(word, static_cast<int>(byteIndex)), static_cast<int>(slot));
+    const unsigned int group = col / static_cast<unsigned int>(groupSize);
+    output[static_cast<std::size_t>(localRow) * rowLength + col] =
+        __float2bfloat16(static_cast<float>(trit) * scales[row * groupsPerRow + group]);
 }
 
 cublasLtHandle_t sharedHandle() {
@@ -262,7 +274,7 @@ Tensor TernaryLinear::forward(const Tensor& input) const {
     for (std::size_t first = 0; first < outFeatures_; first += tileRows_) {
         const std::size_t count = std::min(tileRows_, outFeatures_ - first);
         const std::size_t decodeMark = timer.start();
-        decodeBf16Kernel<<<gridFor(count * inFeatures_), kBlockSize>>>(
+        decodeBf16Kernel<<<dim3(gridFor(inFeatures_), static_cast<unsigned int>(count)), kBlockSize>>>(
             tile.as<__nv_bfloat16>(), weight_.packedWords(), weight_.scales(), first, count, inFeatures_,
             weight_.wordsPerRow(), weight_.groupsPerRow(), weight_.groupSize());
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
@@ -298,7 +310,7 @@ Tensor TernaryLinear::forwardRows(const Tensor& input, std::size_t firstRow, std
         inputBf16.as<__nv_bfloat16>(), input.data(), input.elementCount());
     for (std::size_t localFirst = 0; localFirst < rowCount; localFirst += localTileRows) {
         const std::size_t count = std::min(localTileRows, rowCount - localFirst);
-        decodeBf16Kernel<<<gridFor(count * inFeatures_), kBlockSize>>>(
+        decodeBf16Kernel<<<dim3(gridFor(inFeatures_), static_cast<unsigned int>(count)), kBlockSize>>>(
             tile.as<__nv_bfloat16>(), weight_.packedWords(), weight_.scales(), firstRow + localFirst, count,
             inFeatures_, weight_.wordsPerRow(), weight_.groupsPerRow(), weight_.groupSize());
         gemm(CUBLAS_OP_N, CUBLAS_OP_T, inputBf16.as<__nv_bfloat16>(), rows, inFeatures_, inFeatures_,
@@ -326,7 +338,7 @@ Tensor TernaryLinear::backwardInputRows(const Tensor& gradOutput, std::size_t fi
         gradBf16.as<__nv_bfloat16>(), gradOutput.data(), gradOutput.elementCount());
     for (std::size_t localFirst = 0; localFirst < rowCount; localFirst += localTileRows) {
         const std::size_t count = std::min(localTileRows, rowCount - localFirst);
-        decodeBf16Kernel<<<gridFor(count * inFeatures_), kBlockSize>>>(
+        decodeBf16Kernel<<<dim3(gridFor(inFeatures_), static_cast<unsigned int>(count)), kBlockSize>>>(
             tile.as<__nv_bfloat16>(), weight_.packedWords(), weight_.scales(), firstRow + localFirst, count,
             inFeatures_, weight_.wordsPerRow(), weight_.groupsPerRow(), weight_.groupSize());
         gemm(CUBLAS_OP_N, CUBLAS_OP_N, gradBf16.as<__nv_bfloat16>() + localFirst, rows, count, rowCount,
@@ -383,7 +395,7 @@ Tensor TernaryLinear::backward(const Tensor& input, const Tensor& gradOutput, Gr
     for (std::size_t first = 0; first < outFeatures_; first += tileRows_) {
         const std::size_t count = std::min(tileRows_, outFeatures_ - first);
         const std::size_t gradientBytes = count * inFeatures_ * sizeof(float);
-        decodeBf16Kernel<<<gridFor(count * inFeatures_), kBlockSize>>>(
+        decodeBf16Kernel<<<dim3(gridFor(inFeatures_), static_cast<unsigned int>(count)), kBlockSize>>>(
             tile.as<__nv_bfloat16>(), weight_.packedWords(), weight_.scales(), first, count, inFeatures_,
             weight_.wordsPerRow(), weight_.groupsPerRow(), weight_.groupSize());
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
