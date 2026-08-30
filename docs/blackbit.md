@@ -593,6 +593,121 @@ target misurati. Nsight Compute 2026.2.1 e' installato, ma i contatori
 hardware sono disabilitati dalla policy driver (`ERR_NVGPUCTRPERM`):
 non e' stata fatta alcuna modifica amministrativa silenziosa.
 
+## 7.8 Top-2 davvero eseguito e ottimizzazione del percorso corretto
+
+### Prima: il routing scartava lavoro
+
+Il router sceglieva i top-k per probabilita' e poi scartava lo slot se
+l'esperto preferito era pieno. Con capacita' totale sufficiente non era
+un limite fisico ma lavoro perso: il token restava senza un esperto che
+poteva ancora essere calcolato.
+
+La selezione ora e' capacity-aware su CPU e CUDA: mantiene l'ordine di
+probabilita', salta gli esperti pieni e usa il successivo disponibile.
+Uno scarto resta possibile, ed e' riportato, solo quando meno di topK
+esperti hanno capacita' residua.
+
+Il test del caso peggiore (router collassato, capacita' totale
+esattamente pari alle assegnazioni) sul vecchio percorso dava 16 scarti
+e utilizzo `[8,8,0,0]`; ora da' zero scarti e `[8,8,8,8]`, con CPU e
+CUDA che scelgono gli stessi esperti.
+
+**Questo percorso esegue circa il 79% di lavoro MoE in piu' del
+precedente.** I numeri sotto non sono confrontabili con quelli di
+§7.7, che misuravano il percorso che scartava.
+
+### Baseline del percorso corretto
+
+RTX 5060, 9B-A3B, seq 512, micro-batch 1, 3 passi, rank 8, stessi seed
+e impostazioni. Mediana di 3 campioni: **43,653 token/s**, 11 728,81
+ms/step (dispersione 43,313-44,318, ±1,2%).
+
+### Il collo di bottiglia misurato, non supposto
+
+Nsight Systems 2026.1.3 sul workload corretto. Il primo profilo dava
+`updatePackedKernel` al 44% del tempo kernel, ~4,1 s su ~9,3 s: molto
+oltre qualunque limite di banda, visto che i pesi packed sono 1,73 GiB
+e a banda piena costerebbero pochi millisecondi.
+
+Tre difetti della stessa famiglia, tutti confermati dal profilo:
+
+* `projection()` dipende da (riga, componente) e **non** dalla colonna,
+  ma veniva valutata dentro il ciclo sui trit e dentro il ciclo sulle
+  righe: hash identici ricalcolati 20 volte per thread in
+  `updatePackedKernel` e 256 volte per blocco in
+  `projectGradientKernel`;
+* le statistiche facevano fino a otto atomiche globali **per thread**,
+  e uno step lancia un thread per word ternaria: oltre un miliardo di
+  atomiche per step;
+* il cronometro a eventi di `TernaryLinear::forward` faceva
+  `cudaEventSynchronize` dopo ogni tile: 111 188 sincronizzazioni per
+  step, con l'host che non correva mai avanti ad accodare il kernel
+  successivo.
+
+### A/B, un cambiamento per volta
+
+Ogni riga e' la mediana di 3 campioni identici, con la suite completa
+(520 test) verde prima di ogni misura.
+
+| cambiamento | prima | dopo | guadagno |
+|---|---:|---:|---:|
+| proiezione fuori dal ciclo sui trit | 43,653 | 55,640 | 1,27x |
+| hash di proiezione condivisi per blocco | 55,640 | 61,605 | 1,11x |
+| statistiche del trit ridotte per blocco | 61,605 | 66,401 | 1,08x |
+| niente sync dell'host per tile | 66,401 | 71,188 | 1,07x |
+| decode senza divisioni a 64 bit | 71,188 | 71,929 | 1,01x |
+| statistiche del gradiente fuse nella proiezione | 71,929 | 74,590 | 1,04x |
+| **totale** | **43,653** | **74,590** | **1,71x** |
+
+Il decode e' l'unico caso in cui il guadagno a livello di kernel
+(1 827 -> 1 644 ms su due step, 1,11x) e' piu' netto di quello sul
+tempo di parete, che resta dentro la dispersione fra campioni: e'
+tenuto perche' e' comunque piu' veloce, non perche' il tempo di parete
+lo dimostri.
+
+Tutti i cambiamenti preservano il valore prodotto. Gli unici scarti
+numerici sono l'ordine di accumulazione di due somme di quadrati che
+alimentano statistiche riportate (`gradientRms` e l'RMS
+dell'aggiornamento), non i pesi, non la loss, non le decisioni.
+
+### Stabilita' su 10 passi
+
+    loss    10,835 -> 9,866, monotona
+    picco   4,295 GiB su tutti e 10 i passi, senza crescita
+    scarti  0
+    NaN/Inf 0
+    throughput 75,781 token/s
+
+**Milestone P1 (>=75 token/s) raggiunta.**
+
+### Profilo attuale e limite previsto
+
+Ranking per step dopo gli interventi (Nsight, tempo kernel):
+
+| componente | ms/step | % |
+|---|---:|---:|
+| updatePacked (optimizer) | 1 228 | 24% |
+| decode ternario | 822 | 16% |
+| proiezione + statistiche | 622 | 12% |
+| GQA forward | 333 | 6% |
+| GQA backward | 265 | 5% |
+| GEMM cuBLASLt (tutti) | ~570 | 11% |
+| routing forward | 229 | 4% |
+| adam direction | 104 | 2% |
+
+La somma dei kernel e' circa 5,1 s su uno step di 6,76 s. **Anche
+azzerando ogni overhead dell'host il tetto sarebbe ~100 token/s**:
+oltre quella soglia non basta togliere overhead, va ridotto il lavoro
+dei kernel. I candidati misurati sono `updatePackedKernel` (che fa
+9,05 miliardi di arrotondamenti stocastici per step, uno per trit) e
+`routeForwardKernel`, che oggi gira **a thread singolo** (`<<<1,1>>>`)
+e costa 229 ms/step di pura serializzazione: parallelizzarlo richiede
+pero' attenzione, perche' il riempimento greedy della capacita' e'
+sensibile all'ordine e non deve cambiare quali esperti vengono scelti.
+
+Con questa architettura di calcolo BF16, **>=100 token/s e' plausibile
+ma non gratuito, e >=150 non sembra realistico su questa GPU.**
+
 ## 8. Stato dei percorsi (aggiornato ad ogni fase)
 
 | Percorso | Stato | Verificato da |
@@ -625,6 +740,8 @@ non e' stata fatta alcuna modifica amministrativa silenziosa.
 | Smoke 9B testo reale | **PASS** | 100 step + resume step 101, loss in calo, 4,379 GiB misurati |
 | Ramp 9B seq 8..512 | **PASS** | sette step completi, picco massimo 4,659 GiB |
 | Milestone H | **PASS** | 9B seq 16, picco NVIDIA 4,379 GiB, 49,3 M flip |
+| Top-2 realmente eseguito (CPU e CUDA) | **PASS** | zero scarti a capacita' sufficiente, parita' di selezione CPU/CUDA |
+| Milestone P1 (>=75 token/s) | **PASS** | 75,781 token/s su 10 passi, 4,295 GiB, loss monotona |
 
 ### 8.1 Limiti Phase 9 ancora aperti, detti esplicitamente
 
