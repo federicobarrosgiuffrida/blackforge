@@ -93,15 +93,27 @@ __global__ void gradientStatsKernel(const float* gradient, std::size_t count, De
 //
 // Le somme restano per riga crescente, con gli stessi raggruppamenti,
 // quindi l'accumulatore e' bit-identico a prima.
+// I blocchi con component == 0 leggono ogni elemento del blocco di
+// gradiente esattamente una volta, quindi calcolano anche le statistiche
+// del gradiente riusando il valore gia' in registro. Prima serviva un
+// gradientStatsKernel separato che rileggeva l'intero blocco: una
+// seconda passata completa sulla stessa memoria, per una metrica
+// diagnostica. I conteggi sono interi e restano identici; per la somma
+// dei quadrati cambia solo l'ordine di accumulazione, e alimenta solo il
+// gradientRms riportato, non il clipping ne' altre decisioni.
 __global__ void projectGradientKernel(float* accumulator, const float* gradient, std::size_t firstRow,
                                       std::size_t rowCount, std::size_t cols, std::size_t rank,
-                                      std::uint64_t seed, std::uint64_t epoch) {
+                                      std::uint64_t seed, std::uint64_t epoch, DeviceStepStats* stats) {
     const std::size_t component = blockIdx.y;
     if (component >= rank) return;
     const std::size_t col = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const bool active = col < cols;
+    const bool collectStats = component == 0;
     __shared__ float sharedProjection[kBlockSize];
     float sum = active ? accumulator[component * cols + col] : 0.0F;
+    double statsSquared = 0.0;
+    unsigned int statsValid = 0;
+    unsigned int statsInvalid = 0;
     for (std::size_t base = 0; base < rowCount; base += kBlockSize) {
         const std::size_t chunk = min(static_cast<std::size_t>(kBlockSize), rowCount - base);
         if (threadIdx.x < chunk) {
@@ -111,12 +123,56 @@ __global__ void projectGradientKernel(float* accumulator, const float* gradient,
         __syncthreads();
         if (active) {
             for (std::size_t k = 0; k < chunk; ++k) {
-                sum += sharedProjection[k] * gradient[(base + k) * cols + col];
+                const float value = gradient[(base + k) * cols + col];
+                sum += sharedProjection[k] * value;
+                if (collectStats) {
+                    if (isfinite(value)) {
+                        statsSquared += static_cast<double>(value) * static_cast<double>(value);
+                        ++statsValid;
+                    } else {
+                        ++statsInvalid;
+                    }
+                }
             }
         }
         __syncthreads();
     }
     if (active) accumulator[component * cols + col] = sum;
+    if (!collectStats) return;
+
+    constexpr unsigned int kFullMask = 0xFFFFFFFFU;
+    constexpr int kWarpSize = 32;
+    constexpr int kWarps = kBlockSize / kWarpSize;
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        statsSquared += __shfl_down_sync(kFullMask, statsSquared, offset);
+        statsValid += __shfl_down_sync(kFullMask, statsValid, offset);
+        statsInvalid += __shfl_down_sync(kFullMask, statsInvalid, offset);
+    }
+    __shared__ double sharedSquared[kWarps];
+    __shared__ unsigned int sharedValid[kWarps];
+    __shared__ unsigned int sharedInvalid[kWarps];
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) % kWarpSize;
+    if (lane == 0) {
+        sharedSquared[warp] = statsSquared;
+        sharedValid[warp] = statsValid;
+        sharedInvalid[warp] = statsInvalid;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    double squared = 0.0;
+    unsigned long long valid = 0;
+    unsigned long long invalid = 0;
+    for (int w = 0; w < kWarps; ++w) {
+        squared += sharedSquared[w];
+        valid += sharedValid[w];
+        invalid += sharedInvalid[w];
+    }
+    if (valid != 0) {
+        atomicAdd(&stats->gradientSquared, squared);
+        atomicAdd(&stats->gradientCount, valid);
+    }
+    if (invalid != 0) atomicAdd(&stats->nanInf, invalid);
 }
 
 __global__ void accumulateDenseKernel(float* accumulator, const float* gradient, std::size_t count) {
@@ -401,13 +457,13 @@ void LowRankProjectedOptimizer::consumeWeightGradientBlock(const ParameterId& id
         throw std::invalid_argument("CUDA LowRankProjectedOptimizer: invalid gradient block");
     }
     state.touched = true;
-    const std::size_t gradientValues = rowCount * state.cols;
-    gradientStatsKernel<<<gridFor(gradientValues), kBlockSize>>>(deviceBlock, gradientValues,
-                                                                 deviceStats_.as<DeviceStepStats>());
+    // Le statistiche del gradiente sono calcolate dentro la proiezione,
+    // dai blocchi con component == 0: coprono ogni elemento esattamente
+    // una volta e il valore e' gia' in registro.
     const dim3 projectionGrid(gridFor(state.cols), static_cast<unsigned int>(state.rank));
     projectGradientKernel<<<projectionGrid, kBlockSize>>>(
         state.accumulator.as<float>(), deviceBlock, firstRow, rowCount, state.cols, state.rank, state.seed,
-        state.projectionEpoch);
+        state.projectionEpoch, deviceStats_.as<DeviceStepStats>());
     BLACKFORGE_CUDA_CHECK(cudaGetLastError());
 }
 
