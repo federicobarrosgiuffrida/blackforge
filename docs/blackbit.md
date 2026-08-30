@@ -496,6 +496,46 @@ proiezioni, step, token, learning rate e seme RNG. Quando viene fornito
 `.bftok` e un manifest `metadata.json` con versione dei formati,
 dimensioni del vocabolario e hash FNV-1a di dataset/tokenizer.
 
+## 7.5 Smoke 9B su testo reale e resume
+
+Lo stesso shard TinyStories e lo stesso percorso del Milestone H sono
+stati eseguiti per 100 step su BlackBit-9B-A3B, microbatch 1, seq 16 e
+optimizer rank 8. La curva grezza, un valore per ogni vero minibatch,
+e' conservata in [`phase9_9b_100step_loss.csv`](phase9_9b_100step_loss.csv).
+
+```
+step                          0 -> 100
+token                         0 -> 1 600
+loss                         11,092 -> 10,026
+perplexity                   65 644,5 -> 22 607,7
+throughput                       0,914 token/s
+step medio                  17 497,96 ms
+actual NVIDIA peak              4,379 GiB
+actual NVIDIA medio             4,360 GiB
+flip ternari                1 578 202 878
+router entropy                   2,077 nat
+NaN/Inf                              0
+checkpoint                        2,074 GiB
+```
+
+Il trend resta rumoroso perche' ogni punto contiene una sola sequenza,
+ma non e' una deduzione dalla sola coppia iniziale/finale: la media dei
+primi 10 step e' circa 11,13, mentre quella degli ultimi 10 e' circa
+10,33. Il checkpoint contiene ancora esclusivamente ternari packed,
+parametri densi piccoli e stato optimizer proiettato; nessun master
+BF16/FP32 e nessun gradiente modello completo.
+
+Dopo la chiusura dell'eseguibile e' stato avviato un nuovo processo con
+`--from-checkpoint`. Ha stampato `step 100 -> 101`, `token 1600 -> 1616`,
+ha completato lo step in 19 771,82 ms, prodotto altri 14 457 037 flip e
+misurato 4,381 GiB di picco. Quindi pesi, optimizer, RNG/order del
+dataset e contatori di training riprendono realmente.
+
+Al throughput misurato di 0,914 token/s, i tempi puramente computazionali
+sono circa 34,7 anni per 1B token, 346,5 anni per 10B e 3 465 anni per
+100B. Questo prova la fattibilita' in memoria e la trainability, non la
+praticita' di un pretraining esteso sulla singola RTX 5060.
+
 ## 8. Stato dei percorsi (aggiornato ad ogni fase)
 
 | Percorso | Stato | Verificato da |
@@ -525,13 +565,14 @@ dimensioni del vocabolario e hash FNV-1a di dataset/tokenizer.
 | Optimizer CUDA proiettato + parametri densi | implementato | parità CPU e flip reali dei byte packed |
 | Modello/trainer CUDA end-to-end | implementato | 517 test totali + Tiny/Small/Medium/9B reali |
 | Trainer testo reale + checkpoint/resume CUDA | implementato | TinyStories sample, BFBIT CPU/CUDA interoperabile, ripresa step/token/RNG/optimizer |
+| Smoke 9B testo reale | **PASS** | 100 step + resume step 101, loss in calo, 4,379 GiB misurati |
 | Milestone H | **PASS** | 9B seq 16, picco NVIDIA 4,379 GiB, 49,3 M flip |
 
 ### 8.1 Limiti Phase 9 ancora aperti, detti esplicitamente
 
-* **Milestone H usa ancora token sintetici.** Il percorso su testo reale,
-  checkpoint e resume e' provato su Tiny; lo smoke 9B da 100 step resta
-  da eseguire sullo stesso shard dopo averne comunicato la durata misurata.
+* **Il corpus usato e' soltanto un campione di 100 TinyStories.** Serve
+  a provare il percorso reale e la stabilita', non e' un corpus di
+  pretraining sufficiente per valutare la qualita' del modello.
 * **Le modalità CUDA `EveryNLayers` e `FullRecompute` usano oggi il
   comportamento corretto `PerLayer`**, quindi la correttezza è
   preservata ma non raggiungono ancora il loro diverso trade-off di
