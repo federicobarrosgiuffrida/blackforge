@@ -39,6 +39,24 @@ bb::BlackBitConfig attentionConfig() {
     return config;
 }
 
+bb::BlackBitConfig attention128Config() {
+    bb::BlackBitConfig config;
+    config.name = "cuda-attention-128-test";
+    config.vocabSize = 256;
+    config.hiddenSize = 128;
+    config.numLayers = 1;
+    config.numHeads = 1;
+    config.numKvHeads = 1;
+    config.headDim = 128;
+    config.numExperts = 2;
+    config.expertsPerToken = 2;
+    config.expertHidden = 192;
+    config.maxSeqLen = 8;
+    config.ternaryGroupSize = 20;
+    config.validate();
+    return config;
+}
+
 Tensor values(std::vector<std::size_t> shape, float scale, float phase = 0.0F) {
     std::size_t count = 1;
     for (const std::size_t dimension : shape) count *= dimension;
@@ -127,4 +145,36 @@ TEST(CudaBlackBitAttentionTest, GqaBackwardMatchesCpuAndStreamsAllProjectionGrad
     }
     EXPECT_EQ(bbcuda::gradientLifetimeStats().liveBytes, 0U);
     EXPECT_GT(bbcuda::gradientLifetimeStats().blocksProduced, 0U);
+}
+
+TEST(CudaBlackBitAttentionTest, SpecializedHeadDim128ForwardAndBackwardMatchCpu) {
+    const bb::BlackBitConfig config = attention128Config();
+    bb::GqaAttention cpu("attention128", config);
+    cpu.initialize(117);
+    cpu.setComputeDType(bb::ComputeDType::BF16);
+    bbcuda::GqaAttention gpu(cpu, config);
+    const Tensor input = values({1, 3, config.hiddenSize}, 0.25F, 0.2F);
+    const Tensor gradOutput = values({1, 3, config.hiddenSize}, 0.08F, 0.6F);
+    bb::AttentionCache cpuCache;
+    const Tensor expectedOutput = cpu.forward(input, cpuCache);
+    bb::DenseGradientCollector cpuGradients;
+    const Tensor expectedGradInput = cpu.backward(input, gradOutput, cpuCache, &cpuGradients);
+
+    const auto deviceInput = bbcuda::Tensor::fromHost(input);
+    const auto deviceGradOutput = bbcuda::Tensor::fromHost(gradOutput);
+    bbcuda::AttentionCache gpuCache;
+    const Tensor actualOutput = gpu.forward(deviceInput, gpuCache).toHost();
+    DeviceGradientCollector gpuGradients;
+    const Tensor actualGradInput = gpu.backward(deviceInput, deviceGradOutput, gpuCache, &gpuGradients).toHost();
+
+    expectNear(actualOutput, expectedOutput, 2.5e-2F);
+    expectNear(actualGradInput, expectedGradInput, 3.5e-2F);
+    for (const std::string name : {"attention128.q", "attention128.k", "attention128.v", "attention128.o"}) {
+        const auto& expected = cpuGradients.gradient(name);
+        const auto& actual = gpuGradients.gradients.at(name);
+        ASSERT_EQ(actual.size(), expected.size()) << name;
+        for (std::size_t i = 0; i < actual.size(); ++i) {
+            EXPECT_NEAR(actual[i], expected[i], 4.0e-2F) << name << " index " << i;
+        }
+    }
 }
