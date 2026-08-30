@@ -35,7 +35,9 @@ std::string BenchmarkResult::report() const {
     std::ostringstream out;
     out << "BlackBit CUDA benchmark — " << config.name << "\n";
     out << "  GPU fisica cuda:" << MemoryTelemetry::instance().device() << ", seq " << options.seqLen
-        << ", micro-batch " << options.microBatch << ", passi " << options.steps << "\n\n";
+        << ", micro-batch " << options.microBatch << ", passi " << options.steps;
+    if (instantiateOnly) out << " (INSTANTIATE ONLY: nessun forward/update)";
+    out << "\n\n";
     out << "Parametri\n";
     out << "  totali                         " << totalParameters << "\n";
     out << "  attivi per token               " << activeParameters << "\n\n";
@@ -73,23 +75,30 @@ std::string BenchmarkResult::report() const {
     out << "  gradient produced/reused       " << mib(cumulativeGradientBytes) << "\n";
     out << "  NaN/Inf count                  " << nanInfCount << "\n\n";
     out << "Verifiche da oggetti/allocazioni reali\n";
-    out << "  TERNARY PARAMETERS CHANGED: " << (ternaryFlips > 0 ? "YES" : "NO") << "\n";
+    out << "  TERNARY PARAMETERS CHANGED: "
+        << (instantiateOnly ? "NOT TESTED (instantiate-only)" : (ternaryFlips > 0 ? "YES" : "NO")) << "\n";
     out << "  FULL PRECISION MASTER COPY: " << (fullPrecisionMasterCopy ? "YES" : "NO") << "\n";
     out << "  FULL MODEL GRADIENT BUFFER: " << (fullModelGradientBuffer ? "YES" : "NO") << "\n";
     out << "  PEAK GPU MEMORY < " << options.maxVramMb << " MiB: " << (withinBudget ? "YES" : "NO") << "\n";
+    if (milestoneH) {
+        out << "\n================================\n"
+            << "  BLACKBIT MILESTONE H PASSED\n"
+            << "================================\n";
+    }
     return out.str();
 }
 
 BenchmarkResult runBenchmark(const BlackBitConfig& config, const BenchmarkOptions& options, int device,
                              std::ostream* progress) {
     config.validate();
-    if (options.steps == 0 || options.seqLen == 0 || options.microBatch == 0 ||
+    if (options.seqLen == 0 || options.microBatch == 0 ||
         options.seqLen > config.maxSeqLen) {
         throw std::invalid_argument("CUDA BlackBit benchmark: invalid training shape or step count");
     }
     BenchmarkResult result;
     result.config = config;
     result.options = options;
+    result.instantiateOnly = options.steps == 0;
     const ParameterCount parameters = countParameters(config);
     result.totalParameters = parameters.total();
     result.activeParameters = countActiveParameters(config);
@@ -124,7 +133,7 @@ BenchmarkResult runBenchmark(const BlackBitConfig& config, const BenchmarkOption
             tokenIds[index] = static_cast<int>(random() % config.vocabSize);
             targets[index] = static_cast<int>(random() % config.vocabSize);
         }
-        for (std::size_t step = 0; step < options.warmupSteps; ++step) {
+        for (std::size_t step = 0; step < options.warmupSteps && options.steps != 0; ++step) {
             (void)model.trainStep(tokenIds, targets, options.microBatch, options.seqLen, &optimizer);
             optimizer.endStep();
         }
@@ -157,10 +166,12 @@ BenchmarkResult runBenchmark(const BlackBitConfig& config, const BenchmarkOption
                           << ", flips " << optimizer.stats().lastStep.flips << "\n";
             }
         }
-        result.forwardBackwardMs = forwardBackwardTotal / options.steps;
-        result.optimizerMs = optimizerTotal / options.steps;
-        result.tokensPerSecond = static_cast<double>(tokens * options.steps) /
-                                 ((forwardBackwardTotal + optimizerTotal) / 1000.0);
+        if (options.steps != 0) {
+            result.forwardBackwardMs = forwardBackwardTotal / options.steps;
+            result.optimizerMs = optimizerTotal / options.steps;
+            result.tokensPerSecond = static_cast<double>(tokens * options.steps) /
+                                     ((forwardBackwardTotal + optimizerTotal) / 1000.0);
+        }
         result.ternaryFlips = optimizer.stats().totalFlips;
         result.gradientPeakBytes = gradientLifetimeStats().peakLiveBytes;
         result.cumulativeGradientBytes = gradientLifetimeStats().cumulativeBytes;
@@ -170,6 +181,10 @@ BenchmarkResult runBenchmark(const BlackBitConfig& config, const BenchmarkOption
             parameters.ternary() * sizeof(float);
         result.fullModelGradientBuffer = result.gradientPeakBytes >= parameters.total() * sizeof(float) / 2;
         result.withinBudget = limit == 0 || result.memory.devicePeakUsedBytes < limit;
+        result.milestoneH = parameters.total() >= 9000000000ULL && options.seqLen >= 16 &&
+                            options.steps > 0 && result.ternaryFlips > 0 && result.nanInfCount == 0 &&
+                            !result.fullPrecisionMasterCopy && !result.fullModelGradientBuffer &&
+                            result.withinBudget;
     }
     return result;
 }

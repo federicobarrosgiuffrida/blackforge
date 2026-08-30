@@ -102,6 +102,7 @@ void printUsage() {
               << "  --config <file>    Configurazione JSON di BlackBit (solo 'benchmark blackbit')\n"
               << "  --micro-batch N    Sequenze per passo (solo 'benchmark blackbit', default 1)\n"
               << "  --steps N          Passi di addestramento misurati (solo 'benchmark blackbit', default 3)\n"
+              << "  --instantiate-only Costruisce BlackBit CUDA e misura la VRAM senza eseguire uno step\n"
               << "  --max-vram-mb N    Budget di memoria: superarlo e' un errore diagnosticato prima di allocare "
                  "(solo 'benchmark blackbit', default 7800, 0 = nessun limite)\n"
               << "  --optimizer-rank N Rango del sottospazio dell'ottimizzatore (solo 'benchmark blackbit')\n"
@@ -766,7 +767,7 @@ std::string formatShape(const std::vector<std::size_t>& shape) {
 int runBlackBitBenchmark(const std::string& configPath, const std::string& presetName, std::size_t seqLen,
                           std::size_t microBatch, std::size_t steps, std::size_t warmupSteps,
                           std::size_t maxVramMb, std::size_t optimizerRank, const std::string& recomputeMode,
-                          bool dryRun, const std::string& device) {
+                          bool dryRun, bool instantiateOnly, const std::string& device) {
     try {
         blackforge::blackbit::BlackBitConfig config =
             configPath.empty() ? blackforge::blackbit::blackBitPreset(presetName.empty() ? "tiny" : presetName)
@@ -781,6 +782,10 @@ int runBlackBitBenchmark(const std::string& configPath, const std::string& prese
         }
         if (steps != 0) {
             options.steps = steps;
+        }
+        if (instantiateOnly) {
+            options.steps = 0;
+            options.warmupSteps = 0;
         }
         options.warmupSteps = warmupSteps;
         options.maxVramMb = maxVramMb;
@@ -1083,6 +1088,7 @@ int main(int argc, char** argv) {
     std::size_t optimizerRank = 0;
     std::string recomputeMode;
     bool dryRun = false;
+    bool instantiateOnly = false;
     std::vector<std::string> positional;
     std::string command = args.front();
 
@@ -1219,6 +1225,8 @@ int main(int argc, char** argv) {
             recomputeMode = args[++i];
         } else if (args[i] == "--dry-run") {
             dryRun = true;
+        } else if (args[i] == "--instantiate-only") {
+            instantiateOnly = true;
         } else if (args[i] == "--mlm") {
             mlm = true;
         } else if (args[i] == "--mask-prob") {
@@ -1288,7 +1296,7 @@ int main(int argc, char** argv) {
             // esplicitamente, ne basta uno.
             return runBlackBitBenchmark(configPath, preset, seqLen, microBatch, steps,
                                          warmupGiven ? warmupIterations : 1,
-                                         maxVramMb, optimizerRank, recomputeMode, dryRun, device);
+                                         maxVramMb, optimizerRank, recomputeMode, dryRun, instantiateOnly, device);
         }
         return runBenchmark(positional.front(), device, batchSize, warmupIterations, measuredIterations);
     }

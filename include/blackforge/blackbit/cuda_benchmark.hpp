@@ -34,6 +34,8 @@ struct BenchmarkResult {
     bool fullPrecisionMasterCopy = false;
     bool fullModelGradientBuffer = false;
     bool withinBudget = false;
+    bool instantiateOnly = false;
+    bool milestoneH = false;
 
     [[nodiscard]] std::string report() const;
 };

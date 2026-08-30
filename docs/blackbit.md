@@ -382,6 +382,69 @@ scalare servirebbe circa mezz'ora per passo, e soprattutto non direbbe
 nulla sulla RTX 5060. Il picco di memoria di un passo è quindi ancora
 **previsto** (3,090 GiB), non misurato.
 
+## 7.3 Phase 9 CUDA su RTX 5060 — Milestone H
+
+Ambiente realmente verificato: NVIDIA GeForce RTX 5060 8 GB, compute
+capability 12.0 (`sm_120`), driver 610.62, CUDA 13.3 e toolkit 13.3.73.
+Prima di BlackBit è stato compilato ed eseguito un kernel minimo con
+allocazione, lancio, sincronizzazione, copia di ritorno e verifica.
+
+Il comando riproducibile è:
+
+```
+blackforge benchmark blackbit 9b-a3b --device cuda --seq-len 16 \
+  --micro-batch 1 --steps 1 --warmup 0 --optimizer-rank 8 \
+  --max-vram-mb 7800
+```
+
+Misura del 30 agosto 2026 sulla scheda fisica:
+
+```
+parametri totali                    9 054 268 416
+parametri attivi/token              2 910 661 632
+packed ternary weights              1 731,52 MiB
+scale                                 222,66 MiB
+router/norm                             3,29 MiB
+optimizer rank-8                       249,04 MiB
+baseline CUDA/WDDM                   1 118,56 MiB
+BlackForge accounted peak             2,177 GiB
+ACTUAL NVIDIA DEVICE PEAK              4,379 GiB
+prediction for same shape              2,168 GiB
+gradient tile peak                     12,00 MiB
+gradient bytes prodotti/riusati    19 470,00 MiB
+forward + loss + backward           9 469,77 ms
+optimizer                           6 397,53 ms
+step totale                        15 867,30 ms
+throughput                              1,008 token/s
+trit flips                         49 291 782
+NaN/Inf                                     0
+```
+
+Il divario fra 2,177 GiB contabilizzati e 4,379 GiB realmente usati è
+esattamente il motivo per cui Phase 9 non usa la stima per dichiarare il
+fit: include baseline WDDM/contesto e overhead del driver/runtime non
+attribuibile a un `Buffer` BlackForge. Il tetto da 7 800 MiB viene
+controllato prima di ogni allocazione tramite `cudaMemGetInfo`.
+
+```
+forward                       PASS
+loss                          PASS
+backward                      PASS
+optimizer                     PASS
+ternary parameters changed    YES
+FULL PRECISION MASTER COPY    NO
+FULL MODEL GRADIENT BUFFER    NO
+PEAK GPU MEMORY < 7.8 GB      YES (4,379 GiB misurati)
+
+BLACKBIT MILESTONE H PASSED
+```
+
+La scala di validazione precedente usa lo stesso percorso: Tiny ha
+ridotto la loss su un batch fisso da 9,153 a 5,651 in 20 step (40,99
+token/s); Small e Medium hanno completato uno step con picchi reali di
+1,139 e 1,231 GiB. Nessuna di queste esecuzioni usa PyTorch, LoRA,
+offload del modello o una copia persistente decodificata.
+
 ## 8. Stato dei percorsi (aggiornato ad ogni fase)
 
 | Percorso | Stato | Verificato da |
@@ -403,23 +466,31 @@ nulla sulla RTX 5060. Il picco di memoria di un passo è quindi ancora
 | `blackforge benchmark blackbit` | implementato | 8 test unitari + esecuzione reale su BlackBit-Tiny |
 | API di residenza (GPU/host-pinned/paginato) + pianificatore | implementato per la PIANIFICAZIONE | 3 test unitari; il trasferimento non e' implementato, vedi §8.1 |
 | Rilevamento capability e scelta del formato di calcolo | implementato | 3 test unitari; FP4 rilevato ma non usato, vedi §8.1 |
-| Kernel CUDA BlackBit | da fare | **non compilabile in questo ambiente** (nessun `nvcc`) |
+| Storage/codec ternario CUDA | implementato | parità byte/logica CPU↔GPU, padding e bordi non multipli |
+| `TernaryLinear` CUDA BF16 tile-local | implementato | forward/backward e gradienti a tile contro CPU |
+| RMSNorm, RoPE, SwiGLU, embedding, cross-entropy CUDA | implementato | test deterministici CPU↔GPU |
+| GQA CUDA online-softmax | implementato | forward/backward; nessuna matrice score e nessuna replica K/V |
+| MoE CUDA Top-2 sparso | implementato | dispatch compatto, overflow, router ed esperti contro CPU |
+| Optimizer CUDA proiettato + parametri densi | implementato | parità CPU e flip reali dei byte packed |
+| Modello/trainer CUDA end-to-end | implementato | 515 test totali + Tiny/Small/Medium/9B reali |
+| Milestone H | **PASS** | 9B seq 16, picco NVIDIA 4,379 GiB, 49,3 M flip |
 
-### 8.1 Cosa NON è implementato, detto esplicitamente
+### 8.1 Limiti Phase 9 ancora aperti, detti esplicitamente
 
-* **Nessun kernel CUDA di BlackBit.** L'intero sottosistema gira sul
-  percorso di riferimento CPU. I byte riportati sono quelli reali del
-  formato — e sono gli stessi che la VRAM conterrebbe — ma i tempi sono
-  quelli di cicli tripli scritti a mano, non indicativi di una GPU.
-* **Il trasferimento host↔device dei parametri non residenti non
-  esiste.** `residency.hpp` fornisce l'API di proprietà e uno strumento
-  di pianificazione che calcola, con le dimensioni reali del formato,
-  quanto starebbe in ciascuno stato. Nessun percorso di esecuzione oggi
-  legge un parametro non residente.
+* **Checkpoint/resume del nuovo stato optimizer CUDA non è ancora
+  collegato al formato di checkpoint.** Il formato CPU packed resta
+  implementato, ma non va dichiarata una ripresa GPU finché non viene
+  provata dopo il riavvio del processo.
+* **Il test 9B usa token sintetici**, non ancora gli shard di testo
+  reale. La pipeline tokenizer/dataset esistente va collegata al nuovo
+  trainer prima dello smoke da 100 step.
+* **Le modalità CUDA `EveryNLayers` e `FullRecompute` usano oggi il
+  comportamento corretto `PerLayer`**, quindi la correttezza è
+  preservata ma non raggiungono ancora il loro diverso trade-off di
+  memoria/calcolo.
 * **FP4 è rilevato ma non usato.** `preferredComputeDType()` restituisce
   BF16 anche su Blackwell: un GEMM FP4 non esiste in questo motore, e
   dichiararlo renderebbe falso ogni rapporto sul formato di calcolo.
 * **Lo stato dell'ottimizzatore è FP32**, non BF16/INT8 (vedi §2).
-* **Milestone F (300M che addestra stabilmente) è verificata solo per
-  stabilità**, non per convergenza: sul backend CPU un addestramento
-  vero di BlackBit-Medium richiederebbe settimane.
+* **L'inizializzazione 9B è ancora CPU seriale** e richiede circa 170 s;
+  è separata dai 15,9 s misurati per lo step CUDA.
