@@ -23,6 +23,16 @@ std::string mib(std::size_t bytes) {
     return out.str();
 }
 
+bool supportsStreamOrderedAllocator() {
+    static const bool supported = [] {
+        int device = 0;
+        int value = 0;
+        return cudaGetDevice(&device) == cudaSuccess &&
+               cudaDeviceGetAttribute(&value, cudaDevAttrMemoryPoolsSupported, device) == cudaSuccess && value != 0;
+    }();
+    return supported;
+}
+
 }  // namespace
 
 const char* memoryArenaName(MemoryArena arena) {
@@ -101,7 +111,17 @@ void MemoryTelemetry::recordAllocation(MemoryArena arena, std::size_t bytes) {
     peak_[i] = std::max(peak_[i], current_[i]);
     ++allocations_[i];
     peakAccountedTotal_ = std::max(peakAccountedTotal_, currentTotal());
-    sampleDeviceMemory();
+    // checkBeforeAllocation sampled the physical device immediately before
+    // cudaMalloc. Track the just-completed allocation conservatively here;
+    // the next allocation and every public snapshot take another exact sample.
+    // Avoiding a second cudaMemGetInfo for every tiny temporary matters because
+    // a 9B step performs thousands of short-lived tiled allocations.
+    const std::size_t usedBefore = totalDeviceBytes_ - freeDeviceBytes_;
+    const std::size_t usedAfter = bytes > std::numeric_limits<std::size_t>::max() - usedBefore
+                                      ? std::numeric_limits<std::size_t>::max()
+                                      : usedBefore + bytes;
+    peakDeviceUsedBytes_ = std::max(peakDeviceUsedBytes_, usedAfter);
+    freeDeviceBytes_ = bytes >= freeDeviceBytes_ ? 0 : freeDeviceBytes_ - bytes;
 }
 
 void MemoryTelemetry::recordRelease(MemoryArena arena, std::size_t bytes) noexcept {
@@ -112,14 +132,10 @@ void MemoryTelemetry::recordRelease(MemoryArena arena, std::size_t bytes) noexce
     } else {
         current_[i] -= bytes;
     }
-    // cudaMemGetInfo is diagnostic here; destructors must never throw.
-    std::size_t freeBytes = 0;
-    std::size_t totalBytes = 0;
-    if (cudaMemGetInfo(&freeBytes, &totalBytes) == cudaSuccess) {
-        freeDeviceBytes_ = freeBytes;
-        totalDeviceBytes_ = totalBytes;
-        peakDeviceUsedBytes_ = std::max(peakDeviceUsedBytes_, totalBytes - freeBytes);
-    }
+    // Destruction cannot throw and does not need an expensive device query.
+    // checkBeforeAllocation/snapshot resynchronize this cached estimate with
+    // cudaMemGetInfo before it is used for a decision or user-facing report.
+    freeDeviceBytes_ = std::min(totalDeviceBytes_, freeDeviceBytes_ + bytes);
 }
 
 std::size_t MemoryTelemetry::current(MemoryArena arena) const { return current_[indexOf(arena)]; }
@@ -193,15 +209,22 @@ Buffer::Buffer(std::size_t bytes, MemoryArena arena) : bytes_(bytes), arena_(are
     }
     MemoryTelemetry& telemetry = MemoryTelemetry::instance();
     telemetry.checkBeforeAllocation(arena_, bytes_);
-    BLACKFORGE_CUDA_CHECK(cudaMalloc(&data_, bytes_));
+    streamOrdered_ = supportsStreamOrderedAllocator();
+    if (streamOrdered_) {
+        BLACKFORGE_CUDA_CHECK(cudaMallocAsync(&data_, bytes_, nullptr));
+    } else {
+        BLACKFORGE_CUDA_CHECK(cudaMalloc(&data_, bytes_));
+    }
     telemetry.recordAllocation(arena_, bytes_);
 }
 
 Buffer::~Buffer() { release(); }
 
-Buffer::Buffer(Buffer&& other) noexcept : data_(other.data_), bytes_(other.bytes_), arena_(other.arena_) {
+Buffer::Buffer(Buffer&& other) noexcept
+    : data_(other.data_), bytes_(other.bytes_), arena_(other.arena_), streamOrdered_(other.streamOrdered_) {
     other.data_ = nullptr;
     other.bytes_ = 0;
+    other.streamOrdered_ = false;
 }
 
 Buffer& Buffer::operator=(Buffer&& other) noexcept {
@@ -210,8 +233,10 @@ Buffer& Buffer::operator=(Buffer&& other) noexcept {
         data_ = other.data_;
         bytes_ = other.bytes_;
         arena_ = other.arena_;
+        streamOrdered_ = other.streamOrdered_;
         other.data_ = nullptr;
         other.bytes_ = 0;
+        other.streamOrdered_ = false;
     }
     return *this;
 }
@@ -220,11 +245,15 @@ void Buffer::release() noexcept {
     if (data_ == nullptr) {
         return;
     }
-    // Record after cudaFree so the device sample describes the released state.
-    cudaFree(data_);
+    if (streamOrdered_) {
+        cudaFreeAsync(data_, nullptr);
+    } else {
+        cudaFree(data_);
+    }
     MemoryTelemetry::instance().recordRelease(arena_, bytes_);
     data_ = nullptr;
     bytes_ = 0;
+    streamOrdered_ = false;
 }
 
 }  // namespace blackforge::blackbit::cuda

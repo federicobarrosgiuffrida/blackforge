@@ -121,6 +121,7 @@ private:
     void* data_ = nullptr;
     std::size_t bytes_ = 0;
     MemoryArena arena_ = MemoryArena::Temporary;
+    bool streamOrdered_ = false;
 };
 
 }  // namespace blackforge::blackbit::cuda
