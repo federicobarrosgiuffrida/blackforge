@@ -60,6 +60,7 @@ if(BLACKFORGE_ENABLE_CUDA)
         backend/cuda/optimizer_tests.cu
         backend/cuda/train_runner_tests.cu
         backend/cuda/multi_gpu_train_runner_tests.cu
+        backend/cuda/blackbit_ternary_tests.cu
     )
 endif()
 
