@@ -32,6 +32,8 @@ set(
     backend/cpu/forecast_runner_tests.cpp
     backend/cpu/benchmark_tests.cpp
     backend/cpu/quantize_tests.cpp
+    blackbit/ternary_tests.cpp
+    blackbit/config_tests.cpp
     data/dataset_tests.cpp
     tokenizer/tokenizer_tests.cpp
     tokenizer/dataset_prep_tests.cpp
@@ -62,6 +64,15 @@ target_link_libraries(
     PRIVATE
         blackforge_core
         GTest::gtest_main
+)
+
+# I test BlackBit leggono i file in configs/: la radice del repository
+# va passata al compilatore, dato che ctest esegue i test dalla
+# directory di build.
+target_compile_definitions(
+    blackforge_tests
+    PRIVATE
+        BLACKFORGE_REPO_ROOT="${PROJECT_SOURCE_DIR}"
 )
 
 if(BLACKFORGE_ENABLE_CUDA)

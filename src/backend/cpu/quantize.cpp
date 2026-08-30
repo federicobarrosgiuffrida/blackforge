@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 
 namespace blackforge::backend::cpu {
 
@@ -88,6 +89,16 @@ float quantizeScalar(float value, sema::DType dtype) {
             return roundToMantissaBits(value, 3, 448.0F);
         case sema::DType::FP8_E5M2:
             return roundToMantissaBits(value, 2, 57344.0F);
+        case sema::DType::TERNARY_1P58:
+            // Non arrotondabile elemento per elemento: un valore
+            // ternario ha senso solo rispetto alla scala del GRUPPO a
+            // cui appartiene (vedi blackbit/ternary.hpp), che questa
+            // funzione scalare non conosce. Errore esplicito invece di
+            // un'identita' silenziosa che fingerebbe una
+            // quantizzazione mai avvenuta.
+            throw std::invalid_argument(
+                "quantizeScalar: ternary1p58 non e' un formato quantizzabile per singolo valore, "
+                "usa blackbit::TernaryTensor::quantizeFrom()");
     }
     return value;
 }

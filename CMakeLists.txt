@@ -128,6 +128,9 @@ set(
     src/backend/cpu/forecast_runner.cpp
     src/backend/cpu/benchmark.cpp
     src/backend/cpu/quantize.cpp
+    src/blackbit/ternary.cpp
+    src/blackbit/config.cpp
+    src/blackbit/config_json.cpp
     src/data/dataset.cpp
     src/tokenizer/tokenizer.cpp
     src/tokenizer/dataset_prep.cpp

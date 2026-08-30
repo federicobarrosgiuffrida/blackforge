@@ -32,9 +32,26 @@ int dtypeSizeInBytes(DType dtype) {
         case DType::BF16: return 2;
         case DType::TF32: return 4;
         case DType::FP32: return 4;
+        case DType::TERNARY_1P58: return 0;  // sub-byte: vedi dtypeBitsPerElement()
     }
     return 0;
 }
+
+double dtypeBitsPerElement(DType dtype) {
+    switch (dtype) {
+        case DType::FP8_E4M3: return 8.0;
+        case DType::FP8_E5M2: return 8.0;
+        case DType::FP16: return 16.0;
+        case DType::BF16: return 16.0;
+        case DType::TF32: return 32.0;
+        case DType::FP32: return 32.0;
+        // 5 trit per byte (3^5 = 243 <= 256): 8 bit ogni 5 pesi.
+        case DType::TERNARY_1P58: return 8.0 / 5.0;
+    }
+    return 0.0;
+}
+
+bool isSubByte(DType dtype) { return dtype == DType::TERNARY_1P58; }
 
 bool isValidForStorage(DType dtype) { return dtype != DType::TF32; }
 
@@ -46,6 +63,7 @@ std::string dtypeName(DType dtype) {
         case DType::BF16: return "bf16";
         case DType::TF32: return "tf32";
         case DType::FP32: return "fp32";
+        case DType::TERNARY_1P58: return "ternary1p58";
     }
     return "?";
 }
