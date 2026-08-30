@@ -106,6 +106,7 @@ void printUsage() {
               << "  --micro-batch N    Sequenze per passo (solo 'benchmark blackbit', default 1)\n"
               << "  --steps N          Passi di addestramento misurati (solo 'benchmark blackbit', default 3)\n"
               << "  --instantiate-only Costruisce BlackBit CUDA e misura la VRAM senza eseguire uno step\n"
+              << "  --seq-ladder      Esegue seq 8,16,...,512 sulla stessa istanza BlackBit CUDA\n"
               << "  --max-vram-mb N    Budget di memoria: superarlo e' un errore diagnosticato prima di allocare "
                  "(solo 'benchmark blackbit', default 7800, 0 = nessun limite)\n"
               << "  --optimizer-rank N Rango del sottospazio dell'ottimizzatore (solo 'benchmark blackbit')\n"
@@ -770,7 +771,7 @@ std::string formatShape(const std::vector<std::size_t>& shape) {
 int runBlackBitBenchmark(const std::string& configPath, const std::string& presetName, std::size_t seqLen,
                           std::size_t microBatch, std::size_t steps, std::size_t warmupSteps,
                           std::size_t maxVramMb, std::size_t optimizerRank, const std::string& recomputeMode,
-                          bool dryRun, bool instantiateOnly, const std::string& device) {
+                          bool dryRun, bool instantiateOnly, bool seqLadder, const std::string& device) {
     try {
         blackforge::blackbit::BlackBitConfig config =
             configPath.empty() ? blackforge::blackbit::blackBitPreset(presetName.empty() ? "tiny" : presetName)
@@ -829,6 +830,17 @@ int runBlackBitBenchmark(const std::string& configPath, const std::string& prese
             return result.withinBudget ? 0 : 1;
         }
 #if BLACKFORGE_HAS_CUDA
+        if (seqLadder) {
+            std::vector<std::size_t> lengths;
+            for (const std::size_t length : {8U, 16U, 32U, 64U, 128U, 256U, 512U}) {
+                if (length <= config.maxSeqLen) lengths.push_back(length);
+            }
+            const auto results = blackforge::blackbit::cuda::runBenchmarkLadder(
+                config, options, lengths, spec.cudaIndex, &std::cout);
+            return std::all_of(results.begin(), results.end(), [](const auto& result) {
+                return result.withinBudget && result.nanInfCount == 0 && result.ternaryFlips > 0;
+            }) ? 0 : 1;
+        }
         const blackforge::blackbit::cuda::BenchmarkResult result =
             blackforge::blackbit::cuda::runBenchmark(config, options, spec.cudaIndex, &std::cout);
         std::cout << "\n" << result.report();
@@ -1143,6 +1155,7 @@ int main(int argc, char** argv) {
     std::string recomputeMode;
     bool dryRun = false;
     bool instantiateOnly = false;
+    bool seqLadder = false;
     std::vector<std::string> positional;
     std::string command = args.front();
 
@@ -1287,6 +1300,8 @@ int main(int argc, char** argv) {
             dryRun = true;
         } else if (args[i] == "--instantiate-only") {
             instantiateOnly = true;
+        } else if (args[i] == "--seq-ladder") {
+            seqLadder = true;
         } else if (args[i] == "--mlm") {
             mlm = true;
         } else if (args[i] == "--mask-prob") {
@@ -1361,7 +1376,8 @@ int main(int argc, char** argv) {
             // esplicitamente, ne basta uno.
             return runBlackBitBenchmark(configPath, preset, seqLen, microBatch, steps,
                                          warmupGiven ? warmupIterations : 1,
-                                         maxVramMb, optimizerRank, recomputeMode, dryRun, instantiateOnly, device);
+                                         maxVramMb, optimizerRank, recomputeMode, dryRun, instantiateOnly,
+                                         seqLadder, device);
         }
         return runBenchmark(positional.front(), device, batchSize, warmupIterations, measuredIterations);
     }

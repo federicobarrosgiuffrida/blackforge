@@ -51,7 +51,7 @@ std::string BenchmarkResult::report() const {
     for (std::size_t index = 0; index < kMemoryArenaCount; ++index) {
         const auto arena = static_cast<MemoryArena>(index);
         out << "  " << std::left << std::setw(29) << memoryArenaName(arena) << std::right
-            << mib(MemoryTelemetry::instance().peak(arena)) << "\n";
+            << mib(arenaPeakBytes[index]) << "\n";
     }
     out << "  BlackForge accounted peak      " << gib(memory.blackForgePeakBytes) << "\n";
     out << "  ACTUAL NVIDIA DEVICE PEAK      " << gib(memory.devicePeakUsedBytes) << "\n";
@@ -176,6 +176,9 @@ BenchmarkResult runBenchmark(const BlackBitConfig& config, const BenchmarkOption
         result.gradientPeakBytes = gradientLifetimeStats().peakLiveBytes;
         result.cumulativeGradientBytes = gradientLifetimeStats().cumulativeBytes;
         result.memory = telemetry.snapshot();
+        for (std::size_t index = 0; index < kMemoryArenaCount; ++index) {
+            result.arenaPeakBytes[index] = telemetry.peak(static_cast<MemoryArena>(index));
+        }
         result.fullPrecisionMasterCopy =
             telemetry.current(MemoryArena::PackedWeights) + telemetry.current(MemoryArena::Scales) >=
             parameters.ternary() * sizeof(float);
@@ -187,6 +190,111 @@ BenchmarkResult runBenchmark(const BlackBitConfig& config, const BenchmarkOption
                             result.withinBudget;
     }
     return result;
+}
+
+std::vector<BenchmarkResult> runBenchmarkLadder(const BlackBitConfig& config,
+                                                const BenchmarkOptions& baseOptions,
+                                                const std::vector<std::size_t>& sequenceLengths,
+                                                int device, std::ostream* progress) {
+    config.validate();
+    if (sequenceLengths.empty() || baseOptions.microBatch == 0 || baseOptions.steps == 0 ||
+        baseOptions.dryRun) {
+        throw std::invalid_argument("CUDA BlackBit ladder: lengths and measured steps are required");
+    }
+    for (const std::size_t seq : sequenceLengths) {
+        if (seq == 0 || seq > config.maxSeqLen) {
+            throw std::invalid_argument("CUDA BlackBit ladder: sequence length exceeds model limit");
+        }
+    }
+    MemoryTelemetry& telemetry = MemoryTelemetry::instance();
+    const std::size_t limit = baseOptions.maxVramMb == 0 ? 0 : baseOptions.maxVramMb * 1024ULL * 1024ULL;
+    telemetry.initialize(device, limit);
+    if (telemetry.currentTotal() == 0) telemetry.resetAccounting();
+    blackforge::blackbit::BlackBitModel cpuReference(config, baseOptions.seed);
+    cpuReference.setComputeDType(ComputeDType::BF16);
+    cpuReference.setRuntimeOptions(baseOptions.runtime);
+    cuda::BlackBitModel model(cpuReference);
+    LowRankProjectedOptimizer optimizer(baseOptions.optimizer);
+    model.registerParameters(optimizer);
+    const ParameterCount parameters = countParameters(config);
+    std::vector<BenchmarkResult> results;
+    results.reserve(sequenceLengths.size());
+    for (const std::size_t seq : sequenceLengths) {
+        BenchmarkOptions options = baseOptions;
+        options.seqLen = seq;
+        BenchmarkResult result;
+        result.config = config;
+        result.options = options;
+        result.totalParameters = parameters.total();
+        result.activeParameters = countActiveParameters(config);
+        LowMemoryOptions estimateOptions;
+        estimateOptions.optimizerRank = options.optimizer.rank;
+        estimateOptions.activationCheckpointing = options.runtime.recompute != ActivationRecompute::None;
+        result.estimate = estimateTrainingMemory(config, {options.microBatch, seq}, estimateOptions);
+        result.packedBytes = telemetry.current(MemoryArena::PackedWeights);
+        result.scaleBytes = telemetry.current(MemoryArena::Scales);
+        result.denseParameterBytes = telemetry.current(MemoryArena::DenseParameters);
+        result.optimizerBytes = optimizer.stateBytes();
+        const std::size_t tokens = options.microBatch * seq;
+        std::mt19937 random(options.seed + static_cast<unsigned int>(seq));
+        std::vector<int> tokenIds(tokens);
+        std::vector<int> targets(tokens);
+        for (std::size_t index = 0; index < tokens; ++index) {
+            tokenIds[index] = static_cast<int>(random() % config.vocabSize);
+            targets[index] = static_cast<int>(random() % config.vocabSize);
+        }
+        for (std::size_t warmup = 0; warmup < options.warmupSteps; ++warmup) {
+            (void)model.trainStep(tokenIds, targets, options.microBatch, seq, &optimizer);
+            optimizer.endStep();
+        }
+        const std::size_t flipsBefore = optimizer.stats().totalFlips;
+        resetGradientLifetimeStats();
+        telemetry.resetPeaks();
+        double forwardBackwardTotal = 0.0;
+        double optimizerTotal = 0.0;
+        for (std::size_t step = 0; step < options.steps; ++step) {
+            BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
+            const auto before = std::chrono::steady_clock::now();
+            const BlackBitStepResult stepResult =
+                model.trainStep(tokenIds, targets, options.microBatch, seq, &optimizer);
+            BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
+            const auto afterBackward = std::chrono::steady_clock::now();
+            optimizer.endStep();
+            BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
+            const auto afterOptimizer = std::chrono::steady_clock::now();
+            forwardBackwardTotal += std::chrono::duration<double, std::milli>(afterBackward - before).count();
+            optimizerTotal += std::chrono::duration<double, std::milli>(afterOptimizer - afterBackward).count();
+            result.finalLoss = stepResult.loss;
+            result.routingEntropy = stepResult.meanRoutingEntropy();
+            result.maxExpertUtilization = stepResult.maxExpertUtilization();
+            result.droppedAssignments = stepResult.droppedAssignments();
+            result.nanInfCount += optimizer.stats().lastStep.nanInfCount +
+                                  (stepResult.sawNaN || stepResult.sawInf ? 1U : 0U);
+        }
+        result.forwardBackwardMs = forwardBackwardTotal / options.steps;
+        result.optimizerMs = optimizerTotal / options.steps;
+        result.tokensPerSecond = static_cast<double>(tokens * options.steps) /
+                                 ((forwardBackwardTotal + optimizerTotal) / 1000.0);
+        result.ternaryFlips = optimizer.stats().totalFlips - flipsBefore;
+        result.gradientPeakBytes = gradientLifetimeStats().peakLiveBytes;
+        result.cumulativeGradientBytes = gradientLifetimeStats().cumulativeBytes;
+        result.memory = telemetry.snapshot();
+        for (std::size_t index = 0; index < kMemoryArenaCount; ++index) {
+            result.arenaPeakBytes[index] = telemetry.peak(static_cast<MemoryArena>(index));
+        }
+        result.fullPrecisionMasterCopy =
+            telemetry.current(MemoryArena::PackedWeights) + telemetry.current(MemoryArena::Scales) >=
+            parameters.ternary() * sizeof(float);
+        result.fullModelGradientBuffer = result.gradientPeakBytes >= parameters.total() * sizeof(float) / 2;
+        result.withinBudget = limit == 0 || result.memory.devicePeakUsedBytes < limit;
+        result.milestoneH = parameters.total() >= 9000000000ULL && seq >= 16 &&
+                            result.ternaryFlips > 0 && result.nanInfCount == 0 &&
+                            !result.fullPrecisionMasterCopy && !result.fullModelGradientBuffer &&
+                            result.withinBudget;
+        results.push_back(result);
+        if (progress != nullptr) *progress << "\n" << results.back().report() << std::flush;
+    }
+    return results;
 }
 
 }  // namespace blackforge::blackbit::cuda

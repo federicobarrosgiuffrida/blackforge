@@ -1,8 +1,10 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <ostream>
 #include <string>
+#include <vector>
 
 #include "blackforge/blackbit/benchmark.hpp"
 #include "blackforge/blackbit/cuda_memory.hpp"
@@ -14,6 +16,7 @@ struct BenchmarkResult {
     BenchmarkOptions options;
     MemoryEstimate estimate;
     DeviceMemorySnapshot memory;
+    std::array<std::size_t, kMemoryArenaCount> arenaPeakBytes{};
     std::size_t totalParameters = 0;
     std::size_t activeParameters = 0;
     std::size_t packedBytes = 0;
@@ -42,5 +45,10 @@ struct BenchmarkResult {
 
 BenchmarkResult runBenchmark(const BlackBitConfig& config, const BenchmarkOptions& options,
                              int device = 0, std::ostream* progress = nullptr);
+
+std::vector<BenchmarkResult> runBenchmarkLadder(const BlackBitConfig& config,
+                                                const BenchmarkOptions& baseOptions,
+                                                const std::vector<std::size_t>& sequenceLengths,
+                                                int device = 0, std::ostream* progress = nullptr);
 
 }  // namespace blackforge::blackbit::cuda

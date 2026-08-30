@@ -13,6 +13,7 @@
 
 #include "blackforge/backend/cuda/cuda_check.hpp"
 #include "blackforge/blackbit/cuda_memory.hpp"
+#include "blackforge/blackbit/cuda_benchmark.hpp"
 #include "blackforge/blackbit/cuda_checkpoint.hpp"
 #include "blackforge/blackbit/cuda_model.hpp"
 #include "blackforge/blackbit/cuda_train.hpp"
@@ -260,4 +261,23 @@ TEST(CudaBlackBitModelTest, RealTextTrainerWritesPortableCheckpointTokenizerAndM
     std::filesystem::remove(checkpointPath);
     std::filesystem::remove(checkpointPath + ".bftok");
     std::filesystem::remove(result.manifestPath);
+}
+
+TEST(CudaBlackBitModelTest, SequenceLadderReusesOneModelAndMeasuresEachLengthIndependently) {
+    bb::BenchmarkOptions options;
+    options.microBatch = 1;
+    options.steps = 1;
+    options.warmupSteps = 0;
+    options.optimizer.rank = 4;
+    const auto results = bbcuda::runBenchmarkLadder(modelConfig(), options, {4, 8});
+    ASSERT_EQ(results.size(), 2U);
+    EXPECT_EQ(results[0].options.seqLen, 4U);
+    EXPECT_EQ(results[1].options.seqLen, 8U);
+    for (const auto& result : results) {
+        EXPECT_GT(result.ternaryFlips, 0U);
+        EXPECT_EQ(result.nanInfCount, 0U);
+        EXPECT_GT(result.memory.devicePeakUsedBytes, 0U);
+        EXPECT_GT(result.arenaPeakBytes[static_cast<std::size_t>(bbcuda::MemoryArena::GradientTiles)], 0U);
+        EXPECT_TRUE(result.withinBudget);
+    }
 }

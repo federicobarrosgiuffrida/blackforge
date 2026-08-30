@@ -536,6 +536,30 @@ sono circa 34,7 anni per 1B token, 346,5 anni per 10B e 3 465 anni per
 100B. Questo prova la fattibilita' in memoria e la trainability, non la
 praticita' di un pretraining esteso sulla singola RTX 5060.
 
+## 7.6 Ramp 9B completo fino a seq 512
+
+`--seq-ladder` riusa una sola istanza GPU e lo stesso optimizer tra le
+lunghezze, ma azzera picchi e contatori dei gradienti prima di ciascun
+passo. Tutte le righe comprendono forward, loss, backward e update:
+
+| seq | picco NVIDIA | step ms | token/s | gradient peak | trit flip | NaN/Inf |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 4,376 GiB | 14 195,60 | 0,564 | 12,00 MiB | 43 725 813 | 0 |
+| 16 | 4,379 GiB | 15 334,04 | 1,043 | 12,00 MiB | 35 470 813 | 0 |
+| 32 | 4,387 GiB | 14 759,65 | 2,168 | 12,00 MiB | 27 581 824 | 0 |
+| 64 | 4,411 GiB | 16 949,86 | 3,776 | 12,00 MiB | 27 705 571 | 0 |
+| 128 | 4,458 GiB | 20 997,62 | 6,096 | 12,00 MiB | 30 402 315 | 0 |
+| 256 | 4,557 GiB | 21 692,01 | 11,802 | 12,00 MiB | 26 491 418 | 0 |
+| 512 | 4,659 GiB | 29 341,11 | 17,450 | 12,00 MiB | 27 968 761 | 0 |
+
+A seq 512 le attivazioni raggiungono 273,01 MiB, i buffer MoE 15,80
+MiB e attention 15,09 MiB. La crescita misurata e' lineare e lascia
+ancora oltre 3 GiB di margine, mentre il throughput migliora con GEMM
+piu' grandi. Il limite emerso e' il capacity overflow MoE: 13 487
+assignment aggregati sui 28 layer sono stati scartati a seq 512; il
+router ha comunque entropia 2,078 nat (quasi `ln(8)`) e nessun collasso,
+ma capacity/dispatch richiedono profiling e tuning.
+
 ## 8. Stato dei percorsi (aggiornato ad ogni fase)
 
 | Percorso | Stato | Verificato da |
@@ -563,9 +587,10 @@ praticita' di un pretraining esteso sulla singola RTX 5060.
 | GQA CUDA online-softmax | implementato | forward/backward; nessuna matrice score e nessuna replica K/V |
 | MoE CUDA Top-2 sparso | implementato | dispatch compatto, overflow, router ed esperti contro CPU |
 | Optimizer CUDA proiettato + parametri densi | implementato | parità CPU e flip reali dei byte packed |
-| Modello/trainer CUDA end-to-end | implementato | 517 test totali + Tiny/Small/Medium/9B reali |
+| Modello/trainer CUDA end-to-end | implementato | 518 test totali + Tiny/Small/Medium/9B reali |
 | Trainer testo reale + checkpoint/resume CUDA | implementato | TinyStories sample, BFBIT CPU/CUDA interoperabile, ripresa step/token/RNG/optimizer |
 | Smoke 9B testo reale | **PASS** | 100 step + resume step 101, loss in calo, 4,379 GiB misurati |
+| Ramp 9B seq 8..512 | **PASS** | sette step completi, picco massimo 4,659 GiB |
 | Milestone H | **PASS** | 9B seq 16, picco NVIDIA 4,379 GiB, 49,3 M flip |
 
 ### 8.1 Limiti Phase 9 ancora aperti, detti esplicitamente
