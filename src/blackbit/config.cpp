@@ -122,12 +122,18 @@ MemoryEstimate estimateTrainingMemory(const BlackBitConfig& config, const Traini
     const ParameterCount count = countParameters(config);
     estimate.denseParameterBytes = count.dense() * 2;
 
-    // --- stato optimizer low-rank: per ogni matrice [m, n] si tengono
-    // due fattori r*(m+n) (primo e secondo momento) invece di 2*m*n ---
-    const std::size_t r = options.optimizerRank;
+    // --- stato optimizer low-rank ---
+    //
+    // Per una matrice [m, n] la proiezione e' R = P^T G con R di forma
+    // [r, n] (vedi low_rank_optimizer.hpp): si tengono TRE buffer di
+    // r*n valori (primo momento, secondo momento, accumulatore del
+    // passo) invece dei due di m*n di AdamW. Il rango non puo' superare
+    // m: proiettare su piu' direzioni di quante la matrice ne abbia
+    // costerebbe piu' del parametro stesso.
     const std::size_t sb = options.optimizerStateBytes;
     auto addLowRank = [&](std::size_t rows, std::size_t cols, std::size_t repeat) {
-        estimate.optimizerBytes += repeat * 2 * r * (rows + cols) * sb;
+        const std::size_t rank = std::min(options.optimizerRank, rows);
+        estimate.optimizerBytes += repeat * 3 * rank * cols * sb;
     };
     addLowRank(qDim, h, config.numLayers);
     addLowRank(kvDim, h, 2 * config.numLayers);

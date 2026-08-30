@@ -38,6 +38,7 @@ set(
     blackbit/ternary_linear_tests.cpp
     blackbit/moe_tests.cpp
     blackbit/model_tests.cpp
+    blackbit/low_rank_optimizer_tests.cpp
     data/dataset_tests.cpp
     tokenizer/tokenizer_tests.cpp
     tokenizer/dataset_prep_tests.cpp

@@ -130,8 +130,12 @@ struct LowMemoryOptions {
     // (requisito 7).
     std::size_t optimizerRank = 32;
 
-    // Byte per valore dello stato dell'optimizer (2 = BF16/FP16).
-    std::size_t optimizerStateBytes = 2;
+    // Byte per valore dello stato dell'optimizer. 4 = float32, che e'
+    // cio' che l'implementazione di riferimento usa davvero oggi
+    // (runtime::Tensor e' float32 in tutto questo motore); 2 = BF16,
+    // il passo successivo previsto dal requisito 7. La stima riporta il
+    // valore che si passa, non quello che si vorrebbe.
+    std::size_t optimizerStateBytes = 4;
 
     // Righe di peso dequantizzate contemporaneamente da TernaryLinear.
     std::size_t dequantTileRows = 128;

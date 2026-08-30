@@ -138,6 +138,7 @@ set(
     src/blackbit/moe.cpp
     src/blackbit/attention.cpp
     src/blackbit/model.cpp
+    src/blackbit/low_rank_optimizer.cpp
     src/data/dataset.cpp
     src/tokenizer/tokenizer.cpp
     src/tokenizer/dataset_prep.cpp

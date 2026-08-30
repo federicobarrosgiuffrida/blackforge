@@ -94,11 +94,11 @@ micro-batch 1, rango optimizer 32, stato in BF16), non stimati a mano:
 | Pesi ternari impacchettati | **1,691** |
 | Scale per gruppo (gruppo 160, FP32) | 0,217 |
 | Norm + router (BF16) | 0,002 |
-| Stato optimizer low-rank (r = 32, m e v, BF16) | 0,642 |
+| Stato optimizer low-rank (r = 32, tre buffer r x n, FP32) | 0,941 |
 | Attivazioni con ricalcolo per layer | 0,221 |
 | Picco gradiente (un blocco di 512 righe) | 0,0076 |
 | Workspace (tile dequantizzati + logit a blocchi) | 0,0116 |
-| **Totale stimato** | **2,792** |
+| **Totale stimato** | **3,090** |
 | *Per confronto: approccio ordinario (master BF16 + grad FP32 + AdamW FP32)* | *118,1* |
 
 Il margine rispetto agli 8 GB è voluto: serve per seq_len maggiori (a
@@ -108,6 +108,13 @@ reale dell'allocatore.
 Due voci meritano una nota, perché sono state corrette rispetto alla
 prima stesura del piano dopo aver fatto i conti davvero:
 
+* **Lo stato dell'ottimizzatore è in FP32, non BF16.** Il requisito 7
+  prevede BF16 come punto di partenza; l'implementazione di riferimento
+  è float32 perché `runtime::Tensor` lo è in tutto questo motore.
+  Passare a BF16 dimezza la voce a 0,47 GiB ed è un cambio locale,
+  previsto quando il percorso CUDA arriverà. La stima riporta il numero
+  vero, non quello desiderato (`LowMemoryOptions::optimizerStateBytes`
+  permette di vedere entrambi).
 * **Le scale costano 0,217 GiB**, non "trascurabile": una scala FP32
   ogni 160 pesi sono 0,2 bit/peso, cioè il 13 % del costo dei pesi
   stessi. Passarle a BF16 le dimezza; è la prima ottimizzazione
@@ -329,6 +336,6 @@ con un numero**, non dichiarandolo.
 | MoE (router top-2, dispatch sparso, capacita', bilanciamento, metriche) | implementato | 9 test unitari eseguiti (CPU), incluso il gradiente numerico e "tutti gli esperti ricevono gradiente" |
 | GQA + RoPE (raggruppamento implicito, softmax online) | implementato | test di causalita' e di non duplicazione K/V eseguiti (CPU) |
 | Blocco e modello BlackBit completi, testa a blocchi di vocabolario | implementato | 10 test unitari eseguiti (CPU), incluso l'addestramento che riduce la cross-entropy (**milestone C**) |
-| Backward in streaming | da fare | — |
-| Optimizer low-rank | da fare | — |
+| Backward in streaming (consegna e rilascio per blocco) | implementato | picco di gradiente vivo misurato: **milestone D** |
+| Optimizer proiettato low-rank + consolidazione sperimentale | implementato | 9 test unitari eseguiti (CPU), incluso un addestramento completo: **milestone E** |
 | Kernel CUDA BlackBit | da fare | **non compilabile in questo ambiente** (nessun `nvcc`) |

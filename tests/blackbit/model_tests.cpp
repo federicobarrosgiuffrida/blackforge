@@ -6,6 +6,8 @@
 #include <numeric>
 #include <random>
 
+#include "blackforge/blackbit/config.hpp"
+#include "blackforge/blackbit/gradient.hpp"
 #include "blackforge/blackbit/telemetry.hpp"
 #include "blackforge/blackbit/ternary_update.hpp"
 
@@ -281,4 +283,67 @@ TEST(BlackBitModelTest, IlModelloOccupaMenoDiDueBitPerPesoTernario) {
     // parametri nascosta.
     EXPECT_GE(blackbit::MemoryTelemetry::instance().current(blackbit::MemoryArena::Parameter),
                model.parameterBytes());
+}
+
+TEST(BlackBitModelTest, NessunBufferDiGradientiADimensioneModello) {
+    // Milestone D, dimostrata con un numero: durante un passo completo
+    // di addestramento il picco di gradiente VIVO deve restare una
+    // piccola frazione di quanto occuperebbe il gradiente denso
+    // dell'intero modello.
+    const BlackBitConfig config = microConfig();
+    BlackBitModel model(config, 43);
+
+    blackbit::resetGradientLifetimeStats();
+    blackbit::MemoryTelemetry::instance().resetPeaks();
+
+    const std::vector<int> tokens{1, 2, 3, 4, 5, 6, 7, 8};
+    const std::vector<int> targets{2, 3, 4, 5, 6, 7, 8, 9};
+
+    blackbit::TernarySgdSink optimizer(0.01F);
+    model.registerParameters(optimizer);
+    (void)model.trainStep(tokens, targets, 1, 8, &optimizer);
+
+    const blackbit::GradientLifetimeStats& stats = blackbit::gradientLifetimeStats();
+    const std::size_t denseModelGradientBytes =
+        blackbit::countParameters(config).total() * sizeof(float);
+
+    EXPECT_GT(stats.blocksProduced, 0U);
+    EXPECT_EQ(stats.blocksProduced, stats.blocksReleased)
+        << "un blocco di gradiente e' rimasto vivo dopo la sua consegna";
+    EXPECT_EQ(stats.liveBytes, 0U) << "a fine passo nessun byte di gradiente deve essere ancora vivo";
+    EXPECT_LT(stats.peakLiveBytes, denseModelGradientBytes / 4)
+        << "picco " << stats.peakLiveBytes << " byte contro " << denseModelGradientBytes
+        << " che servirebbero per un gradiente denso del modello";
+
+    // E il totale prodotto deve superare abbondantemente il picco: e'
+    // la prova che lo stesso spazio e' stato riusato invece di
+    // accumulato.
+    EXPECT_GT(stats.cumulativeBytes, stats.peakLiveBytes * 4);
+}
+
+TEST(BlackBitModelTest, NessunaCopiaInPienaPrecisioneDeiPesi) {
+    // Requisito 3: la rappresentazione canonica e' quella impacchettata.
+    // Se esistesse una master copy BF16/FP32 dei pesi, l'arena dei
+    // parametri conterrebbe almeno 16 bit per parametro ternario.
+    const BlackBitConfig config = microConfig();
+    blackbit::MemoryTelemetry::instance().reset();
+    {
+        BlackBitModel model(config, 47);
+        const std::vector<int> tokens{1, 2, 3, 4};
+        const std::vector<int> targets{2, 3, 4, 5};
+        blackbit::TernarySgdSink optimizer(0.01F);
+        model.registerParameters(optimizer);
+        (void)model.trainStep(tokens, targets, 1, 4, &optimizer);
+
+        const std::size_t ternaryParameters = blackbit::countParameters(config).ternary();
+        const std::size_t masterCopyBytes = ternaryParameters * 2;  // BF16
+        const std::size_t parameterArena =
+            blackbit::MemoryTelemetry::instance().peak(blackbit::MemoryArena::Parameter);
+
+        EXPECT_LT(parameterArena, model.parameterBytes() + masterCopyBytes)
+            << "l'arena dei parametri e' abbastanza grande da contenere una copia in piena precisione";
+    }
+    EXPECT_EQ(blackbit::MemoryTelemetry::instance().current(blackbit::MemoryArena::Parameter), 0U)
+        << "il modello distrutto ha lasciato parametri contabilizzati";
+    EXPECT_EQ(blackbit::MemoryTelemetry::instance().inconsistencies(), 0U);
 }
