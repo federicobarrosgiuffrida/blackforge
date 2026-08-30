@@ -4,7 +4,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <istream>
+#include <ostream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "blackforge/backend/cuda/cuda_check.hpp"
 #include "blackforge/blackbit/stochastic_round.hpp"
@@ -387,6 +391,118 @@ std::size_t LowRankProjectedOptimizer::conventionalStateBytes() const {
         result += 2 * state.values->bytes();
     }
     return result;
+}
+
+namespace {
+
+template <typename T>
+void writeScalar(std::ostream& out, T value) {
+    out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+template <typename T>
+T readScalar(std::istream& in) {
+    T value{};
+    in.read(reinterpret_cast<char*>(&value), sizeof(T));
+    if (!in) throw std::runtime_error("CUDA optimizer state: truncated stream");
+    return value;
+}
+
+void writeName(std::ostream& out, const std::string& name) {
+    writeScalar<std::uint32_t>(out, static_cast<std::uint32_t>(name.size()));
+    out.write(name.data(), static_cast<std::streamsize>(name.size()));
+}
+
+std::string readName(std::istream& in) {
+    const std::size_t length = readScalar<std::uint32_t>(in);
+    std::string name(length, '\0');
+    in.read(name.data(), static_cast<std::streamsize>(length));
+    if (!in) throw std::runtime_error("CUDA optimizer state: truncated parameter name");
+    return name;
+}
+
+void writeDeviceVector(std::ostream& out, const Buffer& buffer) {
+    const std::size_t count = buffer.bytes() / sizeof(float);
+    writeScalar<std::uint64_t>(out, static_cast<std::uint64_t>(count));
+    std::vector<float> host(count);
+    if (count != 0) {
+        BLACKFORGE_CUDA_CHECK(cudaMemcpy(host.data(), buffer.data(), buffer.bytes(), cudaMemcpyDeviceToHost));
+        out.write(reinterpret_cast<const char*>(host.data()), static_cast<std::streamsize>(buffer.bytes()));
+    }
+}
+
+void readDeviceVector(std::istream& in, Buffer& buffer) {
+    const std::size_t count = static_cast<std::size_t>(readScalar<std::uint64_t>(in));
+    if (count * sizeof(float) != buffer.bytes()) {
+        throw std::runtime_error("CUDA optimizer state: buffer size differs from registered parameter");
+    }
+    std::vector<float> host(count);
+    if (count != 0) {
+        in.read(reinterpret_cast<char*>(host.data()), static_cast<std::streamsize>(buffer.bytes()));
+        if (!in) throw std::runtime_error("CUDA optimizer state: truncated moment buffer");
+        BLACKFORGE_CUDA_CHECK(cudaMemcpy(buffer.data(), host.data(), buffer.bytes(), cudaMemcpyHostToDevice));
+    }
+}
+
+}  // namespace
+
+void LowRankProjectedOptimizer::serializeState(std::ostream& out) const {
+    for (const auto& [name, state] : states_) {
+        if (state.touched) throw std::runtime_error("CUDA optimizer state: checkpoint requested mid-step for '" + name + "'");
+    }
+    for (const auto& [name, state] : denseStates_) {
+        if (state.touched) throw std::runtime_error("CUDA optimizer state: checkpoint requested mid-step for '" + name + "'");
+    }
+    writeScalar<std::uint64_t>(out, static_cast<std::uint64_t>(step_));
+    writeScalar<std::uint32_t>(out, static_cast<std::uint32_t>(states_.size()));
+    for (const auto& [name, state] : states_) {
+        writeName(out, name);
+        writeScalar<std::uint64_t>(out, static_cast<std::uint64_t>(state.rank));
+        writeScalar<std::uint64_t>(out, state.projectionEpoch);
+        writeDeviceVector(out, state.firstMoment);
+        writeDeviceVector(out, state.secondMoment);
+        writeScalar<std::uint64_t>(out, 0);  // CPU-compatible empty consolidation residual.
+    }
+    writeScalar<std::uint32_t>(out, static_cast<std::uint32_t>(denseStates_.size()));
+    for (const auto& [name, state] : denseStates_) {
+        writeName(out, name);
+        writeDeviceVector(out, state.firstMoment);
+        writeDeviceVector(out, state.secondMoment);
+    }
+    if (!out) throw std::runtime_error("CUDA optimizer state: write failed");
+}
+
+void LowRankProjectedOptimizer::deserializeState(std::istream& in) {
+    step_ = static_cast<std::size_t>(readScalar<std::uint64_t>(in));
+    stats_.stepCount = step_;
+    const std::size_t ternaryCount = readScalar<std::uint32_t>(in);
+    if (ternaryCount != states_.size()) throw std::runtime_error("CUDA optimizer state: ternary state count mismatch");
+    for (std::size_t index = 0; index < ternaryCount; ++index) {
+        const std::string name = readName(in);
+        auto found = states_.find(name);
+        if (found == states_.end()) throw std::runtime_error("CUDA optimizer state: unknown ternary parameter '" + name + "'");
+        State& state = found->second;
+        const std::size_t rank = static_cast<std::size_t>(readScalar<std::uint64_t>(in));
+        if (rank != state.rank) throw std::runtime_error("CUDA optimizer state: rank mismatch for '" + name + "'");
+        state.projectionEpoch = readScalar<std::uint64_t>(in);
+        readDeviceVector(in, state.firstMoment);
+        readDeviceVector(in, state.secondMoment);
+        const std::size_t residualCount = static_cast<std::size_t>(readScalar<std::uint64_t>(in));
+        if (residualCount != 0) throw std::runtime_error("CUDA optimizer state: consolidation residual is unsupported");
+        BLACKFORGE_CUDA_CHECK(cudaMemset(state.accumulator.data(), 0, state.accumulator.bytes()));
+        state.touched = false;
+    }
+    const std::size_t denseCount = readScalar<std::uint32_t>(in);
+    if (denseCount != denseStates_.size()) throw std::runtime_error("CUDA optimizer state: dense state count mismatch");
+    for (std::size_t index = 0; index < denseCount; ++index) {
+        const std::string name = readName(in);
+        auto found = denseStates_.find(name);
+        if (found == denseStates_.end()) throw std::runtime_error("CUDA optimizer state: unknown dense parameter '" + name + "'");
+        readDeviceVector(in, found->second.firstMoment);
+        readDeviceVector(in, found->second.secondMoment);
+        BLACKFORGE_CUDA_CHECK(cudaMemset(found->second.accumulator.data(), 0, found->second.accumulator.bytes()));
+        found->second.touched = false;
+    }
 }
 
 }  // namespace blackforge::blackbit::cuda

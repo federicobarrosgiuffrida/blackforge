@@ -29,7 +29,21 @@ public:
     [[nodiscard]] Tensor backward(const Tensor& input, const Tensor& gradOutput,
                                   const BlockCache& cache, GradientSink* sink) const;
 
-    void registerParameters(LowRankProjectedOptimizer& optimizer);
+    template <typename Registry>
+    void registerParameters(Registry& registry) {
+        registry.registerDense(attentionNormName_, attentionGamma_);
+        registry.registerDense(moeNormName_, moeGamma_);
+        registry.registerTernary(attention_.queryProjection().name(), attention_.queryProjection().weight());
+        registry.registerTernary(attention_.keyProjection().name(), attention_.keyProjection().weight());
+        registry.registerTernary(attention_.valueProjection().name(), attention_.valueProjection().weight());
+        registry.registerTernary(attention_.outputProjection().name(), attention_.outputProjection().weight());
+        registry.registerDense(moe_.routerName(), moe_.routerWeight());
+        for (MoEExpert& expert : moe_.experts()) {
+            registry.registerTernary(expert.gate().name(), expert.gate().weight());
+            registry.registerTernary(expert.up().name(), expert.up().weight());
+            registry.registerTernary(expert.down().name(), expert.down().weight());
+        }
+    }
 
 private:
     std::string attentionNormName_;
@@ -56,7 +70,12 @@ public:
     BlackBitStepResult trainStep(const std::vector<int>& tokenIds, const std::vector<int>& targets,
                                  std::size_t batch, std::size_t seq, GradientSink* sink);
 
-    void registerParameters(LowRankProjectedOptimizer& optimizer);
+    template <typename Registry>
+    void registerParameters(Registry& registry) {
+        registry.registerTernary(embedding_.name(), embedding_.weight());
+        registry.registerDense(finalNormName_, finalGamma_);
+        for (BlackBitBlock& block : blocks_) block.registerParameters(registry);
+    }
     void setRuntimeOptions(const BlackBitRuntimeOptions& options);
     void setVocabChunk(std::size_t chunk);
 

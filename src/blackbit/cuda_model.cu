@@ -148,21 +148,6 @@ Tensor BlackBitBlock::backward(const Tensor& input, const Tensor& gradOutput, co
     return gradAfterAttention;
 }
 
-void BlackBitBlock::registerParameters(LowRankProjectedOptimizer& optimizer) {
-    optimizer.registerDense(attentionNormName_, attentionGamma_);
-    optimizer.registerDense(moeNormName_, moeGamma_);
-    optimizer.registerTernary(attention_.queryProjection().name(), attention_.queryProjection().weight());
-    optimizer.registerTernary(attention_.keyProjection().name(), attention_.keyProjection().weight());
-    optimizer.registerTernary(attention_.valueProjection().name(), attention_.valueProjection().weight());
-    optimizer.registerTernary(attention_.outputProjection().name(), attention_.outputProjection().weight());
-    optimizer.registerDense(moe_.routerName(), moe_.routerWeight());
-    for (MoEExpert& expert : moe_.experts()) {
-        optimizer.registerTernary(expert.gate().name(), expert.gate().weight());
-        optimizer.registerTernary(expert.up().name(), expert.up().weight());
-        optimizer.registerTernary(expert.down().name(), expert.down().weight());
-    }
-}
-
 BlackBitModel::BlackBitModel(blackforge::blackbit::BlackBitModel& cpuReference)
     : config_(cpuReference.config()),
       embedding_(cpuReference.embedding()),
@@ -193,12 +178,6 @@ Tensor BlackBitModel::forwardHidden(const std::vector<int>& tokenIds, std::size_
     }
     cache.preNormHidden = hidden.clone(MemoryArena::Activations);
     return rmsNormForward(hidden, finalGamma_, cache.finalNorm);
-}
-
-void BlackBitModel::registerParameters(LowRankProjectedOptimizer& optimizer) {
-    optimizer.registerTernary(embedding_.name(), embedding_.weight());
-    optimizer.registerDense(finalNormName_, finalGamma_);
-    for (BlackBitBlock& block : blocks_) block.registerParameters(optimizer);
 }
 
 void BlackBitModel::setVocabChunk(std::size_t chunk) {

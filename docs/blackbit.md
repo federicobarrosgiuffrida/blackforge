@@ -445,6 +445,57 @@ token/s); Small e Medium hanno completato uno step con picchi reali di
 1,139 e 1,231 GiB. Nessuna di queste esecuzioni usa PyTorch, LoRA,
 offload del modello o una copia persistente decodificata.
 
+## 7.4 Testo reale, checkpoint e resume CUDA
+
+Per la prima prova su testo reale e' stato usato
+[`roneneldan/TinyStories`](https://huggingface.co/datasets/roneneldan/TinyStories/tree/main),
+licenza CDLA-Sharing-1.0. Il repository completo dichiarava 7,62 GB e
+il solo `TinyStories-train.txt` 1,92 GB: non sono stati scaricati. La
+prova del 30 agosto 2026 ha richiesto solamente 100 righe dal Dataset
+Viewer (82 695 byte JSON, 77 932 byte di testo), proprio per evitare un
+download prematuro di grandi dimensioni.
+
+Acquisizione riproducibile del campione (la risposta mantiene anche i
+row index originali; il corpus concatena esclusivamente il campo
+`text`):
+
+```powershell
+$url = 'https://datasets-server.huggingface.co/rows?dataset=roneneldan%2FTinyStories&config=default&split=train&offset=0&length=100'
+Invoke-WebRequest $url -OutFile tinystories_rows_000000_000099.json
+$rows = Get-Content tinystories_rows_000000_000099.json -Raw | ConvertFrom-Json
+($rows.rows | ForEach-Object { $_.row.text }) -join "`n" |
+  Set-Content tinystories_100.txt -Encoding utf8 -NoNewline
+```
+
+Il tokenizer byte-level BPE nativo e' stato addestrato con 1 024 token
+totali (259 token base/speciali + 765 merge) e lo shard causale prodotto
+con sequenze da 16 token contiene 1 519 esempi. I comandi sono:
+
+```
+blackforge tokenizer-train tinystories_100.txt --vocab-size 1024 \
+  --output tinystories_1024.bftok
+blackforge dataset-build tinystories_100.txt tinystories_1024.bftok \
+  --seq-len 16 --output tinystories_seq16.bfdata
+blackforge train blackbit tiny --device cuda \
+  --dataset tinystories_seq16.bfdata --tokenizer tinystories_1024.bftok \
+  --steps 200 --optimizer-rank 8 --max-vram-mb 7800 \
+  --save-checkpoint tiny_real_step200.bfbit
+```
+
+Risultato fisico: loss 9,056 -> 8,648, perplexity 8 571 -> 5 701,
+3 200 token, 84,13 token/s, 14 838 148 flip ternari, entropia router
+1,385 nat, zero NaN/Inf e picco NVIDIA 1,114 GiB. Dopo un vero riavvio
+del processo, `--from-checkpoint` ha ripreso da step 200/token 3 200 e
+ha raggiunto step 201/token 3 216 (loss 8,217).
+
+Il checkpoint CUDA usa lo stesso contenitore packed `BFBIT-v1` del
+backend CPU ed e' stato caricato anche dal loader CPU. Include pesi
+ternari impacchettati, parametri densi, momenti low-rank, epoca delle
+proiezioni, step, token, learning rate e seme RNG. Quando viene fornito
+`--tokenizer`, il trainer salva accanto al checkpoint una copia
+`.bftok` e un manifest `metadata.json` con versione dei formati,
+dimensioni del vocabolario e hash FNV-1a di dataset/tokenizer.
+
 ## 8. Stato dei percorsi (aggiornato ad ogni fase)
 
 | Percorso | Stato | Verificato da |
@@ -472,18 +523,15 @@ offload del modello o una copia persistente decodificata.
 | GQA CUDA online-softmax | implementato | forward/backward; nessuna matrice score e nessuna replica K/V |
 | MoE CUDA Top-2 sparso | implementato | dispatch compatto, overflow, router ed esperti contro CPU |
 | Optimizer CUDA proiettato + parametri densi | implementato | parità CPU e flip reali dei byte packed |
-| Modello/trainer CUDA end-to-end | implementato | 515 test totali + Tiny/Small/Medium/9B reali |
+| Modello/trainer CUDA end-to-end | implementato | 517 test totali + Tiny/Small/Medium/9B reali |
+| Trainer testo reale + checkpoint/resume CUDA | implementato | TinyStories sample, BFBIT CPU/CUDA interoperabile, ripresa step/token/RNG/optimizer |
 | Milestone H | **PASS** | 9B seq 16, picco NVIDIA 4,379 GiB, 49,3 M flip |
 
 ### 8.1 Limiti Phase 9 ancora aperti, detti esplicitamente
 
-* **Checkpoint/resume del nuovo stato optimizer CUDA non è ancora
-  collegato al formato di checkpoint.** Il formato CPU packed resta
-  implementato, ma non va dichiarata una ripresa GPU finché non viene
-  provata dopo il riavvio del processo.
-* **Il test 9B usa token sintetici**, non ancora gli shard di testo
-  reale. La pipeline tokenizer/dataset esistente va collegata al nuovo
-  trainer prima dello smoke da 100 step.
+* **Milestone H usa ancora token sintetici.** Il percorso su testo reale,
+  checkpoint e resume e' provato su Tiny; lo smoke 9B da 100 step resta
+  da eseguire sullo stesso shard dopo averne comunicato la durata misurata.
 * **Le modalità CUDA `EveryNLayers` e `FullRecompute` usano oggi il
   comportamento corretto `PerLayer`**, quindi la correttezza è
   preservata ma non raggiungono ancora il loro diverso trade-off di

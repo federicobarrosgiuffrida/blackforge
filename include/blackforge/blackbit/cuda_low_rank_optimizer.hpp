@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <istream>
+#include <ostream>
 #include <string>
 #include <unordered_map>
 
@@ -56,6 +58,9 @@ public:
     [[nodiscard]] std::size_t conventionalStateBytes() const;
     [[nodiscard]] std::size_t stepCount() const { return step_; }
     [[nodiscard]] const LowRankOptimizerStats& stats() const { return stats_; }
+
+    void serializeState(std::ostream& out) const;
+    void deserializeState(std::istream& in);
 
     void setLearningRate(float value) { options_.learningRate = value; }
     [[nodiscard]] float learningRate() const { return options_.learningRate; }
