@@ -178,38 +178,57 @@ __global__ void updatePackedKernel(std::uint32_t* packed, std::size_t rows, std:
     unsigned long long nanInf = 0;
     double updateSquared = 0.0;
 
+    // projection() dipende da (riga, componente) e NON dalla colonna,
+    // ma il ciclo originale la ricalcolava per ogni trit: 20 * rank
+    // hash per thread invece di rank. Scambiando i due cicli la
+    // proiezione viene valutata una volta per componente e riusata sui
+    // 20 trit della word. L'ordine di accumulazione di 'update' resta
+    // per componente crescente, esattamente come prima, quindi il
+    // risultato e' bit-identico (stessa somma, stessi raggruppamenti).
+    int trits[kTritsPerWord];
     for (int byte = 0; byte < 4; ++byte) {
-        int trits[kTritsPerByte];
-        decodeTritByte(wordByte(word, byte), trits);
-        for (std::size_t slot = 0; slot < kTritsPerByte; ++slot) {
-            const std::size_t col = firstCol + static_cast<std::size_t>(byte) * kTritsPerByte + slot;
-            if (col >= cols) continue;
-            float update = 0.0F;
-            for (std::size_t component = 0; component < rank; ++component) {
-                update += -learningRate * projection(seed, epoch, row, component, rank) *
-                          direction[component * cols + col];
-            }
-            if (!isfinite(update)) {
-                ++nanInf;
-                continue;
-            }
-            const int oldTrit = trits[slot];
-            const float target = static_cast<float>(oldTrit) + update;
-            const int newTrit = stochasticRoundToTrit(target, stepSeed, row * cols + col);
-            trits[slot] = newTrit;
-            ++elements;
-            updateSquared += static_cast<double>(update) * static_cast<double>(update);
-            if (target <= -1.0F || target >= 1.0F) ++saturated;
-            if (newTrit != oldTrit) {
-                ++flips;
-                if (newTrit > oldTrit) {
-                    ++positiveFlips;
-                } else {
-                    ++negativeFlips;
-                }
+        decodeTritByte(wordByte(word, byte), trits + static_cast<std::size_t>(byte) * kTritsPerByte);
+    }
+
+    float updates[kTritsPerWord];
+    for (std::size_t slot = 0; slot < kTritsPerWord; ++slot) updates[slot] = 0.0F;
+    for (std::size_t component = 0; component < rank; ++component) {
+        const float scaled = -learningRate * projection(seed, epoch, row, component, rank);
+        const float* directionRow = direction + component * cols;
+        for (std::size_t slot = 0; slot < kTritsPerWord; ++slot) {
+            const std::size_t col = firstCol + slot;
+            if (col < cols) updates[slot] += scaled * directionRow[col];
+        }
+    }
+
+    for (std::size_t slot = 0; slot < kTritsPerWord; ++slot) {
+        const std::size_t col = firstCol + slot;
+        if (col >= cols) continue;
+        const float update = updates[slot];
+        if (!isfinite(update)) {
+            ++nanInf;
+            continue;
+        }
+        const int oldTrit = trits[slot];
+        const float target = static_cast<float>(oldTrit) + update;
+        const int newTrit = stochasticRoundToTrit(target, stepSeed, row * cols + col);
+        trits[slot] = newTrit;
+        ++elements;
+        updateSquared += static_cast<double>(update) * static_cast<double>(update);
+        if (target <= -1.0F || target >= 1.0F) ++saturated;
+        if (newTrit != oldTrit) {
+            ++flips;
+            if (newTrit > oldTrit) {
+                ++positiveFlips;
+            } else {
+                ++negativeFlips;
             }
         }
-        word = setWordByte(word, byte, encodeTritByte(trits[0], trits[1], trits[2], trits[3], trits[4]));
+    }
+    for (int byte = 0; byte < 4; ++byte) {
+        const int* byteTrits = trits + static_cast<std::size_t>(byte) * kTritsPerByte;
+        word = setWordByte(word, byte,
+                           encodeTritByte(byteTrits[0], byteTrits[1], byteTrits[2], byteTrits[3], byteTrits[4]));
     }
     packed[wordIndex] = word;
     atomicAdd(&stats->elements, elements);
