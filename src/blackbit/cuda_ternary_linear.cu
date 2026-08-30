@@ -135,29 +135,76 @@ void gemm(cublasOperation_t transA, cublasOperation_t transB, const __nv_bfloat1
                                             &heuristic.algo, sharedWorkspace().data(), heuristic.workspaceSize, nullptr));
 }
 
-class EventPair {
+// Cronometro a eventi che NON blocca l'host.
+//
+// La versione precedente faceva cudaEventSynchronize dopo OGNI tile di
+// decode e ogni GEMM. Il profilo Nsight contava 111 188 sincronizzazioni
+// per step: l'host non poteva mai correre avanti a accodare il kernel
+// successivo, e il tempo di parete restava ~2,4 s sopra la somma dei
+// kernel. Qui le coppie di eventi vengono solo registrate; i tempi si
+// leggono una volta sola alla fine, con una singola sincronizzazione.
+// La metrica riportata resta la stessa, misurata dagli stessi eventi.
+class DeferredTimer {
 public:
-    EventPair() {
-        BLACKFORGE_CUDA_CHECK(cudaEventCreate(&start_));
-        BLACKFORGE_CUDA_CHECK(cudaEventCreate(&end_));
+    void reset() {
+        pending_.clear();
+        used_ = 0;
     }
-    ~EventPair() {
-        cudaEventDestroy(end_);
-        cudaEventDestroy(start_);
+
+    // Ogni marca occupa uno slot suo: gli intervalli possono annidarsi
+    // (il cronometro totale racchiude quelli per tile) senza che una
+    // start successiva sovrascriva l'evento di una ancora aperta.
+    [[nodiscard]] std::size_t start() {
+        const std::size_t index = mark();
+        return index;
     }
-    void start() { BLACKFORGE_CUDA_CHECK(cudaEventRecord(start_)); }
-    float stop() {
-        BLACKFORGE_CUDA_CHECK(cudaEventRecord(end_));
-        BLACKFORGE_CUDA_CHECK(cudaEventSynchronize(end_));
-        float milliseconds = 0.0F;
-        BLACKFORGE_CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_, end_));
-        return milliseconds;
+
+    void stop(std::size_t startIndex, double* accumulator) {
+        const std::size_t endIndex = mark();
+        pending_.push_back(Interval{startIndex, endIndex, accumulator});
+    }
+
+    void resolve() {
+        if (pending_.empty()) return;
+        BLACKFORGE_CUDA_CHECK(cudaEventSynchronize(events_[used_ - 1]));
+        for (const Interval& interval : pending_) {
+            float milliseconds = 0.0F;
+            BLACKFORGE_CUDA_CHECK(
+                cudaEventElapsedTime(&milliseconds, events_[interval.start], events_[interval.end]));
+            *interval.accumulator += milliseconds;
+        }
+        reset();
     }
 
 private:
-    cudaEvent_t start_{};
-    cudaEvent_t end_{};
+    struct Interval {
+        std::size_t start;
+        std::size_t end;
+        double* accumulator;
+    };
+
+    std::size_t mark() {
+        while (events_.size() <= used_) {
+            cudaEvent_t event = nullptr;
+            BLACKFORGE_CUDA_CHECK(cudaEventCreate(&event));
+            events_.push_back(event);
+        }
+        const std::size_t index = used_++;
+        BLACKFORGE_CUDA_CHECK(cudaEventRecord(events_[index]));
+        return index;
+    }
+
+    std::vector<cudaEvent_t> events_;
+    std::vector<Interval> pending_;
+    std::size_t used_ = 0;
 };
+
+// Gli eventi sono riusati fra le chiamate: crearli e distruggerli a ogni
+// forward costava 15 808 cudaEventCreate per step.
+DeferredTimer& deferredTimer() {
+    static thread_local DeferredTimer timer;
+    return timer;
+}
 
 }  // namespace
 
@@ -196,35 +243,42 @@ Tensor TernaryLinear::forward(const Tensor& input) const {
     Buffer inputBf16(input.elementCount() * sizeof(__nv_bfloat16), MemoryArena::Temporary);
     Buffer tile(tileRows_ * inFeatures_ * sizeof(__nv_bfloat16), MemoryArena::DequantizationTiles);
 
-    EventPair totalTimer;
-    totalTimer.start();
+    metrics_ = {};
+    metrics_.dequantWorkspaceBytes = tile.bytes();
+    metrics_.cublasWorkspaceBytes = sharedWorkspace().bytes();
+
+    // 'tile' viene riusato a ogni iterazione, ma decode e GEMM stanno
+    // sullo stesso stream: l'ordine dello stream garantisce gia' che il
+    // decode del tile successivo non parta prima che il GEMM precedente
+    // abbia finito di leggerlo. La sincronizzazione dell'host serviva
+    // solo a leggere il cronometro, non alla correttezza.
+    DeferredTimer& timer = deferredTimer();
+    timer.reset();
+    const std::size_t totalMark = timer.start();
     floatToBf16Kernel<<<gridFor(input.elementCount()), kBlockSize>>>(inputBf16.as<__nv_bfloat16>(), input.data(),
                                                                     input.elementCount());
     BLACKFORGE_CUDA_CHECK(cudaGetLastError());
 
-    metrics_ = {};
-    metrics_.dequantWorkspaceBytes = tile.bytes();
-    metrics_.cublasWorkspaceBytes = sharedWorkspace().bytes();
-    EventPair phaseTimer;
     for (std::size_t first = 0; first < outFeatures_; first += tileRows_) {
         const std::size_t count = std::min(tileRows_, outFeatures_ - first);
-        phaseTimer.start();
+        const std::size_t decodeMark = timer.start();
         decodeBf16Kernel<<<gridFor(count * inFeatures_), kBlockSize>>>(
             tile.as<__nv_bfloat16>(), weight_.packedWords(), weight_.scales(), first, count, inFeatures_,
             weight_.wordsPerRow(), weight_.groupsPerRow(), weight_.groupSize());
         BLACKFORGE_CUDA_CHECK(cudaGetLastError());
-        metrics_.decodeMs += phaseTimer.stop();
+        timer.stop(decodeMark, &metrics_.decodeMs);
 
-        phaseTimer.start();
+        const std::size_t gemmMark = timer.start();
         gemm(CUBLAS_OP_N, CUBLAS_OP_T, inputBf16.as<__nv_bfloat16>(), rows, inFeatures_, inFeatures_,
              tile.as<__nv_bfloat16>(), count, inFeatures_, inFeatures_, output.data() + first, rows, count,
              outFeatures_, 0.0F);
-        metrics_.gemmMs += phaseTimer.stop();
+        timer.stop(gemmMark, &metrics_.gemmMs);
         metrics_.decodedBytesWritten += count * inFeatures_ * sizeof(__nv_bfloat16);
         metrics_.packedBytesRead += count * weight_.wordsPerRow() * sizeof(std::uint32_t) +
                                     count * weight_.groupsPerRow() * sizeof(float);
     }
-    metrics_.totalMs = totalTimer.stop();
+    timer.stop(totalMark, &metrics_.totalMs);
+    timer.resolve();
     return output;
 }
 
