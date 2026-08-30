@@ -75,7 +75,20 @@ struct TernaryUpdateStats {
 // seme globale.
 std::uint64_t parameterNameHash(const std::string& name);
 
-// Applica 'delta' (nelle unita' del peso reale) alle righe
+// In quali unita' e' espresso un aggiornamento.
+enum class TernaryUpdateUnits {
+    // Unita' del peso reale: il delta viene diviso per la scala del
+    // gruppo prima di essere confrontato con la griglia.
+    Weight,
+    // Unita' della GRIGLIA: 1,0 significa "un passo ternario intero".
+    // E' la forma naturale per un ottimizzatore, perche' su una griglia
+    // quantizzata il modulo assoluto del gradiente non dice nulla —
+    // conta solo quanto e' grande l'aggiornamento RISPETTO al passo
+    // della griglia.
+    Grid,
+};
+
+// Applica 'delta' alle righe
 // [firstRow, firstRow + rowCount) di 'weight', arrotondando
 // stocasticamente sulla griglia ternaria del gruppo corrispondente.
 //
@@ -83,18 +96,36 @@ std::uint64_t parameterNameHash(const std::string& name);
 // esecuzioni con gli stessi valori producono gli stessi flip, il che
 // rende riproducibile un addestramento intero.
 TernaryUpdateStats applyTernaryUpdateBlock(TernaryTensor& weight, std::size_t firstRow, std::size_t rowCount,
-                                            const float* delta, std::uint64_t seed, std::uint64_t step);
+                                            const float* delta, std::uint64_t seed, std::uint64_t step,
+                                            TernaryUpdateUnits units = TernaryUpdateUnits::Weight);
 
 // Sink che consuma il gradiente e aggiorna IMMEDIATAMENTE i pesi:
-// discesa del gradiente semplice, con arrotondamento stocastico sui
-// pesi ternari e aggiornamento ordinario su quelli densi.
+// discesa del gradiente, con arrotondamento stocastico sui pesi ternari
+// e aggiornamento ordinario su quelli densi.
 //
-// E' il percorso di aggiornamento piu' semplice che soddisfa i vincoli
-// del progetto (nessuna master copy, nessun buffer di gradienti a
-// dimensione modello, pesi ternari che si muovono davvero), e serve da
-// riferimento verificabile per l'ottimizzatore proiettato low-rank che
-// gli si affianchera'. Non tiene alcuno stato per parametro: la
-// memoria dell'ottimizzatore e' esattamente zero.
+// AGGIORNAMENTO NORMALIZZATO (attivo per default)
+//
+// Il delta applicato non e' 'lr * gradiente' ma
+//
+//     lr * gradiente / rms(gradiente del blocco)     [unita' di griglia]
+//
+// cioe' il learning rate misura direttamente QUANTA FRAZIONE DI PASSO
+// TERNARIO ci si aspetta di percorrere, indipendentemente dal modulo
+// del gradiente e dalla scala di quantizzazione di quella matrice.
+//
+// Non e' un dettaglio di comodo: senza normalizzazione, con una loss
+// mediata su qualche migliaio di elementi il gradiente vale ~1e-4 e il
+// passo della griglia ~0,2, quindi la probabilita' di flip e' ~5e-4 —
+// misurata su un blocco MoE minuscolo, 300 passi producevano 2 flip in
+// tutto e la loss non si muoveva. Il segnale c'era, ma la griglia era
+// troppo grossa per riceverlo. La stessa cosa la fa Adam su pesi
+// continui, normalizzando il passo per la radice del secondo momento:
+// qui e' ancora piu' necessaria, perche' un passo troppo piccolo non
+// diventa un aggiornamento piccolo, diventa NESSUN aggiornamento.
+//
+// Disattivabile (setNormalizeUpdates(false)) per confrontare i due
+// comportamenti. Non tiene alcuno stato per parametro: la memoria
+// dell'ottimizzatore e' esattamente zero.
 class TernarySgdSink : public GradientSink {
 public:
     explicit TernarySgdSink(float learningRate, std::uint64_t seed = 0x9E3779B97F4A7C15ULL)
@@ -114,6 +145,9 @@ public:
     void setLearningRate(float learningRate) { learningRate_ = learningRate; }
     [[nodiscard]] float learningRate() const { return learningRate_; }
 
+    void setNormalizeUpdates(bool normalize) { normalizeUpdates_ = normalize; }
+    [[nodiscard]] bool normalizeUpdates() const { return normalizeUpdates_; }
+
     // Avanza il contatore di passo: va chiamata una volta per ogni
     // aggiornamento completo del modello, cosi' la sequenza casuale non
     // si ripete fra un passo e il successivo.
@@ -131,6 +165,7 @@ public:
 private:
     float learningRate_;
     std::uint64_t seed_;
+    bool normalizeUpdates_ = true;
     std::uint64_t step_ = 0;
     TernaryUpdateStats stats_;
     std::unordered_map<std::string, TernaryTensor*> ternary_;

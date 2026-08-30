@@ -326,7 +326,7 @@ con un numero**, non dichiarandolo.
 | Arrotondamento stocastico + RNG a contatore | implementato | 6 test unitari eseguiti (CPU), incluso quello di non distorsione su 200 000 campioni |
 | Telemetria di memoria per arena + budget | implementato | verificata dai test di `TernaryLinear` |
 | Aggiornamento diretto dei trit (`TernarySgdSink`) | implementato | rete minuscola che riduce la loss del 15 %+ con soli pesi ternari |
-| MoE | da fare | — |
+| MoE (router top-2, dispatch sparso, capacita', bilanciamento, metriche) | implementato | 9 test unitari eseguiti (CPU), incluso il gradiente numerico e "tutti gli esperti ricevono gradiente" |
 | GQA | da fare | — |
 | Backward in streaming | da fare | — |
 | Optimizer low-rank | da fare | — |

@@ -1,5 +1,6 @@
 #include "blackforge/blackbit/ternary_update.hpp"
 
+#include <cmath>
 #include <stdexcept>
 
 #include "blackforge/blackbit/stochastic_round.hpp"
@@ -16,7 +17,8 @@ std::uint64_t parameterNameHash(const std::string& name) {
 }
 
 TernaryUpdateStats applyTernaryUpdateBlock(TernaryTensor& weight, std::size_t firstRow, std::size_t rowCount,
-                                            const float* delta, std::uint64_t seed, std::uint64_t step) {
+                                            const float* delta, std::uint64_t seed, std::uint64_t step,
+                                            TernaryUpdateUnits units) {
     if (firstRow + rowCount > weight.rows()) {
         throw std::out_of_range("applyTernaryUpdateBlock: intervallo di righe fuori dal tensore");
     }
@@ -38,9 +40,11 @@ TernaryUpdateStats applyTernaryUpdateBlock(TernaryTensor& weight, std::size_t fi
             const float scale = weight.scaleAt(flat);
             const int oldTrit = weight.tritAt(flat);
 
-            // Il peso reale aggiornato, espresso in unita' di scala:
+            // Il peso reale aggiornato, espresso in unita' di griglia:
             // e' il valore che la griglia ternaria deve rappresentare.
-            const float targetInUnits = static_cast<float>(oldTrit) + delta[r * cols + c] / scale;
+            const float gridStep =
+                units == TernaryUpdateUnits::Grid ? delta[r * cols + c] : delta[r * cols + c] / scale;
+            const float targetInUnits = static_cast<float>(oldTrit) + gridStep;
             const int newTrit = stochasticRoundToTrit(targetInUnits, stepSeed, flat);
 
             ++stats.elementsConsidered;
@@ -68,12 +72,32 @@ void TernarySgdSink::consumeWeightGradientBlock(const ParameterId& id, std::size
     // il blocco: e' l'unica memoria che questo sink usa, ed e'
     // proporzionale al blocco, non al parametro.
     std::vector<float> delta(rowCount * id.cols);
-    for (std::size_t i = 0; i < delta.size(); ++i) {
-        delta[i] = -learningRate_ * block[i];
+
+    if (normalizeUpdates_) {
+        // Radice del valore quadratico medio del blocco: rende il passo
+        // indipendente dal modulo del gradiente (vedi il commento
+        // nell'header).
+        double squared = 0.0;
+        for (std::size_t i = 0; i < delta.size(); ++i) {
+            squared += static_cast<double>(block[i]) * static_cast<double>(block[i]);
+        }
+        const double rms = std::sqrt(squared / static_cast<double>(delta.size()));
+        if (rms <= 0.0) {
+            return;  // blocco a gradiente esattamente nullo: niente da fare
+        }
+        const float inverse = static_cast<float>(1.0 / rms);
+        for (std::size_t i = 0; i < delta.size(); ++i) {
+            delta[i] = -learningRate_ * block[i] * inverse;
+        }
+    } else {
+        for (std::size_t i = 0; i < delta.size(); ++i) {
+            delta[i] = -learningRate_ * block[i];
+        }
     }
 
     stats_ += applyTernaryUpdateBlock(*it->second, firstRow, rowCount, delta.data(),
-                                       seed_ ^ parameterNameHash(id.name), step_);
+                                       seed_ ^ parameterNameHash(id.name), step_,
+                                       normalizeUpdates_ ? TernaryUpdateUnits::Grid : TernaryUpdateUnits::Weight);
 }
 
 void TernarySgdSink::consumeDenseGradient(const ParameterId& id, const float* values, std::size_t count) {
@@ -90,6 +114,32 @@ void TernarySgdSink::consumeDenseGradient(const ParameterId& id, const float* va
     // RMSNorm, matrici di routing) sono numericamente sensibili e
     // costano insieme meno di un millesimo del modello (vedi
     // requisito 15).
+    //
+    // Con gli aggiornamenti normalizzati attivi, il passo e' RELATIVO
+    // all'ampiezza del parametro stesso (lr * rms(parametro) *
+    // gradiente / rms(gradiente)): senza, lo stesso learning rate
+    // significherebbe due cose diverse per un peso ternario (frazione
+    // di passo della griglia) e per uno denso (unita' assolute), e
+    // regolarne uno scombinerebbe l'altro.
+    if (normalizeUpdates_) {
+        double gradientSquared = 0.0;
+        double parameterSquared = 0.0;
+        for (std::size_t i = 0; i < count; ++i) {
+            gradientSquared += static_cast<double>(values[i]) * static_cast<double>(values[i]);
+            parameterSquared += static_cast<double>(target[i]) * static_cast<double>(target[i]);
+        }
+        const double gradientRms = std::sqrt(gradientSquared / static_cast<double>(count));
+        const double parameterRms = std::sqrt(parameterSquared / static_cast<double>(count));
+        if (gradientRms <= 0.0 || parameterRms <= 0.0) {
+            return;
+        }
+        const float factor = static_cast<float>(static_cast<double>(learningRate_) * parameterRms / gradientRms);
+        for (std::size_t i = 0; i < count; ++i) {
+            target[i] -= factor * values[i];
+        }
+        return;
+    }
+
     for (std::size_t i = 0; i < count; ++i) {
         target[i] -= learningRate_ * values[i];
     }

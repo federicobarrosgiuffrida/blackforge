@@ -47,6 +47,14 @@ public:
     static MemoryTelemetry& instance();
 
     void recordAllocation(MemoryArena arena, std::size_t bytes);
+
+    // Un rilascio piu' grande dell'occupazione corrente e' un errore di
+    // contabilita' (o una reset() chiamata mentre oggetti BlackBit erano
+    // ancora vivi). NON lancia: questa funzione viene chiamata dai
+    // distruttori, e un'eccezione da li' terminerebbe il processo
+    // trasformando un difetto di telemetria in un crash. Il contatore
+    // viene saturato a zero e l'anomalia registrata in
+    // inconsistencies(), che i test verificano essere zero.
     void recordRelease(MemoryArena arena, std::size_t bytes);
 
     [[nodiscard]] std::size_t current(MemoryArena arena) const;
@@ -56,8 +64,17 @@ public:
     [[nodiscard]] std::size_t currentTotal() const;
     [[nodiscard]] std::size_t peakTotal() const;
 
-    // Azzera contatori correnti, picchi e conteggi: usata all'inizio di
-    // un benchmark o di un test.
+    // Numero di rilasci incoerenti visti finora: deve restare zero in
+    // un'esecuzione corretta.
+    [[nodiscard]] std::size_t inconsistencies() const { return inconsistencies_; }
+
+    // Azzera contatori correnti, picchi e conteggi.
+    //
+    // ATTENZIONE: va chiamata SOLO quando nessun oggetto BlackBit che
+    // ha registrato memoria e' ancora vivo, altrimenti i loro
+    // distruttori scaricheranno byte che questo azzeramento ha gia'
+    // tolto (vedi inconsistencies()). Per misurare il picco di una fase
+    // dentro un'esecuzione gia' avviata si usa resetPeaks().
     void reset();
 
     // Azzera i SOLI picchi, lasciando invariata l'occupazione corrente:
@@ -74,6 +91,7 @@ private:
     std::array<std::size_t, kMemoryArenaCount> current_{};
     std::array<std::size_t, kMemoryArenaCount> peak_{};
     std::array<std::size_t, kMemoryArenaCount> allocations_{};
+    std::size_t inconsistencies_ = 0;
 };
 
 // Registra un'allocazione alla costruzione e il rilascio alla

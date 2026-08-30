@@ -46,15 +46,14 @@ void MemoryTelemetry::recordAllocation(MemoryArena arena, std::size_t bytes) {
 void MemoryTelemetry::recordRelease(MemoryArena arena, std::size_t bytes) {
     const std::size_t i = indexOf(arena);
     if (bytes > current_[i]) {
-        // Un rilascio piu' grande dell'occupazione corrente significa
-        // che qualcuno ha sbagliato a contare: e' un errore di
-        // programmazione, non una condizione da assorbire in silenzio
-        // (un contatore che va in underflow renderebbe inutile tutta la
-        // telemetria, e con essa la prova che i gradienti non si
-        // accumulano).
-        throw std::logic_error(std::string("MemoryTelemetry: rilascio di ") + std::to_string(bytes) +
-                               " byte nell'arena '" + memoryArenaName(arena) + "' che ne ha solo " +
-                               std::to_string(current_[i]));
+        // Registrato e saturato, non lanciato: questa funzione e'
+        // raggiunta dai distruttori (vedi l'header). Un underflow
+        // silenzioso renderebbe inutile tutta la telemetria — e con
+        // essa la prova che i gradienti non si accumulano — quindi
+        // l'anomalia resta visibile in inconsistencies().
+        ++inconsistencies_;
+        current_[i] = 0;
+        return;
     }
     current_[i] -= bytes;
 }
@@ -91,6 +90,7 @@ void MemoryTelemetry::reset() {
     current_.fill(0);
     peak_.fill(0);
     allocations_.fill(0);
+    inconsistencies_ = 0;
 }
 
 void MemoryTelemetry::resetPeaks() { peak_ = current_; }
