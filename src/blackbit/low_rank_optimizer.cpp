@@ -391,6 +391,104 @@ std::size_t LowRankProjectedOptimizer::conventionalStateBytes() const {
     return total;
 }
 
+namespace {
+
+template <typename T>
+void writeScalar(std::ostream& out, T value) {
+    out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+template <typename T>
+T readScalar(std::istream& in) {
+    T value{};
+    in.read(reinterpret_cast<char*>(&value), sizeof(T));
+    if (!in) {
+        throw std::runtime_error("stato dell'ottimizzatore: stream terminato prima del previsto");
+    }
+    return value;
+}
+
+void writeVector(std::ostream& out, const std::vector<float>& values) {
+    writeScalar<std::uint64_t>(out, static_cast<std::uint64_t>(values.size()));
+    out.write(reinterpret_cast<const char*>(values.data()),
+              static_cast<std::streamsize>(values.size() * sizeof(float)));
+}
+
+void readVector(std::istream& in, std::vector<float>& values) {
+    const auto count = static_cast<std::size_t>(readScalar<std::uint64_t>(in));
+    if (count != values.size()) {
+        throw std::runtime_error("stato dell'ottimizzatore: dimensione di un buffer diversa da quella attesa (" +
+                                  std::to_string(count) + " invece di " + std::to_string(values.size()) + ")");
+    }
+    in.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(count * sizeof(float)));
+    if (!in) {
+        throw std::runtime_error("stato dell'ottimizzatore: stream terminato prima del previsto");
+    }
+}
+
+}  // namespace
+
+void LowRankProjectedOptimizer::serializeState(std::ostream& out) const {
+    writeScalar<std::uint64_t>(out, static_cast<std::uint64_t>(step_));
+    writeScalar<std::uint32_t>(out, static_cast<std::uint32_t>(ternary_.size()));
+    for (const auto& entry : ternary_) {
+        writeScalar<std::uint32_t>(out, static_cast<std::uint32_t>(entry.first.size()));
+        out.write(entry.first.data(), static_cast<std::streamsize>(entry.first.size()));
+        writeScalar<std::uint64_t>(out, static_cast<std::uint64_t>(entry.second.rank));
+        writeScalar<std::uint64_t>(out, static_cast<std::uint64_t>(entry.second.projectionEpoch));
+        writeVector(out, entry.second.firstMoment);
+        writeVector(out, entry.second.secondMoment);
+        writeVector(out, entry.second.residual);
+    }
+    writeScalar<std::uint32_t>(out, static_cast<std::uint32_t>(dense_.size()));
+    for (const auto& entry : dense_) {
+        writeScalar<std::uint32_t>(out, static_cast<std::uint32_t>(entry.first.size()));
+        out.write(entry.first.data(), static_cast<std::streamsize>(entry.first.size()));
+        writeVector(out, entry.second.firstMoment);
+        writeVector(out, entry.second.secondMoment);
+    }
+}
+
+void LowRankProjectedOptimizer::deserializeState(std::istream& in) {
+    step_ = static_cast<std::size_t>(readScalar<std::uint64_t>(in));
+    stats_.stepCount = step_;
+
+    const auto ternaryCount = readScalar<std::uint32_t>(in);
+    for (std::uint32_t i = 0; i < ternaryCount; ++i) {
+        const auto nameLength = readScalar<std::uint32_t>(in);
+        std::string name(nameLength, '\0');
+        in.read(name.data(), nameLength);
+        auto it = ternary_.find(name);
+        if (it == ternary_.end()) {
+            throw std::runtime_error("stato dell'ottimizzatore: parametro ternario '" + name +
+                                      "' non registrato nel modello corrente");
+        }
+        const auto rank = static_cast<std::size_t>(readScalar<std::uint64_t>(in));
+        if (rank != it->second.rank) {
+            throw std::runtime_error("stato dell'ottimizzatore: il parametro '" + name + "' aveva rango " +
+                                      std::to_string(rank) + ", ora e' " + std::to_string(it->second.rank));
+        }
+        it->second.projectionEpoch = readScalar<std::uint64_t>(in);
+        readVector(in, it->second.firstMoment);
+        readVector(in, it->second.secondMoment);
+        readVector(in, it->second.residual);
+    }
+
+    const auto denseCount = readScalar<std::uint32_t>(in);
+    for (std::uint32_t i = 0; i < denseCount; ++i) {
+        const auto nameLength = readScalar<std::uint32_t>(in);
+        std::string name(nameLength, '\0');
+        in.read(name.data(), nameLength);
+        auto it = dense_.find(name);
+        if (it == dense_.end()) {
+            throw std::runtime_error("stato dell'ottimizzatore: parametro denso '" + name +
+                                      "' non registrato nel modello corrente");
+        }
+        readVector(in, it->second.firstMoment);
+        readVector(in, it->second.secondMoment);
+    }
+}
+
 void LowRankProjectedOptimizer::resetStats() {
     const std::size_t steps = stats_.stepCount;
     stats_ = LowRankOptimizerStats{};

@@ -46,6 +46,18 @@ public:
     // il codice numerico senza aggiungere nulla.
     static MemoryTelemetry& instance();
 
+    // Registra un'allocazione e, se un budget e' attivo, la CONTROLLA:
+    // lancia std::runtime_error con l'arena, i byte, l'occupazione
+    // corrente e cosa ridurre.
+    //
+    // Il controllo vive qui, e non nei singoli siti di allocazione,
+    // perche' e' l'unico punto che tutti attraversano: un budget che si
+    // possa aggirare dimenticando una chiamata non e' un budget. Il
+    // prezzo e' che il buffer risulta gia' allocato quando l'eccezione
+    // parte (viene liberato dallo svolgimento dello stack) — la
+    // diagnostica e' comunque quella giusta, e l'esecuzione si ferma
+    // prima dell'allocazione SUCCESSIVA invece di arrivare a esaurire
+    // davvero la memoria.
     void recordAllocation(MemoryArena arena, std::size_t bytes);
 
     // Un rilascio piu' grande dell'occupazione corrente e' un errore di

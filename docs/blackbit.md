@@ -321,6 +321,40 @@ con un numero**, non dichiarandolo.
 | 8 | Checkpoint impacchettato versionato, config tiny/small/medium/9B, CLI `benchmark blackbit` | F |
 | 9 | Percorso CUDA (kernel dequant+GEMM, dispatch MoE, GQA) e prova su hardware reale | G, H |
 
+## 7.1 Cosa il benchmark riporta oggi
+
+`blackforge benchmark blackbit --config configs/blackbit_9b_a3b.json
+--seq-len 512 --micro-batch 1 --steps 3 --dry-run` (previsione, nessuna
+allocazione):
+
+```
+Totali            9 054 268 416      Attivi per token  2 910 661 632  (32,1 %)
+Pesi impacchettati       1,691 GiB   Stato optimizer        0,941 GiB
+Scale                    0,217 GiB   Attivazioni            0,221 GiB
+Gradienti (un blocco)     7,75 MiB   Workspace              11,88 MiB
+TOTALE                   3,090 GiB   Ordinario            118,054 GiB
+FULL PRECISION MASTER COPY: NO       FULL MODEL GRADIENT BUFFER: NO
+```
+
+`blackforge benchmark blackbit tiny --seq-len 32 --steps 2`
+(esecuzione reale, 33,8 M parametri, backend CPU):
+
+```
+Parametri impacchettati   7,70 MiB   Stato optimizer       19,43 MiB
+                                     (AdamW ordinario)    258,11 MiB
+Gradienti (picco vivo)    1,50 MiB   (totale prodotto)    222,00 MiB
+PICCO TOTALE             0,030 GiB   previsione           0,030 GiB
+```
+
+Il picco di gradiente vivo è **148 volte** più piccolo del gradiente
+complessivamente prodotto: lo stesso spazio viene riusato blocco dopo
+blocco, ed è questo rapporto — non una dichiarazione — a giustificare la
+riga `FULL MODEL GRADIENT BUFFER: NO`.
+
+I tempi (11 token/s su BlackBit-Tiny) sono quelli del backend CPU di
+riferimento, con cicli tripli scritti a mano: servono a verificare la
+correttezza, non a stimare le prestazioni su GPU.
+
 ---
 
 ## 8. Stato dei percorsi (aggiornato ad ogni fase)
@@ -338,4 +372,8 @@ con un numero**, non dichiarandolo.
 | Blocco e modello BlackBit completi, testa a blocchi di vocabolario | implementato | 10 test unitari eseguiti (CPU), incluso l'addestramento che riduce la cross-entropy (**milestone C**) |
 | Backward in streaming (consegna e rilascio per blocco) | implementato | picco di gradiente vivo misurato: **milestone D** |
 | Optimizer proiettato low-rank + consolidazione sperimentale | implementato | 9 test unitari eseguiti (CPU), incluso un addestramento completo: **milestone E** |
+| Ricalcolo attivazioni (4 modalita') | implementato | la loss coincide fra le modalita', il picco no |
+| Budget di memoria applicato | implementato | 7 test unitari eseguiti (CPU) |
+| Checkpoint impacchettato versionato | implementato | 6 test unitari eseguiti (CPU), inclusa la ripresa bit-identica |
+| `blackforge benchmark blackbit` | implementato | 8 test unitari + esecuzione reale su BlackBit-Tiny |
 | Kernel CUDA BlackBit | da fare | **non compilabile in questo ambiente** (nessun `nvcc`) |

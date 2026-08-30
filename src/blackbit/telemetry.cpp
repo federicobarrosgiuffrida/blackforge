@@ -35,6 +35,8 @@ MemoryTelemetry& MemoryTelemetry::instance() {
 }
 
 void MemoryTelemetry::recordAllocation(MemoryArena arena, std::size_t bytes) {
+    MemoryBudget::instance().checkBeforeAllocation(arena, bytes);
+
     const std::size_t i = indexOf(arena);
     current_[i] += bytes;
     ++allocations_[i];

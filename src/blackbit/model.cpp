@@ -268,7 +268,7 @@ BlackBitModel::BlackBitModel(const BlackBitConfig& config, unsigned int seed)
         blocks_[i].initialize(static_cast<unsigned int>(seed + 1000 * (i + 1)));
     }
 
-    vocabChunk_ = std::min<std::size_t>(vocabChunk_, config.vocabSize);
+    options_.vocabChunk = std::min<std::size_t>(options_.vocabChunk, config.vocabSize);
 }
 
 void BlackBitModel::setComputeDType(ComputeDType dtype) {
@@ -278,11 +278,39 @@ void BlackBitModel::setComputeDType(ComputeDType dtype) {
     }
 }
 
+const char* activationRecomputeName(ActivationRecompute mode) {
+    switch (mode) {
+        case ActivationRecompute::None: return "none";
+        case ActivationRecompute::PerLayer: return "per-layer";
+        case ActivationRecompute::EveryNLayers: return "every-n-layers";
+        case ActivationRecompute::FullRecompute: return "full-recompute";
+    }
+    return "?";
+}
+
+void BlackBitModel::setRuntimeOptions(const BlackBitRuntimeOptions& options) {
+    if (options.recomputeEveryN == 0) {
+        throw std::invalid_argument("BlackBitModel: recomputeEveryN deve essere positivo");
+    }
+    options_ = options;
+    setVocabChunk(options.vocabChunk);
+}
+
 void BlackBitModel::setVocabChunk(std::size_t chunk) {
     if (chunk == 0) {
         throw std::invalid_argument("BlackBitModel: vocabChunk deve essere positivo");
     }
-    vocabChunk_ = std::min(chunk, config_.vocabSize);
+    options_.vocabChunk = std::min(chunk, config_.vocabSize);
+}
+
+std::size_t BlackBitModel::segmentSize() const {
+    switch (options_.recompute) {
+        case ActivationRecompute::None:
+        case ActivationRecompute::PerLayer: return 1;
+        case ActivationRecompute::EveryNLayers: return std::max<std::size_t>(options_.recomputeEveryN, 1);
+        case ActivationRecompute::FullRecompute: return std::max<std::size_t>(blocks_.size(), 1);
+    }
+    return 1;
 }
 
 std::size_t BlackBitModel::parameterBytes() const {
@@ -347,17 +375,48 @@ BlackBitStepResult BlackBitModel::trainStep(const std::vector<int>& tokenIds, co
     const std::size_t tokens = batch * seq;
     const std::size_t hidden = config_.hiddenSize;
     const std::size_t vocab = config_.vocabSize;
-    const std::size_t chunk = vocabChunk_;
+    const std::size_t chunk = options_.vocabChunk;
+
+    // --- forward, con la politica di ricalcolo scelta ---
+    //
+    // In modalita' None si conservano tutte le cache dei blocchi. Nelle
+    // altre si conservano solo gli INGRESSI ai punti di ripristino, e
+    // la cache di un blocco vive il tempo di una singola iterazione:
+    // il picco di attivazioni passa da L * A_cache a
+    // (L/n) * A_in + n * A_cache.
+    const std::size_t segment = segmentSize();
 
     BlackBitForwardCache cache;
-    const runtime::Tensor finalHidden = forwardHidden(tokenIds, batch, seq, cache);
+    std::vector<runtime::Tensor> checkpoints;
+    runtime::Tensor activations = embedTokens(tokenIds, batch, seq);
 
-    for (const BlackBitBlockCache& blockCache : cache.blocks) {
-        result.routing.push_back(blockCache.routing);
-        result.auxiliaryLoss += blockCache.routing.loadBalancingLoss;
+    if (options_.recompute == ActivationRecompute::None) {
+        cache.blocks.resize(blocks_.size());
+        for (std::size_t i = 0; i < blocks_.size(); ++i) {
+            activations = blocks_[i].forward(activations, cache.blocks[i]);
+            result.routing.push_back(cache.blocks[i].routing);
+        }
+    } else {
+        for (std::size_t i = 0; i < blocks_.size(); ++i) {
+            if (i % segment == 0) {
+                checkpoints.push_back(activations);
+            }
+            BlackBitBlockCache scratch;
+            activations = blocks_[i].forward(activations, scratch);
+            result.routing.push_back(scratch.routing);
+        }
+        if (blocks_.empty()) {
+            checkpoints.push_back(activations);
+        }
     }
-    if (!cache.blocks.empty()) {
-        result.auxiliaryLoss /= static_cast<float>(cache.blocks.size());
+    cache.preNormHidden = activations;
+    const runtime::Tensor finalHidden = finalNorm_.forward(cache.preNormHidden);
+
+    for (const MoERoutingStats& routing : result.routing) {
+        result.auxiliaryLoss += routing.loadBalancingLoss;
+    }
+    if (!result.routing.empty()) {
+        result.auxiliaryLoss /= static_cast<float>(result.routing.size());
     }
 
     if (findInstability(finalHidden, result.sawNaN, result.sawInf)) {
@@ -504,8 +563,42 @@ BlackBitStepResult BlackBitModel::trainStep(const std::vector<int>& tokenIds, co
     runtime::Tensor gradFinalHidden({batch, seq, hidden}, std::move(gradHidden));
     runtime::Tensor gradBlockInput = finalNorm_.backward(cache.preNormHidden, gradFinalHidden, sink);
 
-    for (std::size_t i = blocks_.size(); i-- > 0;) {
-        gradBlockInput = blocks_[i].backward(cache.blocks[i].input, gradBlockInput, cache.blocks[i], sink);
+    if (options_.recompute == ActivationRecompute::None) {
+        for (std::size_t i = blocks_.size(); i-- > 0;) {
+            gradBlockInput = blocks_[i].backward(cache.blocks[i].input, gradBlockInput, cache.blocks[i], sink);
+        }
+    } else if (options_.recompute == ActivationRecompute::FullRecompute) {
+        // Un solo ingresso conservato (l'uscita dell'embedding): per il
+        // backward del layer i si rifa' il forward dei layer 0..i-1
+        // scartandone le cache, e si conserva solo quella del layer i.
+        for (std::size_t i = blocks_.size(); i-- > 0;) {
+            runtime::Tensor replay = checkpoints.front();
+            for (std::size_t j = 0; j < i; ++j) {
+                BlackBitBlockCache scratch;
+                replay = blocks_[j].forward(replay, scratch);
+            }
+            BlackBitBlockCache recomputed;
+            (void)blocks_[i].forward(replay, recomputed);
+            gradBlockInput = blocks_[i].backward(replay, gradBlockInput, recomputed, sink);
+        }
+    } else {
+        // Segmenti: si ricalcola il forward del segmento conservandone
+        // le cache, poi lo si differenzia a ritroso, poi le cache
+        // muoiono e si passa al segmento precedente.
+        for (std::size_t segmentIndex = checkpoints.size(); segmentIndex-- > 0;) {
+            const std::size_t first = segmentIndex * segment;
+            const std::size_t last = std::min(first + segment, blocks_.size());
+
+            std::vector<BlackBitBlockCache> segmentCaches(last - first);
+            runtime::Tensor replay = checkpoints[segmentIndex];
+            for (std::size_t i = first; i < last; ++i) {
+                replay = blocks_[i].forward(replay, segmentCaches[i - first]);
+            }
+            for (std::size_t i = last; i-- > first;) {
+                gradBlockInput = blocks_[i].backward(segmentCaches[i - first].input, gradBlockInput,
+                                                      segmentCaches[i - first], sink);
+            }
+        }
     }
 
     // Passaggio C: gradiente della tabella di embedding, somma del

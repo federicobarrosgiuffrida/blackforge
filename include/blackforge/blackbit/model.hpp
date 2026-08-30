@@ -103,6 +103,44 @@ struct BlackBitForwardCache {
     runtime::Tensor preNormHidden;
 };
 
+// Politica di ricalcolo delle attivazioni (requisito 10).
+//
+// L'alternativa a conservare tutto e' rifare parte del forward durante
+// il backward. Il baratto e' esplicito: memoria contro tempo, e su una
+// scheda da 8 GB con 28 layer la memoria e' la risorsa scarsa.
+//
+// Detto A_in la dimensione di un'attivazione al confine fra layer
+// (token x hidden) e A_cache tutto cio' che il backward di un blocco
+// richiede (norm, q/k/v, uscita attention, statistiche softmax, uscite
+// degli esperti — parecchie volte A_in), le quattro modalita' costano:
+enum class ActivationRecompute {
+    // L * A_cache. Nessun ricalcolo: e' il comportamento ordinario di
+    // un motore che non ha vincoli di memoria.
+    None,
+    // L * A_in + 1 * A_cache. Si conserva solo l'ingresso di ogni
+    // blocco; il backward rifa' il forward di QUEL blocco. Un forward
+    // in piu' in tutto, ed e' il default di BlackBit.
+    PerLayer,
+    // (L/n) * A_in + n * A_cache. Punti di ripristino ogni n layer: il
+    // backward ricalcola un segmento di n layer per volta.
+    EveryNLayers,
+    // 1 * A_in + 1 * A_cache. Si conserva SOLO l'uscita
+    // dell'embedding: per il backward del layer i si rifa' il forward
+    // dei layer 0..i. Costo O(L^2/2) forward — impraticabile a 28
+    // layer, utile come limite inferiore di memoria e per i test.
+    FullRecompute,
+};
+
+const char* activationRecomputeName(ActivationRecompute mode);
+
+struct BlackBitRuntimeOptions {
+    ActivationRecompute recompute = ActivationRecompute::PerLayer;
+    std::size_t recomputeEveryN = 4;  // usato solo da EveryNLayers
+
+    // Token del vocabolario processati insieme dalla testa di uscita.
+    std::size_t vocabChunk = 1024;
+};
+
 // Esito di un passo di addestramento completo.
 struct BlackBitStepResult {
     float loss = 0.0F;            // cross-entropy media sui token non ignorati
@@ -185,17 +223,24 @@ public:
     // Non cambia il risultato, solo il picco di memoria: 'vocabChunk'
     // valori per token invece di 'vocabSize'.
     void setVocabChunk(std::size_t chunk);
-    [[nodiscard]] std::size_t vocabChunk() const { return vocabChunk_; }
+    [[nodiscard]] std::size_t vocabChunk() const { return options_.vocabChunk; }
+
+    void setRuntimeOptions(const BlackBitRuntimeOptions& options);
+    [[nodiscard]] const BlackBitRuntimeOptions& runtimeOptions() const { return options_; }
 
 private:
     [[nodiscard]] runtime::Tensor embedTokens(const std::vector<int>& tokenIds, std::size_t batch,
                                                std::size_t seq) const;
 
+    // Quanti layer separano due punti di ripristino, secondo la
+    // politica di ricalcolo attiva.
+    [[nodiscard]] std::size_t segmentSize() const;
+
     BlackBitConfig config_;
     TernaryLinear embedding_;  // [vocab, hidden]: lookup di ingresso E proiezione di uscita
     std::vector<BlackBitBlock> blocks_;
     RmsNorm finalNorm_;
-    std::size_t vocabChunk_ = 1024;
+    BlackBitRuntimeOptions options_;
 };
 
 }  // namespace blackforge::blackbit

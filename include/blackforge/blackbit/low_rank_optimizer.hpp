@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <istream>
+#include <ostream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -179,6 +181,20 @@ public:
     void resetStats();
 
     [[nodiscard]] const TernaryConsolidationOptions& consolidation() const { return consolidation_; }
+
+    // Serializzazione dello stato per il checkpoint (vedi
+    // blackbit/checkpoint.hpp). Non scrive magic ne' versione: e' un
+    // blocco componibile, versionato dal contenitore.
+    void serializeState(std::ostream& out) const;
+
+    // Lancia std::runtime_error se lo stream finisce prima del previsto
+    // o se un nome/forma non corrisponde a un parametro registrato: uno
+    // stato dell'ottimizzatore che non combacia col modello e' un
+    // errore, non qualcosa da caricare a meta'.
+    void deserializeState(std::istream& in);
+
+    [[nodiscard]] std::size_t stepCount() const { return step_; }
+    void setStepCount(std::size_t step) { step_ = step; }
 
 private:
     struct TernaryState {
