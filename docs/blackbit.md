@@ -560,6 +560,39 @@ assignment aggregati sui 28 layer sono stati scartati a seq 512; il
 router ha comunque entropia 2,078 nat (quasi `ln(8)`) e nessun collasso,
 ma capacity/dispatch richiedono profiling e tuning.
 
+## 7.7 Profilo e prima ottimizzazione misurata
+
+Nsight Systems 2026.1.3 ha profilato un vero step 9B seq 512. Prima
+dell'intervento, il tempo kernel era dominato da `updatePackedKernel`
+(36%) e `gradientStatsKernel` (35%); GQA forward/backward valeva 17%,
+decode 3% e proiezione 2%. In un solo step erano inoltre visibili
+106 661 kernel launch, 16 808 `cudaMalloc`, 16 809 `cudaFree` e 50 429
+`cudaMemGetInfo`.
+
+La causa principale non era una supposizione: le statistiche facevano
+atomiche globali per ogni elemento del gradiente e fino a sei atomiche
+per ogni trit. Una riduzione shared per blocco e l'aggregazione locale
+per word packed mantengono gli stessi contatori ma riducono drasticamente
+la contesa. La parita' CPU/CUDA e il checkpoint bit-identico restano
+verificati dai test.
+
+Confronto A/B sulla stessa RTX 5060, 9B, seq 512, rank 8:
+
+| misura | prima | dopo | variazione |
+|---|---:|---:|---:|
+| forward+loss+backward | 20 218,30 ms | 11 215,75 ms | 1,80x |
+| optimizer | 9 122,82 ms | 1 082,19 ms | 8,43x |
+| step totale | 29 341,11 ms | 12 297,94 ms | 2,39x |
+| throughput | 17,450 token/s | 41,633 token/s | 2,39x |
+| picco NVIDIA | 4,659 GiB | 4,659 GiB | invariato |
+
+Il secondo profilo conferma il cambio di priorita': GQA forward 36% e
+backward 18%, update packed 13%, decode 9%, proiezione 6% e statistiche
+3%. Attention e riduzione di launch/allocazioni sono quindi i prossimi
+target misurati. Nsight Compute 2026.2.1 e' installato, ma i contatori
+hardware sono disabilitati dalla policy driver (`ERR_NVGPUCTRPERM`):
+non e' stata fatta alcuna modifica amministrativa silenziosa.
+
 ## 8. Stato dei percorsi (aggiornato ad ogni fase)
 
 | Percorso | Stato | Verificato da |

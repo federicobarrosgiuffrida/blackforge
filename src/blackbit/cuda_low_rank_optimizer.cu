@@ -48,14 +48,38 @@ __device__ float projection(std::uint64_t seed, std::uint64_t epoch, std::size_t
 
 __global__ void gradientStatsKernel(const float* gradient, std::size_t count, DeviceStepStats* stats) {
     const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= count) return;
-    const float value = gradient[index];
-    if (!isfinite(value)) {
-        atomicAdd(&stats->nanInf, 1ULL);
-        return;
+    __shared__ double squared[kBlockSize];
+    __shared__ unsigned int valid[kBlockSize];
+    __shared__ unsigned int invalid[kBlockSize];
+    double localSquared = 0.0;
+    unsigned int localValid = 0;
+    unsigned int localInvalid = 0;
+    if (index < count) {
+        const float value = gradient[index];
+        if (isfinite(value)) {
+            localSquared = static_cast<double>(value) * static_cast<double>(value);
+            localValid = 1;
+        } else {
+            localInvalid = 1;
+        }
     }
-    atomicAdd(&stats->gradientSquared, static_cast<double>(value) * static_cast<double>(value));
-    atomicAdd(&stats->gradientCount, 1ULL);
+    squared[threadIdx.x] = localSquared;
+    valid[threadIdx.x] = localValid;
+    invalid[threadIdx.x] = localInvalid;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride != 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            squared[threadIdx.x] += squared[threadIdx.x + stride];
+            valid[threadIdx.x] += valid[threadIdx.x + stride];
+            invalid[threadIdx.x] += invalid[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(&stats->gradientSquared, squared[0]);
+        atomicAdd(&stats->gradientCount, static_cast<unsigned long long>(valid[0]));
+        if (invalid[0] != 0) atomicAdd(&stats->nanInf, static_cast<unsigned long long>(invalid[0]));
+    }
 }
 
 __global__ void projectGradientKernel(float* accumulator, const float* gradient, std::size_t firstRow,
@@ -146,6 +170,13 @@ __global__ void updatePackedKernel(std::uint32_t* packed, std::size_t rows, std:
     const std::size_t firstCol = (wordIndex % wordsPerRow) * kTritsPerWord;
     std::uint32_t word = packed[wordIndex];
     const std::uint64_t stepSeed = splitMix64(seed ^ (step * 0xD1B54A32D192ED03ULL));
+    unsigned long long elements = 0;
+    unsigned long long flips = 0;
+    unsigned long long positiveFlips = 0;
+    unsigned long long negativeFlips = 0;
+    unsigned long long saturated = 0;
+    unsigned long long nanInf = 0;
+    double updateSquared = 0.0;
 
     for (int byte = 0; byte < 4; ++byte) {
         int trits[kTritsPerByte];
@@ -159,29 +190,36 @@ __global__ void updatePackedKernel(std::uint32_t* packed, std::size_t rows, std:
                           direction[component * cols + col];
             }
             if (!isfinite(update)) {
-                atomicAdd(&stats->nanInf, 1ULL);
+                ++nanInf;
                 continue;
             }
             const int oldTrit = trits[slot];
             const float target = static_cast<float>(oldTrit) + update;
             const int newTrit = stochasticRoundToTrit(target, stepSeed, row * cols + col);
             trits[slot] = newTrit;
-            atomicAdd(&stats->elements, 1ULL);
-            atomicAdd(&stats->updateSquared, static_cast<double>(update) * static_cast<double>(update));
-            atomicAdd(&stats->updateCount, 1ULL);
-            if (target <= -1.0F || target >= 1.0F) atomicAdd(&stats->saturated, 1ULL);
+            ++elements;
+            updateSquared += static_cast<double>(update) * static_cast<double>(update);
+            if (target <= -1.0F || target >= 1.0F) ++saturated;
             if (newTrit != oldTrit) {
-                atomicAdd(&stats->flips, 1ULL);
+                ++flips;
                 if (newTrit > oldTrit) {
-                    atomicAdd(&stats->positiveFlips, 1ULL);
+                    ++positiveFlips;
                 } else {
-                    atomicAdd(&stats->negativeFlips, 1ULL);
+                    ++negativeFlips;
                 }
             }
         }
         word = setWordByte(word, byte, encodeTritByte(trits[0], trits[1], trits[2], trits[3], trits[4]));
     }
     packed[wordIndex] = word;
+    atomicAdd(&stats->elements, elements);
+    atomicAdd(&stats->updateSquared, updateSquared);
+    atomicAdd(&stats->updateCount, elements);
+    if (flips != 0) atomicAdd(&stats->flips, flips);
+    if (positiveFlips != 0) atomicAdd(&stats->positiveFlips, positiveFlips);
+    if (negativeFlips != 0) atomicAdd(&stats->negativeFlips, negativeFlips);
+    if (saturated != 0) atomicAdd(&stats->saturated, saturated);
+    if (nanInf != 0) atomicAdd(&stats->nanInf, nanInf);
 }
 
 }  // namespace
