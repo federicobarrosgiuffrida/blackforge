@@ -82,6 +82,8 @@ TEST(MoETest, ATuttiGliEspertiArrivanoTokenEIPesiSommanoAUno) {
     ASSERT_EQ(output.shape(), input.shape());
     EXPECT_EQ(stats.tokens, 64U);
     EXPECT_EQ(stats.assignments, 64U * config.expertsPerToken);
+    EXPECT_EQ(stats.droppedAssignments, 0U)
+        << "con capacita' totale sufficiente il router deve usare il successivo esperto disponibile";
 
     // Con un router inizializzato quasi uniforme nessun esperto deve
     // restare a bocca asciutta: se succedesse, quell'esperto non

@@ -373,6 +373,8 @@ runtime::Tensor MoELayer::forward(const runtime::Tensor& input, MoECache& cache,
     std::vector<std::vector<std::uint32_t>> tokensOfExpert(numExperts);
     std::vector<std::vector<std::size_t>> slotOfExpert(numExperts);
     std::vector<std::size_t> order(numExperts);
+    std::vector<std::size_t> selectedExperts;
+    selectedExperts.reserve(topK);
     std::vector<double> probabilityMass(numExperts, 0.0);
 
     for (std::size_t t = 0; t < tokens; ++t) {
@@ -395,27 +397,30 @@ runtime::Tensor MoELayer::forward(const runtime::Tensor& input, MoECache& cache,
         std::stable_sort(order.begin(), order.end(),
                           [&](std::size_t a, std::size_t b) { return p[a] > p[b]; });
 
+        // Capacity-aware Top-K: keep the probability ordering, but when
+        // an expert is full use the next-best available expert instead of
+        // silently discarding an assignment that could still be computed.
+        // A drop remains possible (and reported) only when fewer than topK
+        // experts have capacity left.
+        selectedExperts.clear();
         float selectedMass = 0.0F;
-        for (std::size_t slot = 0; slot < topK; ++slot) {
-            selectedMass += p[order[slot]];
+        for (const std::size_t expert : order) {
+            if (tokensOfExpert[expert].size() >= capacity) continue;
+            selectedExperts.push_back(expert);
+            selectedMass += p[expert];
+            if (selectedExperts.size() == topK) break;
         }
         if (selectedMass <= 0.0F) {
             selectedMass = 1.0F;
         }
 
         for (std::size_t slot = 0; slot < topK; ++slot) {
-            const std::size_t expert = order[slot];
             const std::size_t slotIndex = t * topK + slot;
-
-            if (tokensOfExpert[expert].size() >= capacity) {
-                // Capacita' esaurita: l'assegnazione viene scartata. Il
-                // token non e' perso (gli altri slot restano validi) ma
-                // il contributo di questo esperto sparisce, e la cosa
-                // deve comparire nelle metriche invece di essere
-                // silenziosa.
+            if (slot >= selectedExperts.size()) {
                 ++stats.droppedAssignments;
                 continue;
             }
+            const std::size_t expert = selectedExperts[slot];
 
             cache.expertOfSlot[slotIndex] = static_cast<int>(expert);
             // Rinormalizzazione sui soli esperti scelti (convenzione di

@@ -15,6 +15,14 @@ namespace blackforge::blackbit::cuda {
 namespace {
 
 constexpr int kBlockSize = 256;
+constexpr std::size_t kMaximumExperts = 32;
+
+struct RoutingSummary {
+    int counts[kMaximumExperts];
+    float probabilityMass[kMaximumExperts];
+    double entropySum;
+    unsigned long long dropped;
+};
 
 unsigned int gridFor(std::size_t count) {
     return static_cast<unsigned int>((count + kBlockSize - 1) / kBlockSize);
@@ -45,8 +53,7 @@ __global__ void softmaxSmallKernel(float* probabilities, const float* logits, st
 // and capacity semantics while all expert compute remains in large GPU GEMMs.
 __global__ void routeForwardKernel(const float* probabilities, int* expertOfSlot, float* weightOfSlot,
                                    int* tokensOfExpert, int* slotsOfExpert, int* counts,
-                                   float* probabilityMass, double* entropySum,
-                                   unsigned long long* dropped, std::size_t tokens,
+                                   RoutingSummary* summary, std::size_t tokens,
                                    std::size_t experts, std::size_t topK, std::size_t capacity) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     double entropy = 0.0;
@@ -54,16 +61,24 @@ __global__ void routeForwardKernel(const float* probabilities, int* expertOfSlot
     for (std::size_t token = 0; token < tokens; ++token) {
         const float* row = probabilities + token * experts;
         for (std::size_t expert = 0; expert < experts; ++expert) {
-            probabilityMass[expert] += row[expert];
+            summary->probabilityMass[expert] += row[expert];
             if (row[expert] > 0.0F) entropy -= static_cast<double>(row[expert]) * log(static_cast<double>(row[expert]));
         }
         std::uint32_t selected = 0;
         float selectedMass = 0.0F;
         for (std::size_t slot = 0; slot < topK; ++slot) {
-            std::size_t best = 0;
-            while ((selected & (1U << best)) != 0) ++best;
-            for (std::size_t expert = best + 1; expert < experts; ++expert) {
-                if ((selected & (1U << expert)) == 0 && row[expert] > row[best]) best = expert;
+            std::size_t best = experts;
+            for (std::size_t expert = 0; expert < experts; ++expert) {
+                if ((selected & (1U << expert)) != 0 ||
+                    static_cast<std::size_t>(counts[expert]) >= capacity) {
+                    continue;
+                }
+                if (best == experts || row[expert] > row[best]) best = expert;
+            }
+            if (best == experts) {
+                expertOfSlot[token * topK + slot] = -1;
+                ++droppedCount;
+                continue;
             }
             selected |= 1U << best;
             expertOfSlot[token * topK + slot] = static_cast<int>(best);
@@ -73,20 +88,17 @@ __global__ void routeForwardKernel(const float* probabilities, int* expertOfSlot
         for (std::size_t slot = 0; slot < topK; ++slot) {
             const std::size_t slotIndex = token * topK + slot;
             const int expert = expertOfSlot[slotIndex];
+            if (expert < 0) continue;
             const int count = counts[expert];
-            if (static_cast<std::size_t>(count) >= capacity) {
-                expertOfSlot[slotIndex] = -1;
-                ++droppedCount;
-                continue;
-            }
             weightOfSlot[slotIndex] = row[expert] / selectedMass;
             tokensOfExpert[static_cast<std::size_t>(expert) * capacity + count] = static_cast<int>(token);
             slotsOfExpert[static_cast<std::size_t>(expert) * capacity + count] = static_cast<int>(slotIndex);
             counts[expert] = count + 1;
         }
     }
-    *entropySum = entropy;
-    *dropped = droppedCount;
+    for (std::size_t expert = 0; expert < experts; ++expert) summary->counts[expert] = counts[expert];
+    summary->entropySum = entropy;
+    summary->dropped = droppedCount;
 }
 
 __global__ void gatherRowsKernel(float* gathered, const float* input, const int* assigned,
@@ -262,38 +274,34 @@ Tensor MoELayer::forward(const Tensor& input, MoECache& cache, MoERoutingStats& 
     BLACKFORGE_CUDA_CHECK(cudaMemset(cache.tokensOfExpert.data(), 0xFF, cache.tokensOfExpert.bytes()));
     BLACKFORGE_CUDA_CHECK(cudaMemset(cache.slotsOfExpert.data(), 0xFF, cache.slotsOfExpert.bytes()));
     BLACKFORGE_CUDA_CHECK(cudaMemset(cache.assignmentsPerExpert.data(), 0, cache.assignmentsPerExpert.bytes()));
-    Tensor probabilityMass = Tensor::zeros({config_.numExperts}, MemoryArena::Temporary);
-    Buffer entropy(sizeof(double), MemoryArena::Temporary);
-    Buffer dropped(sizeof(unsigned long long), MemoryArena::Temporary);
-    BLACKFORGE_CUDA_CHECK(cudaMemset(entropy.data(), 0, entropy.bytes()));
-    BLACKFORGE_CUDA_CHECK(cudaMemset(dropped.data(), 0, dropped.bytes()));
+    Buffer summaryBuffer(sizeof(RoutingSummary), MemoryArena::Temporary);
+    BLACKFORGE_CUDA_CHECK(cudaMemset(summaryBuffer.data(), 0, summaryBuffer.bytes()));
     routeForwardKernel<<<1, 1>>>(
         cache.probabilities.data(), cache.expertOfSlot.data(), cache.weightOfSlot.data(),
         cache.tokensOfExpert.data(), cache.slotsOfExpert.data(), cache.assignmentsPerExpert.data(),
-        probabilityMass.data(), entropy.as<double>(), dropped.as<unsigned long long>(), tokens,
-        config_.numExperts, config_.expertsPerToken, cache.capacity);
+        summaryBuffer.as<RoutingSummary>(), tokens, config_.numExperts, config_.expertsPerToken,
+        cache.capacity);
     BLACKFORGE_CUDA_CHECK(cudaGetLastError());
-    cache.hostAssignmentsPerExpert = cache.assignmentsPerExpert.toHost();
-    double hostEntropy = 0.0;
-    unsigned long long hostDropped = 0;
-    BLACKFORGE_CUDA_CHECK(cudaMemcpy(&hostEntropy, entropy.data(), sizeof(hostEntropy), cudaMemcpyDeviceToHost));
-    BLACKFORGE_CUDA_CHECK(cudaMemcpy(&hostDropped, dropped.data(), sizeof(hostDropped), cudaMemcpyDeviceToHost));
-    const runtime::Tensor hostProbabilityMass = probabilityMass.toHost();
+    RoutingSummary hostSummary{};
+    BLACKFORGE_CUDA_CHECK(cudaMemcpy(&hostSummary, summaryBuffer.data(), sizeof(hostSummary),
+                                     cudaMemcpyDeviceToHost));
+    cache.hostAssignmentsPerExpert.assign(hostSummary.counts,
+                                          hostSummary.counts + config_.numExperts);
     stats = MoERoutingStats{};
     stats.tokens = tokens;
     stats.assignments = slots;
-    stats.droppedAssignments = static_cast<std::size_t>(hostDropped);
+    stats.droppedAssignments = static_cast<std::size_t>(hostSummary.dropped);
     stats.tokensPerExpert.resize(config_.numExperts);
     for (std::size_t expert = 0; expert < config_.numExperts; ++expert) {
         stats.tokensPerExpert[expert] = static_cast<std::size_t>(cache.hostAssignmentsPerExpert[expert]);
     }
-    stats.routingEntropy = tokens == 0 ? 0.0 : hostEntropy / static_cast<double>(tokens);
+    stats.routingEntropy = tokens == 0 ? 0.0 : hostSummary.entropySum / static_cast<double>(tokens);
     const std::size_t routed = slots - stats.droppedAssignments;
     double auxiliary = 0.0;
     if (routed > 0 && tokens > 0) {
         for (std::size_t expert = 0; expert < config_.numExperts; ++expert) {
             auxiliary += (static_cast<double>(stats.tokensPerExpert[expert]) / routed) *
-                         (static_cast<double>(hostProbabilityMass.at(expert)) / tokens);
+                         (static_cast<double>(hostSummary.probabilityMass[expert]) / tokens);
         }
         auxiliary *= config_.numExperts;
     }
