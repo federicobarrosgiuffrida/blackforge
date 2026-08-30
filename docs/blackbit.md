@@ -327,7 +327,8 @@ con un numero**, non dichiarandolo.
 | Telemetria di memoria per arena + budget | implementato | verificata dai test di `TernaryLinear` |
 | Aggiornamento diretto dei trit (`TernarySgdSink`) | implementato | rete minuscola che riduce la loss del 15 %+ con soli pesi ternari |
 | MoE (router top-2, dispatch sparso, capacita', bilanciamento, metriche) | implementato | 9 test unitari eseguiti (CPU), incluso il gradiente numerico e "tutti gli esperti ricevono gradiente" |
-| GQA | da fare | — |
+| GQA + RoPE (raggruppamento implicito, softmax online) | implementato | test di causalita' e di non duplicazione K/V eseguiti (CPU) |
+| Blocco e modello BlackBit completi, testa a blocchi di vocabolario | implementato | 10 test unitari eseguiti (CPU), incluso l'addestramento che riduce la cross-entropy (**milestone C**) |
 | Backward in streaming | da fare | — |
 | Optimizer low-rank | da fare | — |
 | Kernel CUDA BlackBit | da fare | **non compilabile in questo ambiente** (nessun `nvcc`) |

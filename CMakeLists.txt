@@ -136,6 +136,8 @@ set(
     src/blackbit/ternary_linear.cpp
     src/blackbit/ternary_update.cpp
     src/blackbit/moe.cpp
+    src/blackbit/attention.cpp
+    src/blackbit/model.cpp
     src/data/dataset.cpp
     src/tokenizer/tokenizer.cpp
     src/tokenizer/dataset_prep.cpp
