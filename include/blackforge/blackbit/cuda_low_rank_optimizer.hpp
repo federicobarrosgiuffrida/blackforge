@@ -44,10 +44,12 @@ public:
     LowRankProjectedOptimizer& operator=(const LowRankProjectedOptimizer&) = delete;
 
     void registerTernary(const std::string& name, cuda::TernaryTensor& weight);
+    void registerDense(const std::string& name, Tensor& values);
     void setRankFor(const std::string& name, std::size_t rank);
 
     void consumeWeightGradientBlock(const ParameterId& id, std::size_t firstRow, std::size_t rowCount,
                                      const float* deviceBlock) override;
+    void consumeDenseGradient(const ParameterId& id, const float* deviceValues, std::size_t count) override;
     void endStep();
 
     [[nodiscard]] std::size_t stateBytes() const;
@@ -72,6 +74,14 @@ private:
         bool touched = false;
     };
 
+    struct DenseState {
+        Tensor* values = nullptr;
+        Buffer firstMoment;
+        Buffer secondMoment;
+        Buffer accumulator;
+        bool touched = false;
+    };
+
     State& stateFor(const ParameterId& id);
     void allocateState(const std::string& name, State& state, cuda::TernaryTensor& weight);
 
@@ -80,6 +90,7 @@ private:
     LowRankOptimizerStats stats_;
     std::unordered_map<std::string, std::size_t> rankOverrides_;
     std::unordered_map<std::string, State> states_;
+    std::unordered_map<std::string, DenseState> denseStates_;
     Buffer deviceStats_;
 };
 

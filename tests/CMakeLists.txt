@@ -63,6 +63,7 @@ if(BLACKFORGE_ENABLE_CUDA)
         backend/cuda/blackbit_ternary_tests.cu
         backend/cuda/blackbit_linear_tests.cu
         backend/cuda/blackbit_optimizer_tests.cu
+        backend/cuda/blackbit_ops_tests.cu
     )
 endif()
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <stdexcept>
 #include <string>
 
 #include "blackforge/blackbit/cuda_tensor.hpp"
@@ -15,6 +16,9 @@ public:
     virtual ~GradientSink() = default;
     virtual void consumeWeightGradientBlock(const ParameterId& id, std::size_t firstRow, std::size_t rowCount,
                                              const float* deviceBlock) = 0;
+    virtual void consumeDenseGradient(const ParameterId&, const float*, std::size_t) {
+        throw std::invalid_argument("CUDA BlackBit GradientSink: dense gradients are not supported by this sink");
+    }
 };
 
 struct GradientLifetimeStats {

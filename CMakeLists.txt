@@ -169,6 +169,7 @@ if(BLACKFORGE_ENABLE_CUDA)
         src/backend/cuda/multi_gpu_train_runner.cu
         src/blackbit/cuda_memory.cu
         src/blackbit/cuda_tensor.cu
+        src/blackbit/cuda_ops.cu
         src/blackbit/cuda_ternary.cu
         src/blackbit/cuda_ternary_linear.cu
         src/blackbit/cuda_low_rank_optimizer.cu

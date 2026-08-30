@@ -70,6 +70,47 @@ __global__ void projectGradientKernel(float* accumulator, const float* gradient,
     accumulator[index] = sum;
 }
 
+__global__ void accumulateDenseKernel(float* accumulator, const float* gradient, std::size_t count) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) accumulator[index] += gradient[index];
+}
+
+__global__ void squaredNormKernel(const float* values, std::size_t count, double* squared) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) {
+        const double value = values[index];
+        atomicAdd(squared, value * value);
+    }
+}
+
+__global__ void denseAdamKernel(float* values, float* firstMoment, float* secondMoment, float* accumulator,
+                                std::size_t count, float beta1, float beta2, float bias1, float bias2,
+                                float epsilon, float learningRate, float weightDecay, float parameterScale,
+                                DeviceStepStats* stats) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const float gradient = accumulator[index];
+    const float first = beta1 * firstMoment[index] + (1.0F - beta1) * gradient;
+    const float second = beta2 * secondMoment[index] + (1.0F - beta2) * gradient * gradient;
+    firstMoment[index] = first;
+    secondMoment[index] = second;
+    const float direction = (first / bias1) / (sqrtf(second / bias2) + epsilon);
+    float parameter = values[index];
+    const float update = -learningRate * parameterScale * direction;
+    parameter += update;
+    parameter -= learningRate * weightDecay * parameter;
+    values[index] = parameter;
+    accumulator[index] = 0.0F;
+    if (!isfinite(parameter) || !isfinite(direction)) {
+        atomicAdd(&stats->nanInf, 1ULL);
+        return;
+    }
+    atomicAdd(&stats->optimizerSquared, static_cast<double>(direction) * static_cast<double>(direction));
+    atomicAdd(&stats->optimizerCount, 1ULL);
+    atomicAdd(&stats->updateSquared, static_cast<double>(update) * static_cast<double>(update));
+    atomicAdd(&stats->updateCount, 1ULL);
+}
+
 __global__ void adamDirectionKernel(float* firstMoment, float* secondMoment, float* accumulator,
                                     std::size_t count, float beta1, float beta2, float bias1, float bias2,
                                     float epsilon, DeviceStepStats* stats) {
@@ -167,11 +208,34 @@ void LowRankProjectedOptimizer::allocateState(const std::string& name, State& st
 }
 
 void LowRankProjectedOptimizer::registerTernary(const std::string& name, cuda::TernaryTensor& weight) {
+    if (denseStates_.count(name) != 0) {
+        throw std::invalid_argument("CUDA LowRankProjectedOptimizer: parameter '" + name + "' already registered");
+    }
     auto [iterator, inserted] = states_.try_emplace(name);
     if (!inserted) {
         throw std::invalid_argument("CUDA LowRankProjectedOptimizer: parameter '" + name + "' already registered");
     }
     allocateState(name, iterator->second, weight);
+}
+
+void LowRankProjectedOptimizer::registerDense(const std::string& name, Tensor& values) {
+    if (states_.count(name) != 0 || values.elementCount() == 0) {
+        throw std::invalid_argument("CUDA LowRankProjectedOptimizer: invalid or duplicate dense parameter '" +
+                                    name + "'");
+    }
+    auto [iterator, inserted] = denseStates_.try_emplace(name);
+    if (!inserted) {
+        throw std::invalid_argument("CUDA LowRankProjectedOptimizer: parameter '" + name + "' already registered");
+    }
+    DenseState& state = iterator->second;
+    state.values = &values;
+    const std::size_t bytes = values.bytes();
+    state.firstMoment = Buffer(bytes, MemoryArena::Optimizer);
+    state.secondMoment = Buffer(bytes, MemoryArena::Optimizer);
+    state.accumulator = Buffer(bytes, MemoryArena::Optimizer);
+    BLACKFORGE_CUDA_CHECK(cudaMemset(state.firstMoment.data(), 0, bytes));
+    BLACKFORGE_CUDA_CHECK(cudaMemset(state.secondMoment.data(), 0, bytes));
+    BLACKFORGE_CUDA_CHECK(cudaMemset(state.accumulator.data(), 0, bytes));
 }
 
 void LowRankProjectedOptimizer::setRankFor(const std::string& name, std::size_t rank) {
@@ -212,6 +276,25 @@ void LowRankProjectedOptimizer::consumeWeightGradientBlock(const ParameterId& id
     BLACKFORGE_CUDA_CHECK(cudaGetLastError());
 }
 
+void LowRankProjectedOptimizer::consumeDenseGradient(const ParameterId& id, const float* deviceValues,
+                                                      std::size_t count) {
+    auto found = denseStates_.find(id.name);
+    if (found == denseStates_.end()) {
+        throw std::invalid_argument("CUDA LowRankProjectedOptimizer: unregistered dense parameter '" +
+                                    id.name + "'");
+    }
+    DenseState& state = found->second;
+    if (count != state.values->elementCount() || id.rows * id.cols != count ||
+        (deviceValues == nullptr && count != 0)) {
+        throw std::invalid_argument("CUDA LowRankProjectedOptimizer: dense gradient shape mismatch for '" +
+                                    id.name + "'");
+    }
+    gradientStatsKernel<<<gridFor(count), kBlockSize>>>(deviceValues, count, deviceStats_.as<DeviceStepStats>());
+    accumulateDenseKernel<<<gridFor(count), kBlockSize>>>(state.accumulator.as<float>(), deviceValues, count);
+    BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    state.touched = true;
+}
+
 void LowRankProjectedOptimizer::endStep() {
     const float bias1 = 1.0F - std::pow(options_.beta1, static_cast<float>(step_ + 1));
     const float bias2 = 1.0F - std::pow(options_.beta2, static_cast<float>(step_ + 1));
@@ -228,6 +311,24 @@ void LowRankProjectedOptimizer::endStep() {
             state.accumulator.as<float>(), state.rank, options_.learningRate, state.seed, state.projectionEpoch,
             step_, deviceStats_.as<DeviceStepStats>());
         BLACKFORGE_CUDA_CHECK(cudaMemset(state.accumulator.data(), 0, state.accumulator.bytes()));
+        state.touched = false;
+    }
+    for (auto& [name, state] : denseStates_) {
+        (void)name;
+        if (!state.touched) continue;
+        Buffer squared(sizeof(double), MemoryArena::Temporary);
+        BLACKFORGE_CUDA_CHECK(cudaMemset(squared.data(), 0, squared.bytes()));
+        const std::size_t count = state.values->elementCount();
+        squaredNormKernel<<<gridFor(count), kBlockSize>>>(state.values->data(), count, squared.as<double>());
+        double hostSquared = 0.0;
+        BLACKFORGE_CUDA_CHECK(cudaMemcpy(&hostSquared, squared.data(), sizeof(hostSquared), cudaMemcpyDeviceToHost));
+        const float parameterRms = static_cast<float>(std::sqrt(hostSquared / static_cast<double>(count)));
+        const float scale = parameterRms > 0.0F ? parameterRms : 1.0F;
+        denseAdamKernel<<<gridFor(count), kBlockSize>>>(
+            state.values->data(), state.firstMoment.as<float>(), state.secondMoment.as<float>(),
+            state.accumulator.as<float>(), count, options_.beta1, options_.beta2, bias1, bias2, options_.eps,
+            options_.learningRate, options_.weightDecay, scale, deviceStats_.as<DeviceStepStats>());
+        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
         state.touched = false;
     }
     BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
@@ -268,6 +369,10 @@ std::size_t LowRankProjectedOptimizer::stateBytes() const {
         (void)name;
         result += state.firstMoment.bytes() + state.secondMoment.bytes() + state.accumulator.bytes();
     }
+    for (const auto& [name, state] : denseStates_) {
+        (void)name;
+        result += state.firstMoment.bytes() + state.secondMoment.bytes() + state.accumulator.bytes();
+    }
     return result;
 }
 
@@ -276,6 +381,10 @@ std::size_t LowRankProjectedOptimizer::conventionalStateBytes() const {
     for (const auto& [name, state] : states_) {
         (void)name;
         result += 2 * state.rows * state.cols * sizeof(float);
+    }
+    for (const auto& [name, state] : denseStates_) {
+        (void)name;
+        result += 2 * state.values->bytes();
     }
     return result;
 }

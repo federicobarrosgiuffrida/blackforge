@@ -68,4 +68,29 @@ Tensor Tensor::reshaped(std::vector<std::size_t> shape) && {
 
 std::size_t Tensor::elementCount() const { return product(shape_); }
 
+IndexTensor::IndexTensor(std::vector<std::size_t> shape, MemoryArena arena)
+    : shape_(std::move(shape)), storage_(product(shape_) * sizeof(int), arena) {}
+
+IndexTensor IndexTensor::fromHost(std::vector<std::size_t> shape, const std::vector<int>& values,
+                                  MemoryArena arena) {
+    if (product(shape) != values.size()) {
+        throw std::invalid_argument("CUDA BlackBit IndexTensor::fromHost: element count differs");
+    }
+    IndexTensor result(std::move(shape), arena);
+    if (!values.empty()) {
+        BLACKFORGE_CUDA_CHECK(cudaMemcpy(result.data(), values.data(), result.bytes(), cudaMemcpyHostToDevice));
+    }
+    return result;
+}
+
+std::vector<int> IndexTensor::toHost() const {
+    std::vector<int> result(elementCount());
+    if (!result.empty()) {
+        BLACKFORGE_CUDA_CHECK(cudaMemcpy(result.data(), data(), bytes(), cudaMemcpyDeviceToHost));
+    }
+    return result;
+}
+
+std::size_t IndexTensor::elementCount() const { return product(shape_); }
+
 }  // namespace blackforge::blackbit::cuda

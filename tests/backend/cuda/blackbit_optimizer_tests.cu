@@ -90,6 +90,36 @@ TEST(CudaBlackBitOptimizerTest, StateIsLowRankAndNoDenseGradientPersists) {
     EXPECT_EQ(bbcuda::gradientLifetimeStats().liveBytes, 0U);
 }
 
+TEST(CudaBlackBitOptimizerTest, DenseParametersMatchCpuAdamUpdate) {
+    bb::LowRankOptimizerOptions options;
+    options.learningRate = 0.07F;
+    options.weightDecay = 0.02F;
+    std::vector<float> cpuValues{0.7F, -0.3F, 1.1F, 0.2F, -0.8F, 0.45F};
+    const std::vector<float> gradient{0.2F, -0.1F, 0.04F, 0.3F, -0.2F, 0.11F};
+    bb::LowRankProjectedOptimizer cpu(options);
+    cpu.registerDense("router", cpuValues);
+    cpu.consumeDenseGradient({"router", 2, 3}, gradient.data(), gradient.size());
+    cpu.endStep();
+
+    const Tensor initial({2, 3}, {0.7F, -0.3F, 1.1F, 0.2F, -0.8F, 0.45F});
+    auto gpuValues = bbcuda::Tensor::fromHost(initial, bbcuda::MemoryArena::DenseParameters);
+    const Tensor hostGradient({2, 3}, gradient);
+    const auto gpuGradient = bbcuda::Tensor::fromHost(hostGradient, bbcuda::MemoryArena::GradientTiles);
+    bbcuda::LowRankProjectedOptimizer gpu(options);
+    const std::size_t fixedOptimizerBytes = gpu.stateBytes();
+    gpu.registerDense("router", gpuValues);
+    gpu.consumeDenseGradient({"router", 2, 3}, gpuGradient.data(), gradient.size());
+    gpu.endStep();
+
+    const Tensor actual = gpuValues.toHost();
+    for (std::size_t i = 0; i < cpuValues.size(); ++i) {
+        EXPECT_NEAR(actual.at(i), cpuValues[i], 2.0e-6F) << "index " << i;
+    }
+    EXPECT_EQ(gpu.stateBytes(), fixedOptimizerBytes + 3 * gradient.size() * sizeof(float));
+    EXPECT_EQ(gpu.stats().lastStep.nanInfCount, 0U);
+    EXPECT_GT(gpu.stats().lastStep.optimizerNorm, 0.0);
+}
+
 TEST(CudaBlackBitOptimizerTest, ConsumesStreamingLinearGradientAndFlipsActualPackedWeights) {
     bb::TernaryLinear cpuLinear("train.weight", 20, 29, 20, 7);
     std::vector<float> denseValues(29 * 20);
