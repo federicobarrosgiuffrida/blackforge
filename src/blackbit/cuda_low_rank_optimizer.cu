@@ -186,18 +186,23 @@ __global__ void updatePackedKernel(std::uint32_t* packed, std::size_t rows, std:
                                    std::uint64_t step, DeviceStepStats* stats) {
     const std::size_t wordIndex = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t wordCount = rows * wordsPerRow;
-    if (wordIndex >= wordCount) return;
+    // I thread fuori intervallo non possono uscire subito: partecipano
+    // alla riduzione finale con contributi nulli, altrimenti le shuffle
+    // e la __syncthreads della riduzione sarebbero divergenti.
+    const bool active = wordIndex < wordCount;
+    unsigned int elements = 0;
+    unsigned int flips = 0;
+    unsigned int positiveFlips = 0;
+    unsigned int negativeFlips = 0;
+    unsigned int saturated = 0;
+    unsigned int nanInf = 0;
+    double updateSquared = 0.0;
+
+    if (active) {
     const std::size_t row = wordIndex / wordsPerRow;
     const std::size_t firstCol = (wordIndex % wordsPerRow) * kTritsPerWord;
     std::uint32_t word = packed[wordIndex];
     const std::uint64_t stepSeed = splitMix64(seed ^ (step * 0xD1B54A32D192ED03ULL));
-    unsigned long long elements = 0;
-    unsigned long long flips = 0;
-    unsigned long long positiveFlips = 0;
-    unsigned long long negativeFlips = 0;
-    unsigned long long saturated = 0;
-    unsigned long long nanInf = 0;
-    double updateSquared = 0.0;
 
     // projection() dipende da (riga, componente) e NON dalla colonna,
     // ma il ciclo originale la ricalcolava per ogni trit: 20 * rank
@@ -252,14 +257,62 @@ __global__ void updatePackedKernel(std::uint32_t* packed, std::size_t rows, std:
                            encodeTritByte(byteTrits[0], byteTrits[1], byteTrits[2], byteTrits[3], byteTrits[4]));
     }
     packed[wordIndex] = word;
-    atomicAdd(&stats->elements, elements);
-    atomicAdd(&stats->updateSquared, updateSquared);
-    atomicAdd(&stats->updateCount, elements);
-    if (flips != 0) atomicAdd(&stats->flips, flips);
-    if (positiveFlips != 0) atomicAdd(&stats->positiveFlips, positiveFlips);
-    if (negativeFlips != 0) atomicAdd(&stats->negativeFlips, negativeFlips);
-    if (saturated != 0) atomicAdd(&stats->saturated, saturated);
-    if (nanInf != 0) atomicAdd(&stats->nanInf, nanInf);
+    }  // if (active)
+
+    // Un blocco copre 5120 trit, quindi i contatori stanno in 32 bit.
+    // Prima ogni thread faceva fino a otto atomiche globali: su tutto il
+    // modello sono oltre un miliardo di atomiche per step. Warp shuffle
+    // piu' riduzione fra warp lasciano una sola serie di atomiche per
+    // blocco. I contatori sono interi, quindi identici; per la somma dei
+    // quadrati cambia solo l'ordine di accumulazione di una statistica
+    // diagnostica, come gia' fatto per gradientStatsKernel.
+    constexpr unsigned int kFullMask = 0xFFFFFFFFU;
+    constexpr int kWarpSize = 32;
+    constexpr int kWarps = kBlockSize / kWarpSize;
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        elements += __shfl_down_sync(kFullMask, elements, offset);
+        flips += __shfl_down_sync(kFullMask, flips, offset);
+        positiveFlips += __shfl_down_sync(kFullMask, positiveFlips, offset);
+        negativeFlips += __shfl_down_sync(kFullMask, negativeFlips, offset);
+        saturated += __shfl_down_sync(kFullMask, saturated, offset);
+        nanInf += __shfl_down_sync(kFullMask, nanInf, offset);
+        updateSquared += __shfl_down_sync(kFullMask, updateSquared, offset);
+    }
+
+    __shared__ unsigned int sharedCounters[6][kWarps];
+    __shared__ double sharedSquared[kWarps];
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) % kWarpSize;
+    if (lane == 0) {
+        sharedCounters[0][warp] = elements;
+        sharedCounters[1][warp] = flips;
+        sharedCounters[2][warp] = positiveFlips;
+        sharedCounters[3][warp] = negativeFlips;
+        sharedCounters[4][warp] = saturated;
+        sharedCounters[5][warp] = nanInf;
+        sharedSquared[warp] = updateSquared;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+
+    unsigned long long totals[6] = {0, 0, 0, 0, 0, 0};
+    double squared = 0.0;
+    for (int w = 0; w < kWarps; ++w) {
+        for (int counter = 0; counter < 6; ++counter) {
+            totals[counter] += sharedCounters[counter][w];
+        }
+        squared += sharedSquared[w];
+    }
+    if (totals[0] != 0) {
+        atomicAdd(&stats->elements, totals[0]);
+        atomicAdd(&stats->updateCount, totals[0]);
+        atomicAdd(&stats->updateSquared, squared);
+    }
+    if (totals[1] != 0) atomicAdd(&stats->flips, totals[1]);
+    if (totals[2] != 0) atomicAdd(&stats->positiveFlips, totals[2]);
+    if (totals[3] != 0) atomicAdd(&stats->negativeFlips, totals[3]);
+    if (totals[4] != 0) atomicAdd(&stats->saturated, totals[4]);
+    if (totals[5] != 0) atomicAdd(&stats->nanInf, totals[5]);
 }
 
 }  // namespace
