@@ -1,5 +1,7 @@
 #include "blackforge/blackbit/cuda_moe.hpp"
 
+#include "blackforge/blackbit/cuda_profile.hpp"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -260,6 +262,7 @@ Tensor MoELayer::forward(const Tensor& input, MoECache& cache, MoERoutingStats& 
     const std::size_t slots = tokens * config_.expertsPerToken;
     cache.tokens = tokens;
     cache.capacity = capacityFor(tokens);
+    GpuProfiler::instance().begin(GpuPhase::Router);
     Tensor logits = denseLinear(input, routerWeight_);
     cache.probabilities = Tensor({tokens, config_.numExperts}, MemoryArena::MoeDispatch);
     softmaxSmallKernel<<<static_cast<unsigned int>(tokens), 1>>>(
@@ -282,6 +285,7 @@ Tensor MoELayer::forward(const Tensor& input, MoECache& cache, MoERoutingStats& 
         summaryBuffer.as<RoutingSummary>(), tokens, config_.numExperts, config_.expertsPerToken,
         cache.capacity);
     BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    GpuProfiler::instance().end(GpuPhase::Router);
     RoutingSummary hostSummary{};
     BLACKFORGE_CUDA_CHECK(cudaMemcpy(&hostSummary, summaryBuffer.data(), sizeof(hostSummary),
                                      cudaMemcpyDeviceToHost));
@@ -307,19 +311,25 @@ Tensor MoELayer::forward(const Tensor& input, MoECache& cache, MoERoutingStats& 
     }
     stats.loadBalancingLoss = static_cast<float>(auxiliary);
     Tensor output = Tensor::zeros(input.shape(), MemoryArena::Activations);
-    for (std::size_t expert = 0; expert < config_.numExperts; ++expert) {
-        const std::size_t count = static_cast<std::size_t>(cache.hostAssignmentsPerExpert[expert]);
-        if (count == 0) continue;
-        const int* assigned = cache.tokensOfExpert.data() + expert * cache.capacity;
-        const int* expertSlots = cache.slotsOfExpert.data() + expert * cache.capacity;
-        Tensor gathered({count, config_.hiddenSize}, MemoryArena::MoeDispatch);
-        gatherRowsKernel<<<gridFor(gathered.elementCount()), kBlockSize>>>(
-            gathered.data(), input.data(), assigned, count, config_.hiddenSize);
-        Tensor expertOutput = experts_[expert].forward(gathered);
-        combineRowsKernel<<<gridFor(expertOutput.elementCount()), kBlockSize>>>(
-            output.data(), cache.expertOutputOfSlot.data(), expertOutput.data(), assigned, expertSlots,
-            cache.weightOfSlot.data(), count, config_.hiddenSize);
-        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    {
+        // Le parentesi delimitano la fase al solo ciclo degli esperti:
+        // senza, lo scope arriverebbe a fine funzione e si prenderebbe
+        // anche il lavoro del router.
+        const GpuPhaseScope expertScope(GpuPhase::Experts);
+        for (std::size_t expert = 0; expert < config_.numExperts; ++expert) {
+            const std::size_t count = static_cast<std::size_t>(cache.hostAssignmentsPerExpert[expert]);
+            if (count == 0) continue;
+            const int* assigned = cache.tokensOfExpert.data() + expert * cache.capacity;
+            const int* expertSlots = cache.slotsOfExpert.data() + expert * cache.capacity;
+            Tensor gathered({count, config_.hiddenSize}, MemoryArena::MoeDispatch);
+            gatherRowsKernel<<<gridFor(gathered.elementCount()), kBlockSize>>>(
+                gathered.data(), input.data(), assigned, count, config_.hiddenSize);
+            Tensor expertOutput = experts_[expert].forward(gathered);
+            combineRowsKernel<<<gridFor(expertOutput.elementCount()), kBlockSize>>>(
+                output.data(), cache.expertOutputOfSlot.data(), expertOutput.data(), assigned, expertSlots,
+                cache.weightOfSlot.data(), count, config_.hiddenSize);
+            BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+        }
     }
     return output;
 }
@@ -331,27 +341,35 @@ Tensor MoELayer::backward(const Tensor& input, const Tensor& gradOutput, const M
     }
     const std::size_t routed = stats.assignments - stats.droppedAssignments;
     Tensor gradProbabilities = Tensor::zeros({cache.tokens, config_.numExperts}, MemoryArena::MoeDispatch);
+    GpuProfiler::instance().begin(GpuPhase::Router);
     routingGradientKernel<<<static_cast<unsigned int>(cache.tokens), 1>>>(
         gradProbabilities.data(), cache.probabilities.data(), cache.expertOfSlot.data(),
         cache.weightOfSlot.data(), cache.expertOutputOfSlot.data(), gradOutput.data(),
         cache.assignmentsPerExpert.data(), cache.tokens, config_.hiddenSize, config_.numExperts,
         config_.expertsPerToken, routed, config_.routerAuxLossWeight);
+    GpuProfiler::instance().end(GpuPhase::Router);
     Tensor gradInput = Tensor::zeros(input.shape(), MemoryArena::Activations);
-    for (std::size_t expert = 0; expert < config_.numExperts; ++expert) {
-        const std::size_t count = static_cast<std::size_t>(cache.hostAssignmentsPerExpert[expert]);
-        if (count == 0) continue;
-        const int* assigned = cache.tokensOfExpert.data() + expert * cache.capacity;
-        const int* slots = cache.slotsOfExpert.data() + expert * cache.capacity;
-        Tensor gatheredInput({count, config_.hiddenSize}, MemoryArena::MoeDispatch);
-        Tensor gatheredGradient({count, config_.hiddenSize}, MemoryArena::MoeDispatch);
-        gatherWeightedGradientKernel<<<gridFor(gatheredInput.elementCount()), kBlockSize>>>(
-            gatheredInput.data(), gatheredGradient.data(), input.data(), gradOutput.data(), assigned, slots,
-            cache.weightOfSlot.data(), count, config_.hiddenSize);
-        Tensor expertGradInput = experts_[expert].backward(gatheredInput, gatheredGradient, sink);
-        scatterAddKernel<<<gridFor(expertGradInput.elementCount()), kBlockSize>>>(
-            gradInput.data(), expertGradInput.data(), assigned, count, config_.hiddenSize);
-        BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+    {
+        // Solo il ciclo: dopo di questo c'e' il backward del router, che
+        // e' fase Router, non Experts.
+        const GpuPhaseScope expertScope(GpuPhase::Experts);
+        for (std::size_t expert = 0; expert < config_.numExperts; ++expert) {
+            const std::size_t count = static_cast<std::size_t>(cache.hostAssignmentsPerExpert[expert]);
+            if (count == 0) continue;
+            const int* assigned = cache.tokensOfExpert.data() + expert * cache.capacity;
+            const int* slots = cache.slotsOfExpert.data() + expert * cache.capacity;
+            Tensor gatheredInput({count, config_.hiddenSize}, MemoryArena::MoeDispatch);
+            Tensor gatheredGradient({count, config_.hiddenSize}, MemoryArena::MoeDispatch);
+            gatherWeightedGradientKernel<<<gridFor(gatheredInput.elementCount()), kBlockSize>>>(
+                gatheredInput.data(), gatheredGradient.data(), input.data(), gradOutput.data(), assigned,
+                slots, cache.weightOfSlot.data(), count, config_.hiddenSize);
+            Tensor expertGradInput = experts_[expert].backward(gatheredInput, gatheredGradient, sink);
+            scatterAddKernel<<<gridFor(expertGradInput.elementCount()), kBlockSize>>>(
+                gradInput.data(), expertGradInput.data(), assigned, count, config_.hiddenSize);
+            BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+        }
     }
+    GpuProfiler::instance().begin(GpuPhase::Router);
     Tensor gradLogits({cache.tokens, config_.numExperts}, MemoryArena::MoeDispatch);
     softmaxBackwardSmallKernel<<<static_cast<unsigned int>(cache.tokens), 1>>>(
         gradLogits.data(), cache.probabilities.data(), gradProbabilities.data(), cache.tokens,
@@ -361,6 +379,7 @@ Tensor MoELayer::backward(const Tensor& input, const Tensor& gradOutput, const M
     if (sink != nullptr) {
         sink->consumeDenseGradient(routerParameterId(), routerGrad.weight.data(), routerGrad.weight.elementCount());
     }
+    GpuProfiler::instance().end(GpuPhase::Router);
     return gradInput;
 }
 

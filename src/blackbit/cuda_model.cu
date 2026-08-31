@@ -1,5 +1,7 @@
 #include "blackforge/blackbit/cuda_model.hpp"
 
+#include "blackforge/blackbit/cuda_profile.hpp"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -119,10 +121,16 @@ BlackBitBlock::BlackBitBlock(blackforge::blackbit::BlackBitBlock& cpuReference,
       moe_(cpuReference.moe(), config) {}
 
 Tensor BlackBitBlock::forward(const Tensor& input, BlockCache& cache) const {
+    GpuProfiler::instance().begin(GpuPhase::Norm);
     cache.normedForAttention = rmsNormForward(input, attentionGamma_, cache.attentionNorm);
+    GpuProfiler::instance().end(GpuPhase::Norm);
+    GpuProfiler::instance().begin(GpuPhase::Attention);
     Tensor attended = attention_.forward(cache.normedForAttention, cache.attention);
+    GpuProfiler::instance().end(GpuPhase::Attention);
     cache.afterAttention = add(input, attended, MemoryArena::Activations);
+    GpuProfiler::instance().begin(GpuPhase::Norm);
     cache.normedForMoE = rmsNormForward(cache.afterAttention, moeGamma_, cache.moeNorm);
+    GpuProfiler::instance().end(GpuPhase::Norm);
     Tensor mixed = moe_.forward(cache.normedForMoE, cache.moe, cache.routing);
     return add(cache.afterAttention, mixed, MemoryArena::Activations);
 }
@@ -130,16 +138,22 @@ Tensor BlackBitBlock::forward(const Tensor& input, BlockCache& cache) const {
 Tensor BlackBitBlock::backward(const Tensor& input, const Tensor& gradOutput, const BlockCache& cache,
                                GradientSink* sink) const {
     Tensor gradNormedMoe = moe_.backward(cache.normedForMoE, gradOutput, cache.moe, cache.routing, sink);
+    GpuProfiler::instance().begin(GpuPhase::Norm);
     RmsNormGrad moeNormGrad = rmsNormBackward(cache.afterAttention, moeGamma_, gradNormedMoe, cache.moeNorm);
+    GpuProfiler::instance().end(GpuPhase::Norm);
     if (sink != nullptr) {
         sink->consumeDenseGradient({moeNormName_, 1, moeGamma_.elementCount()}, moeNormGrad.gamma.data(),
                                    moeNormGrad.gamma.elementCount());
     }
     Tensor gradAfterAttention = add(gradOutput, moeNormGrad.input, MemoryArena::Activations);
+    GpuProfiler::instance().begin(GpuPhase::Attention);
     Tensor gradNormedAttention = attention_.backward(cache.normedForAttention, gradAfterAttention,
                                                      cache.attention, sink);
+    GpuProfiler::instance().end(GpuPhase::Attention);
+    GpuProfiler::instance().begin(GpuPhase::Norm);
     RmsNormGrad attentionNormGrad = rmsNormBackward(input, attentionGamma_, gradNormedAttention,
                                                     cache.attentionNorm);
+    GpuProfiler::instance().end(GpuPhase::Norm);
     if (sink != nullptr) {
         sink->consumeDenseGradient({attentionNormName_, 1, attentionGamma_.elementCount()},
                                    attentionNormGrad.gamma.data(), attentionNormGrad.gamma.elementCount());
@@ -160,6 +174,7 @@ BlackBitModel::BlackBitModel(blackforge::blackbit::BlackBitModel& cpuReference)
 }
 
 Tensor BlackBitModel::embedTokens(const IndexTensor& tokenIds) const {
+    const GpuPhaseScope scope(GpuPhase::Embedding);
     return embeddingLookup(tokenIds, embedding_.weight(), config_.hiddenSize);
 }
 
@@ -219,7 +234,9 @@ BlackBitStepResult BlackBitModel::trainStep(const std::vector<int>& tokenIds,
     }
     Tensor preNormHidden = activations.clone(MemoryArena::Activations);
     RmsNormCache finalNormCache;
+    GpuProfiler::instance().begin(GpuPhase::Norm);
     Tensor finalHidden = rmsNormForward(activations, finalGamma_, finalNormCache);
+    GpuProfiler::instance().end(GpuPhase::Norm);
     for (const MoERoutingStats& routing : result.routing) result.auxiliaryLoss += routing.loadBalancingLoss;
     if (!result.routing.empty()) result.auxiliaryLoss /= static_cast<float>(result.routing.size());
 
@@ -227,6 +244,10 @@ BlackBitStepResult BlackBitModel::trainStep(const std::vector<int>& tokenIds,
     Tensor rowMax({tokens}, MemoryArena::Temporary);
     Tensor rowSum({tokens}, MemoryArena::Temporary);
     Tensor targetLogit({tokens}, MemoryArena::Temporary);
+    // Le tre passate sulla testa di uscita sono la parte piu' costosa in
+    // FLOP del passo (vocab 65536 x hidden 3072, ripetuta tre volte), ma
+    // non e' evidente quanto tempo GPU consumino davvero: si misura.
+    GpuProfiler::instance().begin(GpuPhase::Head);
     initializeHeadStatsKernel<<<gridFor(tokens), kBlockSize>>>(
         rowMax.data(), rowSum.data(), targetLogit.data(), tokens);
     for (std::size_t first = 0; first < config_.vocabSize; first += chunk) {
@@ -241,6 +262,7 @@ BlackBitStepResult BlackBitModel::trainStep(const std::vector<int>& tokenIds,
     headLossKernel<<<gridFor(tokens), kBlockSize>>>(
         rowMax.data(), rowSum.data(), targetLogit.data(), deviceTargets.data(), tokens,
         config_.vocabSize, lossStats.as<LossStats>());
+    GpuProfiler::instance().end(GpuPhase::Head);
     LossStats hostLoss{};
     BLACKFORGE_CUDA_CHECK(cudaMemcpy(&hostLoss, lossStats.data(), sizeof(hostLoss), cudaMemcpyDeviceToHost));
     if (hostLoss.invalid != 0) throw std::invalid_argument("CUDA BlackBitModel: target outside vocabulary");
@@ -255,6 +277,7 @@ BlackBitStepResult BlackBitModel::trainStep(const std::vector<int>& tokenIds,
 
     const float inverseScored = 1.0F / static_cast<float>(hostLoss.scored);
     Tensor gradHidden = Tensor::zeros(finalHidden.shape(), MemoryArena::Activations);
+    GpuProfiler::instance().begin(GpuPhase::Head);
     for (std::size_t first = 0; first < config_.vocabSize; first += chunk) {
         const std::size_t count = std::min(chunk, config_.vocabSize - first);
         Tensor logits = embedding_.forwardRows(finalHidden, first, count);
@@ -265,7 +288,10 @@ BlackBitStepResult BlackBitModel::trainStep(const std::vector<int>& tokenIds,
         Tensor contribution = embedding_.backwardInputRows(gradLogits, first);
         addInPlace(gradHidden, contribution);
     }
+    GpuProfiler::instance().end(GpuPhase::Head);
+    GpuProfiler::instance().begin(GpuPhase::Norm);
     RmsNormGrad finalNormGrad = rmsNormBackward(preNormHidden, finalGamma_, gradHidden, finalNormCache);
+    GpuProfiler::instance().end(GpuPhase::Norm);
     sink->consumeDenseGradient({finalNormName_, 1, config_.hiddenSize}, finalNormGrad.gamma.data(),
                                finalNormGrad.gamma.elementCount());
     Tensor gradBlockInput = std::move(finalNormGrad.input);
@@ -280,6 +306,7 @@ BlackBitStepResult BlackBitModel::trainStep(const std::vector<int>& tokenIds,
         }
     }
     GradientLifetimeStats& lifetime = gradientLifetimeStats();
+    GpuProfiler::instance().begin(GpuPhase::Head);
     for (std::size_t first = 0; first < config_.vocabSize; first += chunk) {
         const std::size_t count = std::min(chunk, config_.vocabSize - first);
         Tensor logits = embedding_.forwardRows(finalHidden, first, count);
@@ -299,6 +326,7 @@ BlackBitStepResult BlackBitModel::trainStep(const std::vector<int>& tokenIds,
         lifetime.liveBytes = 0;
         ++lifetime.blocksReleased;
     }
+    GpuProfiler::instance().end(GpuPhase::Head);
     BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
     return result;
 }

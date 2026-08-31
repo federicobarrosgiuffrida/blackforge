@@ -39,6 +39,11 @@ struct BenchmarkResult {
     bool withinBudget = false;
     bool instantiateOnly = false;
     bool milestoneH = false;
+    // Attribuzione del tempo GPU per fase dell'ULTIMO passo misurato,
+    // vuota se il profiler era spento. Un solo passo e non la media:
+    // gli eventi vengono azzerati a ogni passo, e mediare richiederebbe
+    // di risolverli (quindi sincronizzare) dentro il ciclo cronometrato.
+    std::string gpuProfile;
 
     [[nodiscard]] std::string report() const;
 };

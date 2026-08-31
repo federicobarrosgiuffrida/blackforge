@@ -11,6 +11,7 @@
 #include "blackforge/backend/cuda/cuda_check.hpp"
 #include "blackforge/blackbit/cuda_low_rank_optimizer.hpp"
 #include "blackforge/blackbit/cuda_model.hpp"
+#include "blackforge/blackbit/cuda_profile.hpp"
 
 namespace blackforge::blackbit::cuda {
 
@@ -80,6 +81,9 @@ std::string BenchmarkResult::report() const {
     out << "  FULL PRECISION MASTER COPY: " << (fullPrecisionMasterCopy ? "YES" : "NO") << "\n";
     out << "  FULL MODEL GRADIENT BUFFER: " << (fullModelGradientBuffer ? "YES" : "NO") << "\n";
     out << "  PEAK GPU MEMORY < " << options.maxVramMb << " MiB: " << (withinBudget ? "YES" : "NO") << "\n";
+    if (!gpuProfile.empty()) {
+        out << "\n" << gpuProfile;
+    }
     if (milestoneH) {
         out << "\n================================\n"
             << "  BLACKBIT MILESTONE H PASSED\n"
@@ -141,16 +145,29 @@ BenchmarkResult runBenchmark(const BlackBitConfig& config, const BenchmarkOption
         telemetry.resetPeaks();
         double forwardBackwardTotal = 0.0;
         double optimizerTotal = 0.0;
+        GpuProfiler& profiler = GpuProfiler::instance();
         for (std::size_t step = 0; step < options.steps; ++step) {
             BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
+            profiler.reset();
             const auto before = std::chrono::steady_clock::now();
             const BlackBitStepResult stepResult =
                 model.trainStep(tokenIds, targets, options.microBatch, options.seqLen, &optimizer);
             BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
             const auto afterBackward = std::chrono::steady_clock::now();
-            optimizer.endStep();
+            {
+                GpuPhaseScope optimizerScope(GpuPhase::Optimizer);
+                optimizer.endStep();
+            }
             BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
             const auto afterOptimizer = std::chrono::steady_clock::now();
+            if (profiler.enabled()) {
+                // Fuori dal cronometro: resolve() sincronizza, e includerla
+                // nel tempo del passo falserebbe proprio la misura che
+                // stiamo cercando di spiegare.
+                profiler.resolve();
+                result.gpuProfile = profiler.report(
+                    std::chrono::duration<double, std::milli>(afterOptimizer - before).count());
+            }
             forwardBackwardTotal += std::chrono::duration<double, std::milli>(afterBackward - before).count();
             optimizerTotal += std::chrono::duration<double, std::milli>(afterOptimizer - afterBackward).count();
             result.finalLoss = stepResult.loss;
@@ -252,16 +269,26 @@ std::vector<BenchmarkResult> runBenchmarkLadder(const BlackBitConfig& config,
         telemetry.resetPeaks();
         double forwardBackwardTotal = 0.0;
         double optimizerTotal = 0.0;
+        GpuProfiler& profiler = GpuProfiler::instance();
         for (std::size_t step = 0; step < options.steps; ++step) {
             BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
+            profiler.reset();
             const auto before = std::chrono::steady_clock::now();
             const BlackBitStepResult stepResult =
                 model.trainStep(tokenIds, targets, options.microBatch, seq, &optimizer);
             BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
             const auto afterBackward = std::chrono::steady_clock::now();
-            optimizer.endStep();
+            {
+                GpuPhaseScope optimizerScope(GpuPhase::Optimizer);
+                optimizer.endStep();
+            }
             BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
             const auto afterOptimizer = std::chrono::steady_clock::now();
+            if (profiler.enabled()) {
+                profiler.resolve();
+                result.gpuProfile = profiler.report(
+                    std::chrono::duration<double, std::milli>(afterOptimizer - before).count());
+            }
             forwardBackwardTotal += std::chrono::duration<double, std::milli>(afterBackward - before).count();
             optimizerTotal += std::chrono::duration<double, std::milli>(afterOptimizer - afterBackward).count();
             result.finalLoss = stepResult.loss;

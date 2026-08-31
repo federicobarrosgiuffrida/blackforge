@@ -180,6 +180,7 @@ if(BLACKFORGE_ENABLE_CUDA)
         src/blackbit/cuda_ternary.cu
         src/blackbit/cuda_ternary_linear.cu
         src/blackbit/cuda_low_rank_optimizer.cu
+        src/blackbit/cuda_profile.cu
     )
 endif()
 

@@ -708,6 +708,63 @@ sensibile all'ordine e non deve cambiare quali esperti vengono scelti.
 Con questa architettura di calcolo BF16, **>=100 token/s e' plausibile
 ma non gratuito, e >=150 non sembra realistico su questa GPU.**
 
+### Attribuzione per fase dentro il processo (`--profile`)
+
+La tabella qui sopra viene da Nsight ed e' per kernel. Manca pero' la
+riga piu' importante: **la somma dei kernel e' 5,1 s su uno step di
+6,76 s**, quindi ~1,6 s (24 %) non e' in nessun kernel. Nsight quel
+tempo lo mostra come vuoto fra i lanci, senza dire a quale parte del
+modello appartiene.
+
+`blackforge benchmark blackbit ... --profile` aggiunge l'attribuzione
+per fase, misurata da dentro il processo con coppie di `cudaEvent`
+(`include/blackforge/blackbit/cuda_profile.hpp`): embedding, rmsnorm,
+attenzione, router, esperti, testa/loss, optimizer. Una sola
+`cudaDeviceSynchronize` a fine step, fuori dal cronometro.
+
+Due scelte da tenere presenti nel leggere il report:
+
+- **`optimizer` include la proiezione low-rank che gira dentro il
+  backward**, non solo `endStep()`. Quindi si sovrappone di proposito a
+  esperti/attenzione/testa e la somma delle fasi puo' superare il 100 %.
+  Senza questa scelta le 622 ms di "proiezione + statistiche" della
+  tabella Nsight finirebbero contate come tempo degli esperti.
+- **`non attribuito` positivo e grande = tempo fuori dai kernel**:
+  accodamento dei lanci sull'host, allocazioni, o le sincronizzazioni
+  implicite (`cudaMemcpy` sincrono dopo `routeForwardKernel`, i
+  `cudaMemset` del dispatch). E' esattamente l'1,6 s che Nsight non
+  attribuisce.
+
+Il profiler e' spento salvo `--profile`: a profiler spento `begin()` e
+`end()` sono un confronto booleano, quindi l'istrumentazione puo' restare
+nel percorso caldo senza pagarla.
+
+### Verifica del codice CUDA senza GPU (`tools/check_cuda_syntax.sh`)
+
+Negli ambienti di sviluppo senza toolkit CUDA, `cmake` compila solo il
+ramo CPU: i 29 file CUDA del repository non vengono **mai** analizzati, e
+un errore di battitura in un kernel resta invisibile fino alla prima
+build su una macchina con GPU. Non e' un'ipotesi: l'istrumentazione di
+questa sezione e' stata scritta in un container senza `nvcc`.
+
+`tools/check_cuda_syntax.sh` chiude quel buco. Riscrive
+`kernel<<<griglia, blocchi>>>(args)` in
+`(blackforgeLaunchConfiguration(griglia, blocchi), kernel)(args)` — una
+espressione con virgola che vale `kernel` e poi lo chiama, cosi' gli
+argomenti restano controllati contro la firma **e** le variabili usate
+solo nella configurazione di lancio non diventano falsi
+`-Wunused-variable`. Gli header di `tools/cuda_syntax_stub/` dichiarano
+il minimo di CUDA necessario (`__nv_bfloat16` con il `static_assert` sui
+2 byte, cosi' i `sizeof` nelle allocazioni restano corretti; le
+`isfinite`/`min`/`max` che CUDA mette allo scope globale; cuBLASLt).
+
+Cosa cattura: sintassi, tipi, argomenti dei kernel, membri inesistenti,
+name lookup, accessi privati. **Cosa non cattura**: gli errori specifici
+di `nvcc` (funzioni host chiamate dal device, pressione sui registri,
+`__launch_bounds__` non soddisfatte) e qualunque errore di esecuzione.
+**Non sostituisce una build CUDA vera** — riduce il numero di giri
+necessari su una macchina con GPU, non li azzera.
+
 ## 8. Stato dei percorsi (aggiornato ad ogni fase)
 
 | Percorso | Stato | Verificato da |

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "blackforge/backend/cuda/cuda_check.hpp"
+#include "blackforge/blackbit/cuda_profile.hpp"
 #include "blackforge/blackbit/stochastic_round.hpp"
 #include "blackforge/blackbit/ternary_update.hpp"
 
@@ -452,6 +453,13 @@ LowRankProjectedOptimizer::State& LowRankProjectedOptimizer::stateFor(const Para
 
 void LowRankProjectedOptimizer::consumeWeightGradientBlock(const ParameterId& id, std::size_t firstRow,
                                                             std::size_t rowCount, const float* deviceBlock) {
+    // Attribuita a Optimizer anche se avviene DENTRO il backward: la
+    // proiezione low-rank e' lavoro dell'ottimizzatore, non del calcolo
+    // del gradiente. Si sovrappone quindi alle fasi che la contengono
+    // (esperti, attenzione, testa) — voluto: il report dice esplicitamente
+    // che le fasi possono sovrapporsi, ed e' l'unico modo di vedere quanto
+    // costa la proiezione senza confonderla col GEMM che la precede.
+    GpuPhaseScope scope(GpuPhase::Optimizer);
     State& state = stateFor(id);
     if (firstRow + rowCount > state.rows || (deviceBlock == nullptr && rowCount != 0)) {
         throw std::invalid_argument("CUDA LowRankProjectedOptimizer: invalid gradient block");
@@ -469,6 +477,7 @@ void LowRankProjectedOptimizer::consumeWeightGradientBlock(const ParameterId& id
 
 void LowRankProjectedOptimizer::consumeDenseGradient(const ParameterId& id, const float* deviceValues,
                                                       std::size_t count) {
+    GpuPhaseScope scope(GpuPhase::Optimizer);
     auto found = denseStates_.find(id.name);
     if (found == denseStates_.end()) {
         throw std::invalid_argument("CUDA LowRankProjectedOptimizer: unregistered dense parameter '" +
