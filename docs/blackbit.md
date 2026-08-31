@@ -695,12 +695,12 @@ Ranking per step dopo gli interventi (Nsight, tempo kernel):
 | routing forward | 229 | 4% |
 | adam direction | 104 | 2% |
 
-### `updatePacked`: riuso delle direzioni (da misurare su GPU)
+### `updatePacked`: riuso delle direzioni (misurato su GPU)
 
 La riga da 1 228 ms/step sopra e' **MISURATA** sulla RTX 5060 prima di
-questo intervento. Non esiste ancora una misura GPU del kernel nuovo:
-in particolare, nessuno dei numeri stimati in questo paragrafo va letto
-come un risultato di benchmark.
+questo intervento, in una sessione precedente. Le stime che hanno
+motivato il cambio sono riportate sotto, ma ora esiste anche un A/B
+diretto e ripetuto: le due cose non vanno confuse.
 
 Il volume logico delle direzioni, da solo, non spiega il tempo misurato.
 Con il rango 8 usato nei run 9B e 9,05 miliardi di trit, il traffico e'
@@ -721,8 +721,33 @@ direzioni vengono caricate una volta in memoria condivisa, a tile di 32
 componenti (2 560 B fissi), e riusate da 256 thread. Il compromesso e'
 che il packed viene letto e scritto a passo `wordsPerRow`: i 3,8 GiB
 logici per step possono diventare circa 30 GiB con amplificazione 8x,
-pari a circa 68 ms a 448 GB/s (**STIMATO**). Il guadagno netto resta
-un'ipotesi finche' non viene misurato sullo stesso workload GPU.
+pari a circa 68 ms a 448 GB/s (**STIMATO**).
+
+#### A/B diretto sulla RTX 5060
+
+**MISURATO il 31 agosto 2026.** Vecchio kernel al commit `6adcef0`
+contro nuovo kernel al commit `04e1c2b`, entrambi compilati Release con
+lo stesso nvcc 13.3.73, host MSVC 19.50, `sm_120`, driver 610.62. Il
+workload e' 9B-A3B, seq 512, micro-batch 1, 3 step, rank 8, limite 7 800
+MiB e `--profile`. Tre processi per variante, alternati nuovo/vecchio;
+la tabella riporta la mediana e fra parentesi il range dei tre campioni.
+
+| metrica | vecchio | nuovo | variazione |
+|---|---:|---:|---:|
+| `endStep` optimizer | 512,38 ms (510,84-512,61) | 324,27 ms (324,03-327,80) | **-36,7%, 1,58x** |
+| fase optimizer inclusiva | 989,71 ms (968,81-1 000,99) | 800,56 ms (795,72-810,47) | **-19,1%** |
+| passo totale | 5 524,30 ms (5 464,21-5 674,93) | 5 376,89 ms (5 335,67-5 444,69) | **-2,7%** |
+| throughput | 92,681 token/s (90,221-93,701) | 95,222 token/s (94,037-95,958) | **+2,7%** |
+| picco NVIDIA | 3,608 GiB | 3,608 GiB | invariato |
+
+Il verdetto e' quindi positivo ma piu' piccolo della previsione: il
+percorso modificato e' stabilmente piu' veloce e risparmia 188,11 ms
+sull'`endStep`, non circa un secondo. Il tempo forward/backward ha una
+dispersione indipendente (mediane 5 013,47 ms vecchio e 5 049,09 ms
+nuovo), che assorbe parte del vantaggio nel tempo totale. Il vecchio
+tempo Nsight da 1 228 ms non e' stato riprodotto con driver e toolchain
+attuali; resta una misura storica valida per quella sessione, non una
+baseline intercambiabile con questo A/B.
 
 L'invarianza degli indici e' verificata senza CUDA da
 `PackedUpdateMappingTest.LaMappaturaATileProduceWordBitIdentiche`: il
@@ -731,26 +756,31 @@ inclusi caricamento cooperativo della tile, blocco di righe parziale,
 rank 8 e 40, ultimo chunk parziale e colonne non multiple di 20 (anche
 3072, cioe' 154 word con 8 slot di padding). Tutte le word risultano
 bit-identiche. Verifica locale: 388/388 test CPU passati e tutti i 29
-file CUDA accettati dal checker con stub; non e' una build `nvcc` e non
-verifica esecuzione, occupancy o pressione sui registri.
+file CUDA accettati dal checker con stub. Sulla GPU reale, l'intero
+progetto compila con nvcc 13.3 e passano 531/531 test della build CUDA,
+incluso il confronto fra aggiornamento proiettato CUDA e riferimento
+CPU. Restano non misurati occupancy e pressione sui registri a livello
+di singolo kernel.
 
-La somma dei kernel e' circa 5,1 s su uno step di 6,76 s. **Anche
+Nella misura Nsight storica della tabella, la somma dei kernel e' circa
+5,1 s su uno step di 6,76 s. **Anche
 azzerando ogni overhead dell'host il tetto sarebbe ~100 token/s**:
 oltre quella soglia non basta togliere overhead, va ridotto il lavoro
-dei kernel. I candidati misurati sono `updatePackedKernel`, ora
-rimappato ma ancora da rimisurare, e `routeForwardKernel`, che oggi gira
-**a thread singolo** (`<<<1,1>>>`) e costa 229 ms/step di pura
-serializzazione: parallelizzarlo richiede pero' attenzione, perche' il
-riempimento greedy della capacita' e' sensibile all'ordine e non deve
-cambiare quali esperti vengono scelti.
+dei kernel. La rimappatura di `updatePackedKernel` porta il workload
+attuale a 95,222 token/s **MISURATI**; il prossimo candidato e'
+`routeForwardKernel`, che oggi gira **a thread singolo** (`<<<1,1>>>`)
+e costa 229 ms/step nella misura Nsight precedente. Parallelizzarlo
+richiede pero' attenzione, perche' il riempimento greedy della
+capacita' e' sensibile all'ordine e non deve cambiare quali esperti
+vengono scelti.
 
 Con questa architettura di calcolo BF16, **>=100 token/s e' plausibile
 ma non gratuito, e >=150 non sembra realistico su questa GPU.**
 
 ### Attribuzione per fase dentro il processo (`--profile`)
 
-La tabella qui sopra viene da Nsight ed e' per kernel. Manca pero' la
-riga piu' importante: **la somma dei kernel e' 5,1 s su uno step di
+La tabella Nsight all'inizio di questa sezione e' per kernel. Manca
+pero' la riga piu' importante: **la somma dei kernel e' 5,1 s su uno step di
 6,76 s**, quindi ~1,6 s (24 %) non e' in nessun kernel. Nsight quel
 tempo lo mostra come vuoto fra i lanci, senza dire a quale parte del
 modello appartiene.
@@ -831,13 +861,14 @@ necessari su una macchina con GPU, non li azzera.
 | GQA CUDA online-softmax | implementato | forward/backward; nessuna matrice score e nessuna replica K/V |
 | MoE CUDA Top-2 sparso | implementato | dispatch compatto, overflow, router ed esperti contro CPU |
 | Optimizer CUDA proiettato + parametri densi | implementato | parità CPU e flip reali dei byte packed |
-| Modello/trainer CUDA end-to-end | implementato | 518 test totali + Tiny/Small/Medium/9B reali |
+| Modello/trainer CUDA end-to-end | implementato | 531 test totali + Tiny/Small/Medium/9B reali |
 | Trainer testo reale + checkpoint/resume CUDA | implementato | TinyStories sample, BFBIT CPU/CUDA interoperabile, ripresa step/token/RNG/optimizer |
 | Smoke 9B testo reale | **PASS** | 100 step + resume step 101, loss in calo, 4,379 GiB misurati |
 | Ramp 9B seq 8..512 | **PASS** | sette step completi, picco massimo 4,659 GiB |
 | Milestone H | **PASS** | 9B seq 16, picco NVIDIA 4,379 GiB, 49,3 M flip |
 | Top-2 realmente eseguito (CPU e CUDA) | **PASS** | zero scarti a capacita' sufficiente, parita' di selezione CPU/CUDA |
 | Milestone P1 (>=75 token/s) | **PASS** | 75,781 token/s su 10 passi, 4,295 GiB, loss monotona |
+| `updatePacked` con direzioni condivise | **PASS** | nvcc 13.3, 531/531 test, `endStep` -36,7% e throughput +2,7% su A/B 9B |
 
 ### 8.1 Limiti Phase 9 ancora aperti, detti esplicitamente
 

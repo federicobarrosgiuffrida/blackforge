@@ -266,9 +266,10 @@ constexpr std::size_t kComponentTile = 32;
 // Il prezzo: packed[row * wordsPerRow + wordCol] diventa un accesso a
 // passo wordsPerRow, quindi non coalescente. Sono 3,8 GiB per passo
 // (lettura piu' scrittura) con amplificazione ~8x, cioe' ~30 GiB a 448
-// GB/s = ~68 ms — molto meno del secondo abbondante risparmiato sulle
-// transazioni L2. E' un compromesso, non un miglioramento su tutti i
-// fronti, e va verificato su GPU.
+// GB/s = ~68 ms STIMATI. L'A/B reale sulla RTX 5060 conferma il
+// compromesso, ma non la stima iniziale di circa un secondo risparmiato:
+// la mediana dell'intero endStep scende da 512,38 a 324,27 ms (-36,7%)
+// e il throughput totale cresce del 2,7%. Dettagli in docs/blackbit.md.
 //
 // I trit prodotti sono BIT-IDENTICI: 'update' resta accumulato per
 // componente crescente, la proiezione e l'arrotondamento stocastico
