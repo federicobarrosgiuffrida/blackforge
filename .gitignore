@@ -4,3 +4,4 @@ out/
 .cache/
 CMakeUserPresets.json
 .claude/
+phase9_cuda_smoke.exe

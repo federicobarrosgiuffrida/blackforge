@@ -38,6 +38,8 @@
 #include "blackforge/backend/cuda/model.hpp"
 #include "blackforge/backend/cuda/multi_gpu_train_runner.hpp"
 #include "blackforge/backend/cuda/train_runner.hpp"
+#include "blackforge/blackbit/cuda_benchmark.hpp"
+#include "blackforge/blackbit/cuda_train.hpp"
 #endif
 
 namespace {
@@ -49,6 +51,7 @@ void printUsage() {
               << "  build <file>       Compila e costruisce ogni modello (alloca i parametri), senza eseguirlo\n"
               << "  run <file>         Esegue il primo modello del file\n"
               << "  train <file>       Addestra il modello descritto dal blocco 'train' del file (CPU o CUDA)\n"
+              << "  train blackbit [preset]  Addestra BlackBit CUDA su uno shard .bfdata reale\n"
               << "  forecast <file>    Genera 'horizon' passi autoregressivi dal blocco 'forecast' del file (CPU)\n"
               << "  benchmark <file>   Misura tempo/throughput/memoria del primo modello del file\n"
               << "  benchmark blackbit [preset]   Misura un modello BlackBit (MoE ternario a bassa memoria):\n"
@@ -91,7 +94,7 @@ void printUsage() {
                  "superare " << blackforge::tokenizer::Tokenizer::kFirstMergeId << ")\n"
               << "  --seq-len N        Lunghezza di sequenza di ogni esempio (solo 'dataset-build')\n"
               << "  --output <file>    Percorso di output (solo 'tokenizer-train'/'dataset-build')\n"
-              << "  --tokenizer <file> Tokenizer .bftok da usare (solo 'generate')\n"
+              << "  --tokenizer <file> Tokenizer .bftok per 'generate' o metadati checkpoint BlackBit\n"
               << "  --prompt <testo>   Testo iniziale da cui continuare la generazione (solo 'generate')\n"
               << "  --max-new-tokens N Numero massimo di token da generare (solo 'generate', default 50)\n"
               << "  --mlm              Costruisce un dataset mascherato (MLM) invece che causale (solo "
@@ -99,8 +102,11 @@ void printUsage() {
               << "  --mask-prob P      Probabilita' di mascherare ogni posizione, 0 < P <= 1 (solo 'dataset-build "
                  "--mlm', default 0.15)\n"
               << "  --config <file>    Configurazione JSON di BlackBit (solo 'benchmark blackbit')\n"
+              << "  --dataset <file>   Shard tokenizzato .bfdata (solo 'train blackbit')\n"
               << "  --micro-batch N    Sequenze per passo (solo 'benchmark blackbit', default 1)\n"
               << "  --steps N          Passi di addestramento misurati (solo 'benchmark blackbit', default 3)\n"
+              << "  --instantiate-only Costruisce BlackBit CUDA e misura la VRAM senza eseguire uno step\n"
+              << "  --seq-ladder      Esegue seq 8,16,...,512 sulla stessa istanza BlackBit CUDA\n"
               << "  --max-vram-mb N    Budget di memoria: superarlo e' un errore diagnosticato prima di allocare "
                  "(solo 'benchmark blackbit', default 7800, 0 = nessun limite)\n"
               << "  --optimizer-rank N Rango del sottospazio dell'ottimizzatore (solo 'benchmark blackbit')\n"
@@ -584,7 +590,9 @@ int runGenerate(const std::string& path, const std::string& fromCheckpoint, cons
             std::cerr << "errore: il prompt codificato e' vuoto (prompt vuoto?)\n";
             return 1;
         }
-        std::vector<float> promptFloats(promptIds.begin(), promptIds.end());
+        std::vector<float> promptFloats;
+        promptFloats.reserve(promptIds.size());
+        for (const std::uint32_t id : promptIds) promptFloats.push_back(static_cast<float>(id));
         blackforge::runtime::Tensor promptTensor({1, promptIds.size()}, promptFloats);
 
         std::vector<std::uint32_t> generated = promptIds;
@@ -765,7 +773,7 @@ std::string formatShape(const std::vector<std::size_t>& shape) {
 int runBlackBitBenchmark(const std::string& configPath, const std::string& presetName, std::size_t seqLen,
                           std::size_t microBatch, std::size_t steps, std::size_t warmupSteps,
                           std::size_t maxVramMb, std::size_t optimizerRank, const std::string& recomputeMode,
-                          bool dryRun) {
+                          bool dryRun, bool instantiateOnly, bool seqLadder, const std::string& device) {
     try {
         blackforge::blackbit::BlackBitConfig config =
             configPath.empty() ? blackforge::blackbit::blackBitPreset(presetName.empty() ? "tiny" : presetName)
@@ -780,6 +788,10 @@ int runBlackBitBenchmark(const std::string& configPath, const std::string& prese
         }
         if (steps != 0) {
             options.steps = steps;
+        }
+        if (instantiateOnly) {
+            options.steps = 0;
+            options.warmupSteps = 0;
         }
         options.warmupSteps = warmupSteps;
         options.maxVramMb = maxVramMb;
@@ -807,14 +819,92 @@ int runBlackBitBenchmark(const std::string& configPath, const std::string& prese
             return 2;
         }
 
-        const blackforge::blackbit::BenchmarkResult result =
-            blackforge::blackbit::runBlackBitBenchmark(config, options, dryRun ? nullptr : &std::cout);
+        DeviceSpec spec;
+        std::string deviceError;
+        if (!parseDeviceSpec(device, spec, deviceError)) {
+            std::cerr << "errore: " << deviceError << "\n";
+            return 2;
+        }
+        if (!spec.isCuda || dryRun) {
+            const blackforge::blackbit::BenchmarkResult result =
+                blackforge::blackbit::runBlackBitBenchmark(config, options, dryRun ? nullptr : &std::cout);
+            std::cout << "\n" << result.report();
+            return result.withinBudget ? 0 : 1;
+        }
+#if BLACKFORGE_HAS_CUDA
+        if (seqLadder) {
+            std::vector<std::size_t> lengths;
+            for (const std::size_t length : {8U, 16U, 32U, 64U, 128U, 256U, 512U}) {
+                if (length <= config.maxSeqLen) lengths.push_back(length);
+            }
+            const auto results = blackforge::blackbit::cuda::runBenchmarkLadder(
+                config, options, lengths, spec.cudaIndex, &std::cout);
+            return std::all_of(results.begin(), results.end(), [](const auto& result) {
+                return result.withinBudget && result.nanInfCount == 0 && result.ternaryFlips > 0;
+            }) ? 0 : 1;
+        }
+        const blackforge::blackbit::cuda::BenchmarkResult result =
+            blackforge::blackbit::cuda::runBenchmark(config, options, spec.cudaIndex, &std::cout);
         std::cout << "\n" << result.report();
         return result.withinBudget ? 0 : 1;
+#else
+        std::cerr << "errore: benchmark BlackBit CUDA richiesto ma questa build non include CUDA\n";
+        return 1;
+#endif
     } catch (const std::exception& error) {
         std::cerr << "errore: " << error.what() << "\n";
         return 1;
     }
+}
+
+int runBlackBitTraining(const std::string& configPath, const std::string& presetName,
+                        const std::string& datasetPath, const std::string& tokenizerPath,
+                        std::size_t microBatch, std::size_t steps,
+                        std::size_t maxVramMb, std::size_t optimizerRank,
+                        const std::string& recomputeMode, const std::string& fromCheckpoint,
+                        const std::string& saveCheckpoint, const std::string& device) {
+#if BLACKFORGE_HAS_CUDA
+    try {
+        DeviceSpec spec;
+        std::string deviceError;
+        if (!parseDeviceSpec(device, spec, deviceError) || !spec.isCuda) {
+            std::cerr << "errore: 'train blackbit' richiede --device cuda o cuda:N\n";
+            return 2;
+        }
+        blackforge::blackbit::BlackBitConfig config =
+            configPath.empty() ? blackforge::blackbit::blackBitPreset(presetName.empty() ? "tiny" : presetName)
+                               : blackforge::blackbit::loadConfigFromJson(configPath);
+        blackforge::blackbit::cuda::TrainingOptions options;
+        options.datasetPath = datasetPath;
+        options.tokenizerPath = tokenizerPath;
+        options.fromCheckpoint = fromCheckpoint;
+        options.saveCheckpoint = saveCheckpoint;
+        options.microBatch = microBatch == 0 ? 1 : microBatch;
+        options.steps = steps == 0 ? 100 : steps;
+        options.maxVramMb = maxVramMb;
+        if (optimizerRank != 0) options.optimizer.rank = optimizerRank;
+        if (recomputeMode == "none") {
+            options.runtime.recompute = blackforge::blackbit::ActivationRecompute::None;
+        } else if (recomputeMode.empty() || recomputeMode == "per-layer") {
+            options.runtime.recompute = blackforge::blackbit::ActivationRecompute::PerLayer;
+        } else {
+            std::cerr << "errore: il trainer CUDA corrente supporta --recompute none o per-layer\n";
+            return 2;
+        }
+        const auto result = blackforge::blackbit::cuda::train(config, options, spec.cudaIndex, &std::cout);
+        std::cout << "\n" << result.report();
+        return result.nanInfCount == 0 ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << "errore: " << error.what() << "\n";
+        return 1;
+    }
+#else
+    (void)configPath; (void)presetName; (void)datasetPath; (void)tokenizerPath; (void)microBatch; (void)steps;
+    (void)maxVramMb; (void)optimizerRank; (void)recomputeMode; (void)fromCheckpoint;
+    (void)saveCheckpoint; (void)device;
+    std::cerr << "errore: 'train blackbit' richiede una build CUDA\n";
+    return 1;
+#endif
 }
 
 int runBenchmark(const std::string& path, const std::string& device, std::size_t batchSize,
@@ -1059,12 +1149,15 @@ int main(int argc, char** argv) {
     bool mlm = false;
     float maskProb = 0.15F;
     std::string configPath;
+    std::string datasetPath;
     std::size_t microBatch = 0;
     std::size_t steps = 0;
     std::size_t maxVramMb = 7800;
     std::size_t optimizerRank = 0;
     std::string recomputeMode;
     bool dryRun = false;
+    bool instantiateOnly = false;
+    bool seqLadder = false;
     std::vector<std::string> positional;
     std::string command = args.front();
 
@@ -1169,6 +1262,12 @@ int main(int argc, char** argv) {
                 return 2;
             }
             configPath = args[++i];
+        } else if (args[i] == "--dataset") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--dataset' richiede un percorso\n";
+                return 2;
+            }
+            datasetPath = args[++i];
         } else if (args[i] == "--micro-batch") {
             if (i + 1 >= args.size()) {
                 std::cerr << "errore: '--micro-batch' richiede un valore\n";
@@ -1201,6 +1300,10 @@ int main(int argc, char** argv) {
             recomputeMode = args[++i];
         } else if (args[i] == "--dry-run") {
             dryRun = true;
+        } else if (args[i] == "--instantiate-only") {
+            instantiateOnly = true;
+        } else if (args[i] == "--seq-ladder") {
+            seqLadder = true;
         } else if (args[i] == "--mlm") {
             mlm = true;
         } else if (args[i] == "--mask-prob") {
@@ -1248,6 +1351,11 @@ int main(int argc, char** argv) {
             std::cerr << "errore: comando 'train' richiede il percorso di un file .bf\n";
             return 2;
         }
+        if (positional.front() == "blackbit") {
+            const std::string preset = positional.size() > 1 ? positional[1] : std::string();
+            return runBlackBitTraining(configPath, preset, datasetPath, tokenizerPath, microBatch, steps, maxVramMb,
+                                       optimizerRank, recomputeMode, fromCheckpoint, saveCheckpointPath, device);
+        }
         return runTrain(positional.front(), fromCheckpoint, saveCheckpointPath, device, devicesList);
     }
     if (command == "forecast") {
@@ -1270,7 +1378,8 @@ int main(int argc, char** argv) {
             // esplicitamente, ne basta uno.
             return runBlackBitBenchmark(configPath, preset, seqLen, microBatch, steps,
                                          warmupGiven ? warmupIterations : 1,
-                                         maxVramMb, optimizerRank, recomputeMode, dryRun);
+                                         maxVramMb, optimizerRank, recomputeMode, dryRun, instantiateOnly,
+                                         seqLadder, device);
         }
         return runBenchmark(positional.front(), device, batchSize, warmupIterations, measuredIterations);
     }

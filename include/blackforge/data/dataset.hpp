@@ -14,9 +14,8 @@ namespace blackforge::data {
 // Il formato su disco (vedi saveDataset/loadDataset) e' un formato
 // binario minimale e proprietario di BlackForge (magic "BFDATA1"),
 // scelto per semplicita' e non per compatibilita' con formati esterni.
-// Non c'e' ancora alcuno strumento per costruire un dataset a partire
-// da sorgenti reali (CSV, immagini, testo, ...): serve chiamare
-// saveDataset() con i dati gia' pronti in memoria.
+// Per il testo autoregressivo il comando `dataset-build` e le utility
+// tokenizer/dataset_prep costruiscono direttamente questo formato.
 class Dataset {
 public:
     Dataset(std::vector<std::size_t> inputExampleShape, std::vector<std::size_t> targetExampleShape,

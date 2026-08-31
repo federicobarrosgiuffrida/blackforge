@@ -382,6 +382,332 @@ scalare servirebbe circa mezz'ora per passo, e soprattutto non direbbe
 nulla sulla RTX 5060. Il picco di memoria di un passo è quindi ancora
 **previsto** (3,090 GiB), non misurato.
 
+## 7.3 Phase 9 CUDA su RTX 5060 — Milestone H
+
+Ambiente realmente verificato: NVIDIA GeForce RTX 5060 8 GB, compute
+capability 12.0 (`sm_120`), driver 610.62, CUDA 13.3 e toolkit 13.3.73.
+Prima di BlackBit è stato compilato ed eseguito un kernel minimo con
+allocazione, lancio, sincronizzazione, copia di ritorno e verifica.
+
+Il comando riproducibile è:
+
+```
+blackforge benchmark blackbit 9b-a3b --device cuda --seq-len 16 \
+  --micro-batch 1 --steps 1 --warmup 0 --optimizer-rank 8 \
+  --max-vram-mb 7800
+```
+
+Misura del 30 agosto 2026 sulla scheda fisica:
+
+```
+parametri totali                    9 054 268 416
+parametri attivi/token              2 910 661 632
+packed ternary weights              1 731,52 MiB
+scale                                 222,66 MiB
+router/norm                             3,29 MiB
+optimizer rank-8                       249,04 MiB
+baseline CUDA/WDDM                   1 118,56 MiB
+BlackForge accounted peak             2,177 GiB
+ACTUAL NVIDIA DEVICE PEAK              4,379 GiB
+prediction for same shape              2,168 GiB
+gradient tile peak                     12,00 MiB
+gradient bytes prodotti/riusati    19 470,00 MiB
+forward + loss + backward           9 469,77 ms
+optimizer                           6 397,53 ms
+step totale                        15 867,30 ms
+throughput                              1,008 token/s
+trit flips                         49 291 782
+NaN/Inf                                     0
+```
+
+Il divario fra 2,177 GiB contabilizzati e 4,379 GiB realmente usati è
+esattamente il motivo per cui Phase 9 non usa la stima per dichiarare il
+fit: include baseline WDDM/contesto e overhead del driver/runtime non
+attribuibile a un `Buffer` BlackForge. Il tetto da 7 800 MiB viene
+controllato prima di ogni allocazione tramite `cudaMemGetInfo`.
+
+```
+forward                       PASS
+loss                          PASS
+backward                      PASS
+optimizer                     PASS
+ternary parameters changed    YES
+FULL PRECISION MASTER COPY    NO
+FULL MODEL GRADIENT BUFFER    NO
+PEAK GPU MEMORY < 7.8 GB      YES (4,379 GiB misurati)
+
+BLACKBIT MILESTONE H PASSED
+```
+
+La scala di validazione precedente usa lo stesso percorso: Tiny ha
+ridotto la loss su un batch fisso da 9,153 a 5,651 in 20 step (40,99
+token/s); Small e Medium hanno completato uno step con picchi reali di
+1,139 e 1,231 GiB. Nessuna di queste esecuzioni usa PyTorch, LoRA,
+offload del modello o una copia persistente decodificata.
+
+## 7.4 Testo reale, checkpoint e resume CUDA
+
+Per la prima prova su testo reale e' stato usato
+[`roneneldan/TinyStories`](https://huggingface.co/datasets/roneneldan/TinyStories/tree/main),
+licenza CDLA-Sharing-1.0. Il repository completo dichiarava 7,62 GB e
+il solo `TinyStories-train.txt` 1,92 GB: non sono stati scaricati. La
+prova del 30 agosto 2026 ha richiesto solamente 100 righe dal Dataset
+Viewer (82 695 byte JSON, 77 932 byte di testo), proprio per evitare un
+download prematuro di grandi dimensioni.
+
+Acquisizione riproducibile del campione (la risposta mantiene anche i
+row index originali; il corpus concatena esclusivamente il campo
+`text`):
+
+```powershell
+$url = 'https://datasets-server.huggingface.co/rows?dataset=roneneldan%2FTinyStories&config=default&split=train&offset=0&length=100'
+Invoke-WebRequest $url -OutFile tinystories_rows_000000_000099.json
+$rows = Get-Content tinystories_rows_000000_000099.json -Raw | ConvertFrom-Json
+($rows.rows | ForEach-Object { $_.row.text }) -join "`n" |
+  Set-Content tinystories_100.txt -Encoding utf8 -NoNewline
+```
+
+Il tokenizer byte-level BPE nativo e' stato addestrato con 1 024 token
+totali (259 token base/speciali + 765 merge) e lo shard causale prodotto
+con sequenze da 16 token contiene 1 519 esempi. I comandi sono:
+
+```
+blackforge tokenizer-train tinystories_100.txt --vocab-size 1024 \
+  --output tinystories_1024.bftok
+blackforge dataset-build tinystories_100.txt tinystories_1024.bftok \
+  --seq-len 16 --output tinystories_seq16.bfdata
+blackforge train blackbit tiny --device cuda \
+  --dataset tinystories_seq16.bfdata --tokenizer tinystories_1024.bftok \
+  --steps 200 --optimizer-rank 8 --max-vram-mb 7800 \
+  --save-checkpoint tiny_real_step200.bfbit
+```
+
+Risultato fisico: loss 9,056 -> 8,648, perplexity 8 571 -> 5 701,
+3 200 token, 84,13 token/s, 14 838 148 flip ternari, entropia router
+1,385 nat, zero NaN/Inf e picco NVIDIA 1,114 GiB. Dopo un vero riavvio
+del processo, `--from-checkpoint` ha ripreso da step 200/token 3 200 e
+ha raggiunto step 201/token 3 216 (loss 8,217).
+
+Il checkpoint CUDA usa lo stesso contenitore packed `BFBIT-v1` del
+backend CPU ed e' stato caricato anche dal loader CPU. Include pesi
+ternari impacchettati, parametri densi, momenti low-rank, epoca delle
+proiezioni, step, token, learning rate e seme RNG. Quando viene fornito
+`--tokenizer`, il trainer salva accanto al checkpoint una copia
+`.bftok` e un manifest `metadata.json` con versione dei formati,
+dimensioni del vocabolario e hash FNV-1a di dataset/tokenizer.
+
+## 7.5 Smoke 9B su testo reale e resume
+
+Lo stesso shard TinyStories e lo stesso percorso del Milestone H sono
+stati eseguiti per 100 step su BlackBit-9B-A3B, microbatch 1, seq 16 e
+optimizer rank 8. La curva grezza, un valore per ogni vero minibatch,
+e' conservata in [`phase9_9b_100step_loss.csv`](phase9_9b_100step_loss.csv).
+
+```
+step                          0 -> 100
+token                         0 -> 1 600
+loss                         11,092 -> 10,026
+perplexity                   65 644,5 -> 22 607,7
+throughput                       0,914 token/s
+step medio                  17 497,96 ms
+actual NVIDIA peak              4,379 GiB
+actual NVIDIA medio             4,360 GiB
+flip ternari                1 578 202 878
+router entropy                   2,077 nat
+NaN/Inf                              0
+checkpoint                        2,074 GiB
+```
+
+Il trend resta rumoroso perche' ogni punto contiene una sola sequenza,
+ma non e' una deduzione dalla sola coppia iniziale/finale: la media dei
+primi 10 step e' circa 11,13, mentre quella degli ultimi 10 e' circa
+10,33. Il checkpoint contiene ancora esclusivamente ternari packed,
+parametri densi piccoli e stato optimizer proiettato; nessun master
+BF16/FP32 e nessun gradiente modello completo.
+
+Dopo la chiusura dell'eseguibile e' stato avviato un nuovo processo con
+`--from-checkpoint`. Ha stampato `step 100 -> 101`, `token 1600 -> 1616`,
+ha completato lo step in 19 771,82 ms, prodotto altri 14 457 037 flip e
+misurato 4,381 GiB di picco. Quindi pesi, optimizer, RNG/order del
+dataset e contatori di training riprendono realmente.
+
+Al throughput misurato di 0,914 token/s, i tempi puramente computazionali
+sono circa 34,7 anni per 1B token, 346,5 anni per 10B e 3 465 anni per
+100B. Questo prova la fattibilita' in memoria e la trainability, non la
+praticita' di un pretraining esteso sulla singola RTX 5060.
+
+## 7.6 Ramp 9B completo fino a seq 512
+
+`--seq-ladder` riusa una sola istanza GPU e lo stesso optimizer tra le
+lunghezze, ma azzera picchi e contatori dei gradienti prima di ciascun
+passo. Tutte le righe comprendono forward, loss, backward e update:
+
+| seq | picco NVIDIA | step ms | token/s | gradient peak | trit flip | NaN/Inf |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 4,376 GiB | 14 195,60 | 0,564 | 12,00 MiB | 43 725 813 | 0 |
+| 16 | 4,379 GiB | 15 334,04 | 1,043 | 12,00 MiB | 35 470 813 | 0 |
+| 32 | 4,387 GiB | 14 759,65 | 2,168 | 12,00 MiB | 27 581 824 | 0 |
+| 64 | 4,411 GiB | 16 949,86 | 3,776 | 12,00 MiB | 27 705 571 | 0 |
+| 128 | 4,458 GiB | 20 997,62 | 6,096 | 12,00 MiB | 30 402 315 | 0 |
+| 256 | 4,557 GiB | 21 692,01 | 11,802 | 12,00 MiB | 26 491 418 | 0 |
+| 512 | 4,659 GiB | 29 341,11 | 17,450 | 12,00 MiB | 27 968 761 | 0 |
+
+A seq 512 le attivazioni raggiungono 273,01 MiB, i buffer MoE 15,80
+MiB e attention 15,09 MiB. La crescita misurata e' lineare e lascia
+ancora oltre 3 GiB di margine, mentre il throughput migliora con GEMM
+piu' grandi. Il limite emerso e' il capacity overflow MoE: 13 487
+assignment aggregati sui 28 layer sono stati scartati a seq 512; il
+router ha comunque entropia 2,078 nat (quasi `ln(8)`) e nessun collasso,
+ma capacity/dispatch richiedono profiling e tuning.
+
+## 7.7 Profilo e prima ottimizzazione misurata
+
+Nsight Systems 2026.1.3 ha profilato un vero step 9B seq 512. Prima
+dell'intervento, il tempo kernel era dominato da `updatePackedKernel`
+(36%) e `gradientStatsKernel` (35%); GQA forward/backward valeva 17%,
+decode 3% e proiezione 2%. In un solo step erano inoltre visibili
+106 661 kernel launch, 16 808 `cudaMalloc`, 16 809 `cudaFree` e 50 429
+`cudaMemGetInfo`.
+
+La causa principale non era una supposizione: le statistiche facevano
+atomiche globali per ogni elemento del gradiente e fino a sei atomiche
+per ogni trit. Una riduzione shared per blocco e l'aggregazione locale
+per word packed mantengono gli stessi contatori ma riducono drasticamente
+la contesa. La parita' CPU/CUDA e il checkpoint bit-identico restano
+verificati dai test.
+
+Confronto A/B sulla stessa RTX 5060, 9B, seq 512, rank 8:
+
+| misura | prima | dopo | variazione |
+|---|---:|---:|---:|
+| forward+loss+backward | 20 218,30 ms | 11 215,75 ms | 1,80x |
+| optimizer | 9 122,82 ms | 1 082,19 ms | 8,43x |
+| step totale | 29 341,11 ms | 12 297,94 ms | 2,39x |
+| throughput | 17,450 token/s | 41,633 token/s | 2,39x |
+| picco NVIDIA | 4,659 GiB | 4,659 GiB | invariato |
+
+Il secondo profilo conferma il cambio di priorita': GQA forward 36% e
+backward 18%, update packed 13%, decode 9%, proiezione 6% e statistiche
+3%. Attention e riduzione di launch/allocazioni sono quindi i prossimi
+target misurati. Nsight Compute 2026.2.1 e' installato, ma i contatori
+hardware sono disabilitati dalla policy driver (`ERR_NVGPUCTRPERM`):
+non e' stata fatta alcuna modifica amministrativa silenziosa.
+
+## 7.8 Top-2 davvero eseguito e ottimizzazione del percorso corretto
+
+### Prima: il routing scartava lavoro
+
+Il router sceglieva i top-k per probabilita' e poi scartava lo slot se
+l'esperto preferito era pieno. Con capacita' totale sufficiente non era
+un limite fisico ma lavoro perso: il token restava senza un esperto che
+poteva ancora essere calcolato.
+
+La selezione ora e' capacity-aware su CPU e CUDA: mantiene l'ordine di
+probabilita', salta gli esperti pieni e usa il successivo disponibile.
+Uno scarto resta possibile, ed e' riportato, solo quando meno di topK
+esperti hanno capacita' residua.
+
+Il test del caso peggiore (router collassato, capacita' totale
+esattamente pari alle assegnazioni) sul vecchio percorso dava 16 scarti
+e utilizzo `[8,8,0,0]`; ora da' zero scarti e `[8,8,8,8]`, con CPU e
+CUDA che scelgono gli stessi esperti.
+
+**Questo percorso esegue circa il 79% di lavoro MoE in piu' del
+precedente.** I numeri sotto non sono confrontabili con quelli di
+§7.7, che misuravano il percorso che scartava.
+
+### Baseline del percorso corretto
+
+RTX 5060, 9B-A3B, seq 512, micro-batch 1, 3 passi, rank 8, stessi seed
+e impostazioni. Mediana di 3 campioni: **43,653 token/s**, 11 728,81
+ms/step (dispersione 43,313-44,318, ±1,2%).
+
+### Il collo di bottiglia misurato, non supposto
+
+Nsight Systems 2026.1.3 sul workload corretto. Il primo profilo dava
+`updatePackedKernel` al 44% del tempo kernel, ~4,1 s su ~9,3 s: molto
+oltre qualunque limite di banda, visto che i pesi packed sono 1,73 GiB
+e a banda piena costerebbero pochi millisecondi.
+
+Tre difetti della stessa famiglia, tutti confermati dal profilo:
+
+* `projection()` dipende da (riga, componente) e **non** dalla colonna,
+  ma veniva valutata dentro il ciclo sui trit e dentro il ciclo sulle
+  righe: hash identici ricalcolati 20 volte per thread in
+  `updatePackedKernel` e 256 volte per blocco in
+  `projectGradientKernel`;
+* le statistiche facevano fino a otto atomiche globali **per thread**,
+  e uno step lancia un thread per word ternaria: oltre un miliardo di
+  atomiche per step;
+* il cronometro a eventi di `TernaryLinear::forward` faceva
+  `cudaEventSynchronize` dopo ogni tile: 111 188 sincronizzazioni per
+  step, con l'host che non correva mai avanti ad accodare il kernel
+  successivo.
+
+### A/B, un cambiamento per volta
+
+Ogni riga e' la mediana di 3 campioni identici, con la suite completa
+(520 test) verde prima di ogni misura.
+
+| cambiamento | prima | dopo | guadagno |
+|---|---:|---:|---:|
+| proiezione fuori dal ciclo sui trit | 43,653 | 55,640 | 1,27x |
+| hash di proiezione condivisi per blocco | 55,640 | 61,605 | 1,11x |
+| statistiche del trit ridotte per blocco | 61,605 | 66,401 | 1,08x |
+| niente sync dell'host per tile | 66,401 | 71,188 | 1,07x |
+| decode senza divisioni a 64 bit | 71,188 | 71,929 | 1,01x |
+| statistiche del gradiente fuse nella proiezione | 71,929 | 74,590 | 1,04x |
+| **totale** | **43,653** | **74,590** | **1,71x** |
+
+Il decode e' l'unico caso in cui il guadagno a livello di kernel
+(1 827 -> 1 644 ms su due step, 1,11x) e' piu' netto di quello sul
+tempo di parete, che resta dentro la dispersione fra campioni: e'
+tenuto perche' e' comunque piu' veloce, non perche' il tempo di parete
+lo dimostri.
+
+Tutti i cambiamenti preservano il valore prodotto. Gli unici scarti
+numerici sono l'ordine di accumulazione di due somme di quadrati che
+alimentano statistiche riportate (`gradientRms` e l'RMS
+dell'aggiornamento), non i pesi, non la loss, non le decisioni.
+
+### Stabilita' su 10 passi
+
+    loss    10,835 -> 9,866, monotona
+    picco   4,295 GiB su tutti e 10 i passi, senza crescita
+    scarti  0
+    NaN/Inf 0
+    throughput 75,781 token/s
+
+**Milestone P1 (>=75 token/s) raggiunta.**
+
+### Profilo attuale e limite previsto
+
+Ranking per step dopo gli interventi (Nsight, tempo kernel):
+
+| componente | ms/step | % |
+|---|---:|---:|
+| updatePacked (optimizer) | 1 228 | 24% |
+| decode ternario | 822 | 16% |
+| proiezione + statistiche | 622 | 12% |
+| GQA forward | 333 | 6% |
+| GQA backward | 265 | 5% |
+| GEMM cuBLASLt (tutti) | ~570 | 11% |
+| routing forward | 229 | 4% |
+| adam direction | 104 | 2% |
+
+La somma dei kernel e' circa 5,1 s su uno step di 6,76 s. **Anche
+azzerando ogni overhead dell'host il tetto sarebbe ~100 token/s**:
+oltre quella soglia non basta togliere overhead, va ridotto il lavoro
+dei kernel. I candidati misurati sono `updatePackedKernel` (che fa
+9,05 miliardi di arrotondamenti stocastici per step, uno per trit) e
+`routeForwardKernel`, che oggi gira **a thread singolo** (`<<<1,1>>>`)
+e costa 229 ms/step di pura serializzazione: parallelizzarlo richiede
+pero' attenzione, perche' il riempimento greedy della capacita' e'
+sensibile all'ordine e non deve cambiare quali esperti vengono scelti.
+
+Con questa architettura di calcolo BF16, **>=100 token/s e' plausibile
+ma non gratuito, e >=150 non sembra realistico su questa GPU.**
+
 ## 8. Stato dei percorsi (aggiornato ad ogni fase)
 
 | Percorso | Stato | Verificato da |
@@ -403,23 +729,32 @@ nulla sulla RTX 5060. Il picco di memoria di un passo è quindi ancora
 | `blackforge benchmark blackbit` | implementato | 8 test unitari + esecuzione reale su BlackBit-Tiny |
 | API di residenza (GPU/host-pinned/paginato) + pianificatore | implementato per la PIANIFICAZIONE | 3 test unitari; il trasferimento non e' implementato, vedi §8.1 |
 | Rilevamento capability e scelta del formato di calcolo | implementato | 3 test unitari; FP4 rilevato ma non usato, vedi §8.1 |
-| Kernel CUDA BlackBit | da fare | **non compilabile in questo ambiente** (nessun `nvcc`) |
+| Storage/codec ternario CUDA | implementato | parità byte/logica CPU↔GPU, padding e bordi non multipli |
+| `TernaryLinear` CUDA BF16 tile-local | implementato | forward/backward e gradienti a tile contro CPU |
+| RMSNorm, RoPE, SwiGLU, embedding, cross-entropy CUDA | implementato | test deterministici CPU↔GPU |
+| GQA CUDA online-softmax | implementato | forward/backward; nessuna matrice score e nessuna replica K/V |
+| MoE CUDA Top-2 sparso | implementato | dispatch compatto, overflow, router ed esperti contro CPU |
+| Optimizer CUDA proiettato + parametri densi | implementato | parità CPU e flip reali dei byte packed |
+| Modello/trainer CUDA end-to-end | implementato | 518 test totali + Tiny/Small/Medium/9B reali |
+| Trainer testo reale + checkpoint/resume CUDA | implementato | TinyStories sample, BFBIT CPU/CUDA interoperabile, ripresa step/token/RNG/optimizer |
+| Smoke 9B testo reale | **PASS** | 100 step + resume step 101, loss in calo, 4,379 GiB misurati |
+| Ramp 9B seq 8..512 | **PASS** | sette step completi, picco massimo 4,659 GiB |
+| Milestone H | **PASS** | 9B seq 16, picco NVIDIA 4,379 GiB, 49,3 M flip |
+| Top-2 realmente eseguito (CPU e CUDA) | **PASS** | zero scarti a capacita' sufficiente, parita' di selezione CPU/CUDA |
+| Milestone P1 (>=75 token/s) | **PASS** | 75,781 token/s su 10 passi, 4,295 GiB, loss monotona |
 
-### 8.1 Cosa NON è implementato, detto esplicitamente
+### 8.1 Limiti Phase 9 ancora aperti, detti esplicitamente
 
-* **Nessun kernel CUDA di BlackBit.** L'intero sottosistema gira sul
-  percorso di riferimento CPU. I byte riportati sono quelli reali del
-  formato — e sono gli stessi che la VRAM conterrebbe — ma i tempi sono
-  quelli di cicli tripli scritti a mano, non indicativi di una GPU.
-* **Il trasferimento host↔device dei parametri non residenti non
-  esiste.** `residency.hpp` fornisce l'API di proprietà e uno strumento
-  di pianificazione che calcola, con le dimensioni reali del formato,
-  quanto starebbe in ciascuno stato. Nessun percorso di esecuzione oggi
-  legge un parametro non residente.
+* **Il corpus usato e' soltanto un campione di 100 TinyStories.** Serve
+  a provare il percorso reale e la stabilita', non e' un corpus di
+  pretraining sufficiente per valutare la qualita' del modello.
+* **Le modalità CUDA `EveryNLayers` e `FullRecompute` usano oggi il
+  comportamento corretto `PerLayer`**, quindi la correttezza è
+  preservata ma non raggiungono ancora il loro diverso trade-off di
+  memoria/calcolo.
 * **FP4 è rilevato ma non usato.** `preferredComputeDType()` restituisce
   BF16 anche su Blackwell: un GEMM FP4 non esiste in questo motore, e
   dichiararlo renderebbe falso ogni rapporto sul formato di calcolo.
 * **Lo stato dell'ottimizzatore è FP32**, non BF16/INT8 (vedi §2).
-* **Milestone F (300M che addestra stabilmente) è verificata solo per
-  stabilità**, non per convergenza: sul backend CPU un addestramento
-  vero di BlackBit-Medium richiederebbe settimane.
+* **L'inizializzazione 9B è ancora CPU seriale** e richiede circa 170 s;
+  è separata dai 15,9 s misurati per lo step CUDA.
