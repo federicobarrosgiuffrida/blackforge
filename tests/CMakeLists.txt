@@ -43,6 +43,7 @@ set(
     blackbit/benchmark_tests.cpp
     blackbit/telemetry_tests.cpp
     blackbit/residency_tests.cpp
+    blackbit/safetensors_tests.cpp
     data/dataset_tests.cpp
     tokenizer/tokenizer_tests.cpp
     tokenizer/dataset_prep_tests.cpp

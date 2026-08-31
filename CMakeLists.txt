@@ -143,6 +143,7 @@ set(
     src/blackbit/benchmark.cpp
     src/blackbit/residency.cpp
     src/blackbit/capability.cpp
+    src/blackbit/safetensors.cpp
     src/data/dataset.cpp
     src/tokenizer/tokenizer.cpp
     src/tokenizer/dataset_prep.cpp
