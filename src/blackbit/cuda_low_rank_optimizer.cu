@@ -237,16 +237,57 @@ __global__ void adamDirectionKernel(float* firstMoment, float* secondMoment, flo
     atomicAdd(&stats->optimizerCount, 1ULL);
 }
 
+// Numero di componenti caricate in memoria condivisa per volta. Fissa,
+// non pari a 'rank', cosi' la memoria condivisa non dipende da un valore
+// di runtime: kComponentTile * kTritsPerWord * 4 = 2560 byte per blocco,
+// che non limita l'occupancy con nessun rango configurabile.
+constexpr std::size_t kComponentTile = 32;
+
+// La griglia e' (colonna di word, blocco di righe): un blocco copre UNA
+// posizione di word e kBlockSize righe consecutive.
+//
+// PERCHE' NON E' PIU' UN THREAD PER WORD CONSECUTIVA
+//
+// Nella mappatura precedente i thread di un warp coprivano 32 word
+// consecutive della stessa riga, quindi per ogni (componente, slot)
+// leggevano direction[componente * cols + col] con col = 20*t + slot:
+// passo 20 float, 32 indirizzi sparsi su ~40 linee di cache. Con rank 8
+// sono 8 * 20 = 160 letture di questo tipo per thread, cioe' ~6400
+// transazioni L2 per warp. Con 452 milioni di word per passo e' il costo
+// dominante del kernel (misurato 1228 ms/step con Nsight, 24 % del
+// passo) — non i 9,05 miliardi di arrotondamenti stocastici, che sono
+// aritmetica di registro.
+//
+// Ora 'firstCol' e' uniforme dentro il blocco: le rank * 20 direzioni
+// che servono sono le STESSE per tutti i thread, si caricano una volta
+// in memoria condivisa (accessi contigui, quindi coalescenti) e si
+// rileggono in broadcast. Il fattore di riuso e' kBlockSize = 256.
+//
+// Il prezzo: packed[row * wordsPerRow + wordCol] diventa un accesso a
+// passo wordsPerRow, quindi non coalescente. Sono 3,8 GiB per passo
+// (lettura piu' scrittura) con amplificazione ~8x, cioe' ~30 GiB a 448
+// GB/s = ~68 ms — molto meno del secondo abbondante risparmiato sulle
+// transazioni L2. E' un compromesso, non un miglioramento su tutti i
+// fronti, e va verificato su GPU.
+//
+// I trit prodotti sono BIT-IDENTICI: 'update' resta accumulato per
+// componente crescente, la proiezione e l'arrotondamento stocastico
+// dipendono da (riga, colonna) e non dalla forma della griglia. Cambia
+// solo il raggruppamento di updateSquared, che alimenta il solo
+// updateRms diagnostico.
 __global__ void updatePackedKernel(std::uint32_t* packed, std::size_t rows, std::size_t cols,
                                    std::size_t wordsPerRow, const float* direction, std::size_t rank,
                                    float learningRate, std::uint64_t seed, std::uint64_t epoch,
                                    std::uint64_t step, DeviceStepStats* stats) {
-    const std::size_t wordIndex = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::size_t wordCount = rows * wordsPerRow;
+    const std::size_t wordColumn = blockIdx.x;
+    const std::size_t row = static_cast<std::size_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+    const std::size_t firstColumn = wordColumn * kTritsPerWord;
+    const std::size_t wordIndex = row * wordsPerRow + wordColumn;
     // I thread fuori intervallo non possono uscire subito: partecipano
-    // alla riduzione finale con contributi nulli, altrimenti le shuffle
-    // e la __syncthreads della riduzione sarebbero divergenti.
-    const bool active = wordIndex < wordCount;
+    // alla riduzione finale con contributi nulli, e soprattutto devono
+    // raggiungere le __syncthreads del caricamento in memoria condivisa,
+    // altrimenti il blocco si blocca.
+    const bool active = row < rows && wordColumn < wordsPerRow;
     unsigned int elements = 0;
     unsigned int flips = 0;
     unsigned int positiveFlips = 0;
@@ -255,37 +296,59 @@ __global__ void updatePackedKernel(std::uint32_t* packed, std::size_t rows, std:
     unsigned int nanInf = 0;
     double updateSquared = 0.0;
 
-    if (active) {
-    const std::size_t row = wordIndex / wordsPerRow;
-    const std::size_t firstCol = (wordIndex % wordsPerRow) * kTritsPerWord;
-    std::uint32_t word = packed[wordIndex];
-    const std::uint64_t stepSeed = splitMix64(seed ^ (step * 0xD1B54A32D192ED03ULL));
-
-    // projection() dipende da (riga, componente) e NON dalla colonna,
-    // ma il ciclo originale la ricalcolava per ogni trit: 20 * rank
-    // hash per thread invece di rank. Scambiando i due cicli la
-    // proiezione viene valutata una volta per componente e riusata sui
-    // 20 trit della word. L'ordine di accumulazione di 'update' resta
-    // per componente crescente, esattamente come prima, quindi il
-    // risultato e' bit-identico (stessa somma, stessi raggruppamenti).
+    std::uint32_t word = 0;
     int trits[kTritsPerWord];
-    for (int byte = 0; byte < 4; ++byte) {
-        decodeTritByte(wordByte(word, byte), trits + static_cast<std::size_t>(byte) * kTritsPerByte);
-    }
-
     float updates[kTritsPerWord];
     for (std::size_t slot = 0; slot < kTritsPerWord; ++slot) updates[slot] = 0.0F;
-    for (std::size_t component = 0; component < rank; ++component) {
-        const float scaled = -learningRate * projection(seed, epoch, row, component, rank);
-        const float* directionRow = direction + component * cols;
-        for (std::size_t slot = 0; slot < kTritsPerWord; ++slot) {
-            const std::size_t col = firstCol + slot;
-            if (col < cols) updates[slot] += scaled * directionRow[col];
+
+    if (active) {
+        word = packed[wordIndex];
+        // projection() dipende da (riga, componente) e NON dalla colonna,
+        // ma il ciclo originale la ricalcolava per ogni trit: 20 * rank
+        // hash per thread invece di rank. Scambiando i due cicli la
+        // proiezione viene valutata una volta per componente e riusata sui
+        // 20 trit della word. L'ordine di accumulazione di 'update' resta
+        // per componente crescente, esattamente come prima, quindi il
+        // risultato e' bit-identico (stessa somma, stessi raggruppamenti).
+        for (int byte = 0; byte < 4; ++byte) {
+            decodeTritByte(wordByte(word, byte), trits + static_cast<std::size_t>(byte) * kTritsPerByte);
         }
     }
 
+    // Le direzioni delle colonne [firstColumn, firstColumn + 20) sono le
+    // stesse per ogni riga, quindi per ogni thread del blocco: si
+    // caricano una volta e si rileggono in broadcast dalla memoria
+    // condivisa. Le __syncthreads devono stare FUORI da if (active),
+    // altrimenti i thread di coda non le raggiungono e il blocco resta
+    // fermo.
+    __shared__ float sharedDirection[kComponentTile * kTritsPerWord];
+    for (std::size_t componentBase = 0; componentBase < rank; componentBase += kComponentTile) {
+        const std::size_t chunk = min(kComponentTile, rank - componentBase);
+        __syncthreads();
+        for (std::size_t index = threadIdx.x; index < chunk * kTritsPerWord; index += blockDim.x) {
+            const std::size_t component = componentBase + index / kTritsPerWord;
+            const std::size_t column = firstColumn + index % kTritsPerWord;
+            sharedDirection[index] = column < cols ? direction[component * cols + column] : 0.0F;
+        }
+        __syncthreads();
+        if (!active) continue;
+        for (std::size_t offset = 0; offset < chunk; ++offset) {
+            const float scaled =
+                -learningRate * projection(seed, epoch, row, componentBase + offset, rank);
+            const float* tile = sharedDirection + offset * kTritsPerWord;
+            for (std::size_t slot = 0; slot < kTritsPerWord; ++slot) {
+                // La guardia era gia' qui: senza, gli slot di padding
+                // dell'ultima word accumulerebbero scaled * 0, che e' 0
+                // ma non se scaled fosse non finito.
+                if (firstColumn + slot < cols) updates[slot] += scaled * tile[slot];
+            }
+        }
+    }
+
+    if (active) {
+    const std::uint64_t stepSeed = splitMix64(seed ^ (step * 0xD1B54A32D192ED03ULL));
     for (std::size_t slot = 0; slot < kTritsPerWord; ++slot) {
-        const std::size_t col = firstCol + slot;
+        const std::size_t col = firstColumn + slot;
         if (col >= cols) continue;
         const float update = updates[slot];
         if (!isfinite(update)) {
@@ -506,7 +569,11 @@ void LowRankProjectedOptimizer::endStep() {
             state.firstMoment.as<float>(), state.secondMoment.as<float>(), state.accumulator.as<float>(),
             projectedValues, options_.beta1, options_.beta2, bias1, bias2, options_.eps,
             deviceStats_.as<DeviceStepStats>());
-        updatePackedKernel<<<gridFor(state.rows * state.weight->wordsPerRow()), kBlockSize>>>(
+        // (colonna di word, blocco di righe): vedi il commento su
+        // updatePackedKernel per il perche' della mappatura.
+        const dim3 updateGrid(static_cast<unsigned int>(state.weight->wordsPerRow()),
+                              gridFor(state.rows));
+        updatePackedKernel<<<updateGrid, kBlockSize>>>(
             state.weight->packedWords(), state.rows, state.cols, state.weight->wordsPerRow(),
             state.accumulator.as<float>(), state.rank, options_.learningRate, state.seed, state.projectionEpoch,
             step_, deviceStats_.as<DeviceStepStats>());
