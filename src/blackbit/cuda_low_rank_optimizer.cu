@@ -379,7 +379,8 @@ __global__ void updatePackedKernel(std::uint32_t* packed, std::size_t rows, std:
     packed[wordIndex] = word;
     }  // if (active)
 
-    // Un blocco copre 5120 trit, quindi i contatori stanno in 32 bit.
+    // Un blocco copre al massimo 256 righe * 20 trit = 5120 trit,
+    // quindi i contatori stanno in 32 bit anche con la nuova mappatura.
     // Prima ogni thread faceva fino a otto atomiche globali: su tutto il
     // modello sono oltre un miliardo di atomiche per step. Warp shuffle
     // piu' riduzione fra warp lasciano una sola serie di atomiche per

@@ -39,6 +39,7 @@ set(
     blackbit/moe_tests.cpp
     blackbit/model_tests.cpp
     blackbit/low_rank_optimizer_tests.cpp
+    blackbit/packed_update_mapping_tests.cpp
     blackbit/checkpoint_tests.cpp
     blackbit/benchmark_tests.cpp
     blackbit/telemetry_tests.cpp

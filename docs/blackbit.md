@@ -695,15 +695,54 @@ Ranking per step dopo gli interventi (Nsight, tempo kernel):
 | routing forward | 229 | 4% |
 | adam direction | 104 | 2% |
 
+### `updatePacked`: riuso delle direzioni (da misurare su GPU)
+
+La riga da 1 228 ms/step sopra e' **MISURATA** sulla RTX 5060 prima di
+questo intervento. Non esiste ancora una misura GPU del kernel nuovo:
+in particolare, nessuno dei numeri stimati in questo paragrafo va letto
+come un risultato di benchmark.
+
+Il volume logico delle direzioni, da solo, non spiega il tempo misurato.
+Con il rango 8 usato nei run 9B e 9,05 miliardi di trit, il traffico e'
+**STIMATO** in `8 * 4 B * 9,05e9 = 290 GB` per step, cioe' circa 0,65 s
+a 448 GB/s. Inoltre una direzione `8 * 3968 * 4 B = 127 KB` entra in L2.
+Il problema e' la mappatura delle transazioni: un warp copriva 32 word
+consecutive della stessa riga e leggeva le direzioni a passo 20 float.
+Per rank 8 sono **STIMATE** circa 6 400 transazioni L2 per warp; su
+14,1 milioni di warp, circa 2,9 TB di settori da 32 B. A circa 1,9 TB/s
+di banda L2, la stima e' 1,5 s, nello stesso ordine di grandezza dei
+1 228 ms **MISURATI**. I circa 12,7 miliardi di `splitMix64` necessari
+all'arrotondamento stocastico valgono invece circa 28 ms **STIMATI** e
+non sono il sospetto principale.
+
+`updatePackedKernel` usa ora una griglia `(colonna di word, blocco di
+righe)`. `firstColumn` e' uniforme nel blocco, quindi le `rank * 20`
+direzioni vengono caricate una volta in memoria condivisa, a tile di 32
+componenti (2 560 B fissi), e riusate da 256 thread. Il compromesso e'
+che il packed viene letto e scritto a passo `wordsPerRow`: i 3,8 GiB
+logici per step possono diventare circa 30 GiB con amplificazione 8x,
+pari a circa 68 ms a 448 GB/s (**STIMATO**). Il guadagno netto resta
+un'ipotesi finche' non viene misurato sullo stesso workload GPU.
+
+L'invarianza degli indici e' verificata senza CUDA da
+`PackedUpdateMappingTest.LaMappaturaATileProduceWordBitIdentiche`: il
+test reimplementa sia il vecchio launch lineare sia la nuova griglia,
+inclusi caricamento cooperativo della tile, blocco di righe parziale,
+rank 8 e 40, ultimo chunk parziale e colonne non multiple di 20 (anche
+3072, cioe' 154 word con 8 slot di padding). Tutte le word risultano
+bit-identiche. Verifica locale: 388/388 test CPU passati e tutti i 29
+file CUDA accettati dal checker con stub; non e' una build `nvcc` e non
+verifica esecuzione, occupancy o pressione sui registri.
+
 La somma dei kernel e' circa 5,1 s su uno step di 6,76 s. **Anche
 azzerando ogni overhead dell'host il tetto sarebbe ~100 token/s**:
 oltre quella soglia non basta togliere overhead, va ridotto il lavoro
-dei kernel. I candidati misurati sono `updatePackedKernel` (che fa
-9,05 miliardi di arrotondamenti stocastici per step, uno per trit) e
-`routeForwardKernel`, che oggi gira **a thread singolo** (`<<<1,1>>>`)
-e costa 229 ms/step di pura serializzazione: parallelizzarlo richiede
-pero' attenzione, perche' il riempimento greedy della capacita' e'
-sensibile all'ordine e non deve cambiare quali esperti vengono scelti.
+dei kernel. I candidati misurati sono `updatePackedKernel`, ora
+rimappato ma ancora da rimisurare, e `routeForwardKernel`, che oggi gira
+**a thread singolo** (`<<<1,1>>>`) e costa 229 ms/step di pura
+serializzazione: parallelizzarlo richiede pero' attenzione, perche' il
+riempimento greedy della capacita' e' sensibile all'ordine e non deve
+cambiare quali esperti vengono scelti.
 
 Con questa architettura di calcolo BF16, **>=100 token/s e' plausibile
 ma non gratuito, e >=150 non sembra realistico su questa GPU.**
